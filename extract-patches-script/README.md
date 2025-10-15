@@ -28,7 +28,7 @@ You will need the following libraries:
 **Bash**
 
 ```
-pip install pandas undetected-chromedriver selenium beautifulsoup4
+pip install -r requirements.txt
 ```
 
 Additionally, since **`undetected-chromedriver` manages its own Chrome binary, you typically** ****do not** need to manually download a separate** `chromedriver` executable. It will automatically detect and manage your installed Chrome browser.
@@ -51,8 +51,6 @@ The script expects the following columns to be present in this CSV for processin
 | `Patched`           | A flag indicating if the vulnerability has a patch (script filters for `Patched != 0`). | `1`                    |
 | `VULNERABILITY_URL` | A URL to a resource with more details on the vulnerability (optional).                    | `https://...`          |
 
-Exportar para Sheets
-
 ### 2. Execution
 
 Run the script from your terminal:
@@ -60,10 +58,8 @@ Run the script from your terminal:
 **Bash**
 
 ```
-python your_script_name.py
+python extract_patches.py
 ```
-
-*(Replace** **`your_script_name.py` with the actual name of your script file.)*
 
 The script will:
 
@@ -90,8 +86,6 @@ The output file,  **`patched_dataset.csv`** , will contain a row for every file 
 | `commit_hash`       | The Git commit hash of the patch.                                                                                         |
 | `vulnerability_url` | The original vulnerability URL from the input CSV.                                                                        |
 
-Exportar para Sheets
-
 ---
 
 ## Configuration & Customization
@@ -103,8 +97,6 @@ You can modify the following constants within the script:
 | `CSV_FILENAME` | `"dump-glibc.csv"`      | The name of the input CSV file.  |
 | `OUTPUT_FILE`  | `"patched_dataset.csv"` | The name of the output CSV file. |
 
-Exportar para Sheets
-
 **Important Note on Delays:** The script includes a `time.sleep(2)` delay between processing each CVE to be respectful of the target server's load and to further reduce the risk of triggering bot detection or being rate-limited. You may adjust this value if necessary.
 
 ---
@@ -115,4 +107,4 @@ Exportar para Sheets
 * **`Bot detection still active`** :
 * Try increasing the **`time.sleep(5)` within** `extract_code_from_commit_selenium`.
 * Check your Chrome version is compatible with `undetected-chromedriver`.
-* **`No code extracted`** : The structure of the sourceware.org page may have changed. You may need to inspect the HTML and update the **`extract_code_from_html_diff` and** `extract_code_from_patch_section` functions to target the new classes/elements.
+* **`No code extracted`** : The structure of the sourceware.org page may have changed. You may need to inspect the HTML and update the `b` **and** `extract_code_from_patch_section` functions to target the new classes/elements.
