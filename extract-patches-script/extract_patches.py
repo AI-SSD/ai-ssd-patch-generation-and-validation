@@ -1,31 +1,32 @@
 """
-CVE Patch Extractor for Glibc Vulnerabilities - Selenium Version with Bot Detection Bypass
+CVE Patch Extractor for Glibc Vulnerabilities - Git-based Version
 
-This script uses undetected-chromedriver to bypass bot detection on sourceware.org
-and extract vulnerable and patched code snippets from CVE vulnerability data.
+This script uses GitPython to directly extract FULL vulnerable and patched code 
+from git commits, eliminating the need for web scraping.
+
+Key Features:
+- Processes each unique P_COMMIT only once (deduplicates commits)
+- Extracts ALL .c files from each commit, regardless of FilePath
+- Aggregates all code changes from multiple .c files in the same commit
 
 Requirements:
 - pandas
-- undetected-chromedriver
-- selenium
-- beautifulsoup4
+- gitpython
 """
 
 import pandas as pd
-import undetected_chromedriver as uc
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from bs4 import BeautifulSoup
-import time
-import csv
-from typing import Optional, Dict, Tuple, List
+import git
 import os
-import re
+import csv
+from typing import Optional, Dict, List
 
 # Configuration
 CSV_FILENAME = "dump-glibc.csv"
-OUTPUT_FILE = "patched_dataset.csv"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_FILE = os.path.join(SCRIPT_DIR, "patched_dataset.csv")
+GLIBC_REPO_URL = "https://github.com/bminor/glibc.git"
+REPO_CACHE_DIR = os.path.join(SCRIPT_DIR, "glibc_repo")
+
 
 def fetch_csv_data_from_local(filename: str) -> pd.DataFrame:
     """
@@ -50,299 +51,193 @@ def fetch_csv_data_from_local(filename: str) -> pd.DataFrame:
     print(f"Columns: {df.columns.tolist()}")
     return df
 
-def setup_driver() -> uc.Chrome:
-    """
-    Set up undetected Chrome driver with options to bypass bot detection.
-    
-    Returns:
-        Configured Chrome driver instance
-    """
-    print("Setting up undetected Chrome driver...")
-    
-    options = uc.ChromeOptions()
-    
-    # Additional options to appear more like a real browser
-    options.add_argument('--disable-blink-features=AutomationControlled')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-gpu')
-    
-    # Create driver with undetected-chromedriver
-    driver = uc.Chrome(options=options, version_main=None)
-    
-    # Set page load timeout
-    driver.set_page_load_timeout(30)
-    
-    print("Driver setup complete")
-    return driver
 
-def extract_file_path_from_header(header_div) -> Optional[str]:
+def setup_git_repository(repo_path: str, repo_url: str) -> git.Repo:
     """
-    Extract file path from diff header.
+    Clone or open the glibc git repository.
     
     Args:
-        header_div: BeautifulSoup div element with class 'diff header'
+        repo_path: Local path where repository should be stored
+        repo_url: URL of the git repository
         
     Returns:
-        Extracted file path or None
+        GitPython Repo object
     """
-    if not header_div:
+    if os.path.exists(repo_path):
+        print(f"Opening existing repository at {repo_path}")
+        repo = git.Repo(repo_path)
+        
+        # Fetch latest changes
+        print("Fetching latest changes from remote...")
+        try:
+            origin = repo.remotes.origin
+            origin.fetch()
+            print("Repository updated successfully")
+        except Exception as e:
+            print(f"Warning: Could not fetch updates: {e}")
+    else:
+        print(f"Cloning repository from {repo_url} to {repo_path}")
+        print("This may take several minutes for the first run...")
+        repo = git.Repo.clone_from(repo_url, repo_path)
+        print("Repository cloned successfully")
+    
+    return repo
+
+
+def get_full_file_content(repo: git.Repo, commit_hash: str, file_path: str) -> Optional[str]:
+    """
+    Get the full content of a file at a specific commit.
+    
+    Args:
+        repo: GitPython Repo object
+        commit_hash: The commit hash
+        file_path: Path to the file in the repository
+        
+    Returns:
+        Full file content as string, or None if file doesn't exist
+    """
+    try:
+        commit = repo.commit(commit_hash)
+        # Use git show to get file content at specific commit
+        file_content = (commit.tree / file_path).data_stream.read()
+        return file_content.decode('utf-8', errors='ignore')
+    except (KeyError, AttributeError):
+        # File doesn't exist at this commit
         return None
-    
-    header_text = header_div.get_text()
-    
-    # Try to extract file path from patterns like "a/path/to/file.c b/path/to/file.c"
-    # The file path is typically after "a/" or "b/"
-    match = re.search(r'[ab]/([\w/\.\-]+)', header_text)
-    if match:
-        return match.group(1)
-    
-    return None
+    except Exception as e:
+        print(f"Error reading file {file_path} at commit {commit_hash}: {e}")
+        return None
 
-def extract_code_from_patch_section(patch_div) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+
+def extract_all_c_files_from_commit(repo: git.Repo, commit_hash: str) -> List[Dict]:
     """
-    Extract vulnerable and patched code from a single patch section (one file).
+    Extract FULL vulnerable and patched code from ALL .c files in a git commit.
+    Gets the complete file content before and after the commit for every .c file.
     
     Args:
-        patch_div: BeautifulSoup div element with class 'patch'
+        repo: GitPython Repo object
+        commit_hash: The commit hash to analyze
         
     Returns:
-        Tuple of (file_path, vulnerable_code, patched_code)
-    """
-    # Extract file path from header
-    header_div = patch_div.find('div', class_='diff header')
-    file_path = extract_file_path_from_header(header_div)
-    
-    vulnerable_lines = []
-    patched_lines = []
-    
-    # Find all diff line divs within this patch
-    all_divs = patch_div.find_all('div', class_=True)
-    
-    for div in all_divs:
-        classes = div.get('class', [])
-        
-        # Only process lines with 'diff' class
-        if 'diff' not in classes:
-            continue
-        
-        # Skip headers and metadata
-        if any(x in classes for x in ['header', 'chunk_header', 'extended_header', 'from_file', 'to_file']):
-            continue
-        
-        line_text = div.get_text()
-        
-        # Context lines (common to both versions) - class contains both 'diff' and 'ctx'
-        if 'ctx' in classes:
-            vulnerable_lines.append(line_text)
-            patched_lines.append(line_text)
-        # Removed lines (vulnerable code only) - class contains both 'diff' and 'rem'
-        elif 'rem' in classes:
-            vulnerable_lines.append(line_text)
-        # Added lines (patched code only) - class contains both 'diff' and 'add'
-        elif 'add' in classes:
-            patched_lines.append(line_text)
-    
-    # Join lines
-    vulnerable_code = '\n'.join(vulnerable_lines).strip() if vulnerable_lines else None
-    patched_code = '\n'.join(patched_lines).strip() if patched_lines else None
-    
-    return file_path, vulnerable_code, patched_code
-
-def extract_code_from_html_diff(soup: BeautifulSoup, target_file_path: str = None) -> List[Dict]:
-    """
-    Extract vulnerable and patched code from HTML-formatted diff on sourceware.org.
-    Returns a list of dictionaries, one per file in the commit.
-    
-    Args:
-        soup: BeautifulSoup object of the page
-        target_file_path: Optional file path to filter specific file changes
-        
-    Returns:
-        List of dicts with keys: file_path, vulnerable_code, patched_code
-    """
-    results = []
-    
-    # Find all patch divs (each represents one file)
-    patches = soup.find_all('div', class_='patch')
-    
-    print(f"Found {len(patches)} patch sections (files)")
-    
-    for patch_idx, patch in enumerate(patches, 1):
-        file_path, vulnerable_code, patched_code = extract_code_from_patch_section(patch)
-        
-        # If target_file_path is specified, only include matching files
-        if target_file_path:
-            # Strip the extracted path for reliable comparison, in case of any non-visible characters
-            extracted_path = file_path.strip() if file_path else "" 
-            
-            # Comparison: Check if the target file is a substring of the extracted path
-            if not extracted_path or target_file_path not in extracted_path:
-                # Improved logging to show the actual strings being compared
-                print(f"  Patch {patch_idx}: Skipping (Target file '{target_file_path}' not found in extracted path '{extracted_path}')")
-                continue
-        
-        # Only include if we extracted some code
-        if vulnerable_code or patched_code:
-            result = {
-                'file_path': file_path or f'unknown_file_{patch_idx}',
-                'vulnerable_code': vulnerable_code or '',
-                'patched_code': patched_code or ''
-            }
-            results.append(result)
-            
-            print(f"  Patch {patch_idx} ({file_path or 'unknown'}):")
-            print(f"    - Vulnerable: {len(vulnerable_code.splitlines()) if vulnerable_code else 0} lines")
-            print(f"    - Patched: {len(patched_code.splitlines()) if patched_code else 0} lines")
-        else:
-            print(f"  Patch {patch_idx} ({file_path or 'unknown'}): No code extracted")
-    
-    return results
-
-def extract_code_from_commit_selenium(driver: uc.Chrome, commit_hash: str, file_path: str = None) -> Tuple[List[Dict], Optional[str]]:
-    """
-    Extract vulnerable and patched code from a sourceware.org commit using Selenium.
-    ...
+        List of dicts with keys: file_path, vulnerable_code (full), patched_code (full)
     """
     print(f"Processing commit hash: {commit_hash}")
     
-    # Try different URL formats
-    urls = [
-        f"https://sourceware.org/git/?p=glibc.git;a=commitdiff;h={commit_hash}",
-    ]
-    
-    for url in urls:
-        print(f"Trying URL: {url}")
+    try:
+        # Get the commit object
+        commit = repo.commit(commit_hash)
         
-        try:
-            # Navigate to the URL
-            driver.get(url)
+        # Get parent commit (the vulnerable version)
+        if not commit.parents:
+            print(f"Commit {commit_hash} has no parents (initial commit), skipping...")
+            return []
+        
+        parent_commit = commit.parents[0]
+        
+        # Get the diff to find which files were modified
+        diffs = parent_commit.diff(commit)
+        
+        print(f"Found {len(diffs)} file(s) changed in commit")
+        
+        results = []
+        c_files_found = 0
+        
+        for diff_item in diffs:
+            # Get the file path
+            file_path = diff_item.b_path or diff_item.a_path
             
-            # Wait for page to load - consider increasing this if your connection is slow
-            time.sleep(5) # Increased sleep time for safety
-            
-            # Get page source
-            page_source = driver.page_source
-            
-            # Parse with BeautifulSoup
-            soup = BeautifulSoup(page_source, 'html.parser')
-            
-            # Check if we have patch content - this is the reliable check
-            patch_divs = soup.find_all('div', class_='patch')
-            if not patch_divs:
-                print(f"No patch divs found in page. Possible bot detection or page not loaded.")
+            if not file_path:
                 continue
             
-            # Parse with BeautifulSoup
-            soup = BeautifulSoup(page_source, 'html.parser')
-            
-            # Check if we have patch content
-            patch_divs = soup.find_all('div', class_='patch')
-            if not patch_divs:
-                print(f"No patch divs found in page")
+            if not file_path.endswith('.c'):
+                print(f"  Skipping {file_path} (not a .c file)")
                 continue
             
-            print(f"Found {len(patch_divs)} patch div(s) in page")
+            c_files_found += 1
             
-            # Extract code from all files
-            file_results = extract_code_from_html_diff(soup, file_path)
+            # Get FULL file content from parent commit (vulnerable version)
+            vulnerable_code = get_full_file_content(repo, parent_commit.hexsha, file_path)
             
-            if file_results:
-                print(f"Successfully extracted code from {len(file_results)} file(s)")
-                return file_results, url
-            else:
-                print(f"Patch divs found but no code extracted")
+            # Get FULL file content from current commit (patched version)
+            patched_code = get_full_file_content(repo, commit.hexsha, file_path)
+            
+            # Handle file additions/deletions
+            if vulnerable_code is None and patched_code is not None:
+                print(f"  ℹ {file_path}: New file added (no vulnerable version)")
+                vulnerable_code = ""
+            elif vulnerable_code is not None and patched_code is None:
+                print(f"  ℹ {file_path}: File deleted (no patched version)")
+                patched_code = ""
+            elif vulnerable_code is None and patched_code is None:
+                print(f"  Skipping {file_path} (file not found in either version)")
+                continue
+            
+            result = {
+                'file_path': file_path,
+                'vulnerable_code': vulnerable_code,
+                'patched_code': patched_code
+            }
+            results.append(result)
+            
+            vuln_lines = len(vulnerable_code.splitlines()) if vulnerable_code else 0
+            patch_lines = len(patched_code.splitlines()) if patched_code else 0
+            
+            print(f"  ✓ {file_path}:")
+            print(f"    - Vulnerable version: {vuln_lines} lines")
+            print(f"    - Patched version: {patch_lines} lines")
         
-        except Exception as e:
-            print(f"Error processing {url}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
+        print(f"Extracted {len(results)} .c file(s) from commit (found {c_files_found} total .c files)")
+        return results
     
-    print(f"Failed to extract code from any URL")
-    return [], None
+    except git.exc.BadName:
+        print(f"Error: Commit {commit_hash} not found in repository")
+        return []
+    except Exception as e:
+        print(f"Error processing commit {commit_hash}: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
 
-def process_vulnerability(driver: uc.Chrome, row: pd.Series) -> List[Dict]:
+
+def group_cves_by_commit(df: pd.DataFrame) -> Dict[str, List[str]]:
     """
-    Process a single vulnerability row and extract all required information.
+    Group CVE IDs by their P_COMMIT hash to avoid processing the same commit multiple times.
     
     Args:
-        driver: Selenium Chrome driver instance
-        row: A row from the DataFrame with columns: CVE, P_COMMIT, FilePath, Patched
+        df: DataFrame with CVE and P_COMMIT columns
         
     Returns:
-        List of dictionaries with extracted data (one per file in the commit)
+        Dictionary mapping commit_hash -> list of CVE IDs
     """
-    cve_id = row.get('CVE')
-    commit_hash = row.get('P_COMMIT')
-    file_path = row.get('FilePath')
-    patched = row.get('Patched')
-    vulnerability_url = row.get('VULNERABILITY_URL')
+    commit_to_cves = {}
     
-    # Validate required fields
-    if pd.isna(cve_id) or not cve_id:
-        print("No CVE ID found in row")
-        return []
+    for _, row in df.iterrows():
+        commit_hash = row.get('P_COMMIT')
+        cve_id = row.get('CVE')
+        
+        # Skip invalid entries
+        if pd.isna(commit_hash) or not commit_hash or commit_hash == '\\N':
+            continue
+        if pd.isna(cve_id) or not cve_id:
+            continue
+        
+        if commit_hash not in commit_to_cves:
+            commit_to_cves[commit_hash] = []
+        
+        # Add CVE to this commit's list (avoid duplicates)
+        if cve_id not in commit_to_cves[commit_hash]:
+            commit_to_cves[commit_hash].append(cve_id)
     
-    print(f"\n{'='*80}")
-    print(f"Processing CVE: {cve_id}")
-    print(f"{'='*80}")
-    
-    if pd.isna(patched) or patched == 0:
-        print(f"CVE {cve_id} is not patched (Patched={patched}), skipping...")
-        return []
-    
-    if pd.isna(commit_hash) or not commit_hash or commit_hash == '\\N':
-        print(f"No commit hash found for {cve_id}, skipping...")
-        return []
-    
-    print(f"Commit hash: {commit_hash}")
-    target_file = None
-    if not pd.isna(file_path) and file_path and file_path != '\\N':
-        print(f"Target file path: {file_path}")
-        target_file = file_path
-    
-    if not pd.isna(vulnerability_url) and vulnerability_url:
-        print(f"Vulnerability URL: {vulnerability_url}")
-    
-    file_results, successful_url = extract_code_from_commit_selenium(
-        driver,
-        commit_hash,
-        target_file
-    )
-    
-    if not file_results:
-        print(f"No code extracted for {cve_id}")
-        return []
-    
-    # Add CVE metadata to each file result
-    results = []
-    for file_result in file_results:
-        result = {
-            'cve_id': cve_id,
-            'file_path': file_result['file_path'],
-            'vulnerable_code': file_result['vulnerable_code'],
-            'patched_code': file_result['patched_code'],
-            'patch_url': successful_url or '',
-            'commit_hash': commit_hash,
-            'vulnerability_url': vulnerability_url or ''
-        }
-        results.append(result)
-    
-    print(f"✓ Successfully extracted code for {cve_id} from {len(results)} file(s)")
-    for idx, result in enumerate(results, 1):
-        vuln_lines = len(result['vulnerable_code'].splitlines()) if result['vulnerable_code'] else 0
-        patch_lines = len(result['patched_code'].splitlines()) if result['patched_code'] else 0
-        print(f"  File {idx} ({result['file_path']}): {vuln_lines} vuln lines, {patch_lines} patch lines")
-    
-    return results
+    return commit_to_cves
+
 
 def main():
     """
     Main function to orchestrate the entire extraction process.
     """
     print("=" * 80)
-    print("CVE Patch Extractor - Selenium Version with Bot Detection Bypass")
+    print("CVE Patch Extractor - Full File Content Version")
+    print("Processes each commit once, extracts ALL .c files")
     print("=" * 80)
     
     # Step 1: Load CSV data
@@ -362,68 +257,92 @@ def main():
     patched_df = df[df['Patched'] != 0].copy()
     print(f"\nFound {len(patched_df)} patched vulnerabilities out of {len(df)} total")
     
-    # Step 2: Set up Selenium driver
-    driver = None
-    try:
-        driver = setup_driver()
-        
-        # Step 3: Process each patched vulnerability
-        all_results = []
-        total_rows = len(patched_df)
-        
-        for idx, (_, row) in enumerate(patched_df.iterrows(), 1):
-            print(f"\nProcessing row {idx}/{total_rows}")
-            
-            results = process_vulnerability(driver, row)
-            all_results.extend(results)
-            
-            if results:
-                print(f"Progress: {len(all_results)} total file extractions from {idx} CVEs")
-            
-            # Add delay between requests to be respectful to the server
-            time.sleep(2)
-        
-        # Step 4: Save results to CSV
-        if all_results:
-            print(f"\n{'='*80}")
-            print(f"Saving {len(all_results)} results to {OUTPUT_FILE}")
-            print(f"{'='*80}")
-            
-            results_df = pd.DataFrame(all_results)
-            results_df.to_csv(OUTPUT_FILE, index=False, quoting=csv.QUOTE_ALL)
-            
-            print(f"✓ Results saved successfully!")
-            print(f"\nFinal Summary:")
-            print(f"  - Total vulnerabilities in CSV: {len(df)}")
-            print(f"  - Patched vulnerabilities processed: {total_rows}")
-            print(f"  - Total file extractions: {len(all_results)}")
-            print(f"  - Unique CVEs extracted: {results_df['cve_id'].nunique()}")
-            
-            # Show sample of results
-            print(f"\nSample of extracted data:")
-            print(results_df[['cve_id', 'commit_hash', 'file_path']].head(10))
-        else:
-            print("\nNo results to save")
-            print("This could be due to:")
-            print("  - Bot detection still active (try running without headless mode)")
-            print("  - Network connectivity issues")
-            print("  - Changes in website structure")
-            print("  - All commits lacking extractable diffs")
+    print("\nGrouping CVEs by commit hash...")
+    commit_to_cves = group_cves_by_commit(patched_df)
+    print(f"Found {len(commit_to_cves)} unique commits to process")
+    print(f"Average CVEs per commit: {sum(len(cves) for cves in commit_to_cves.values()) / len(commit_to_cves):.2f}")
     
+    # Step 2: Set up Git repository
+    try:
+        repo = setup_git_repository(REPO_CACHE_DIR, GLIBC_REPO_URL)
     except Exception as e:
-        print(f"Error during processing: {e}")
+        print(f"Error setting up repository: {e}")
         import traceback
         traceback.print_exc()
+        return
     
-    finally:
-        # Clean up: close the browser
-        if driver:
-            print("\nClosing browser...")
-            driver.quit()
+    all_results = []
+    total_commits = len(commit_to_cves)
+    
+    for idx, (commit_hash, cve_list) in enumerate(commit_to_cves.items(), 1):
+        print(f"\n{'='*80}")
+        print(f"Processing commit {idx}/{total_commits}: {commit_hash}")
+        print(f"Associated CVEs: {', '.join(cve_list)}")
+        print(f"{'='*80}")
+        
+        # Extract all .c files from this commit
+        file_results = extract_all_c_files_from_commit(repo, commit_hash)
+        
+        if not file_results:
+            print(f"No .c files extracted from commit {commit_hash}")
+            continue
+        
+        for cve_id in cve_list:
+            for file_result in file_results:
+                result = {
+                    'CVE': cve_id,
+                    'P_COMMIT': commit_hash,
+                    'FilePath': file_result['file_path'],
+                    'V_CODE': file_result['vulnerable_code'],
+                    'P_CODE': file_result['patched_code']
+                }
+                all_results.append(result)
+        
+        print(f"✓ Extracted {len(file_results)} .c file(s) for {len(cve_list)} CVE(s)")
+        print(f"  Created {len(file_results) * len(cve_list)} output rows")
+        print(f"Progress: {len(all_results)} total rows from {idx} commits")
+    
+    # Step 4: Save results to CSV
+    if all_results:
+        print(f"\n{'='*80}")
+        print(f"Saving {len(all_results)} results to {OUTPUT_FILE}")
+        print(f"{'='*80}")
+        
+        results_df = pd.DataFrame(all_results)
+        results_df.to_csv(OUTPUT_FILE, index=False, quoting=csv.QUOTE_ALL)
+        
+        print(f"✓ Results saved successfully!")
+        print(f"\nFinal Summary:")
+        print(f"  - Total vulnerabilities in CSV: {len(df)}")
+        print(f"  - Patched vulnerabilities: {len(patched_df)}")
+        print(f"  - Unique commits processed: {total_commits}")
+        print(f"  - Total output rows: {len(all_results)}")
+        print(f"  - Unique CVEs in output: {results_df['CVE'].nunique()}")
+        print(f"  - Unique .c files extracted: {results_df['FilePath'].nunique()}")
+        
+        # Show sample of results
+        print(f"\nSample of extracted data:")
+        print(results_df[['CVE', 'P_COMMIT', 'FilePath']].head(10))
+        
+        # Show statistics about code sizes
+        results_df['V_CODE_lines'] = results_df['V_CODE'].apply(lambda x: len(x.splitlines()) if x else 0)
+        results_df['P_CODE_lines'] = results_df['P_CODE'].apply(lambda x: len(x.splitlines()) if x else 0)
+        print(f"\nCode size statistics:")
+        print(f"  - Average vulnerable code lines: {results_df['V_CODE_lines'].mean():.1f}")
+        print(f"  - Average patched code lines: {results_df['P_CODE_lines'].mean():.1f}")
+        print(f"  - Max vulnerable code lines: {results_df['V_CODE_lines'].max()}")
+        print(f"  - Max patched code lines: {results_df['P_CODE_lines'].max()}")
+    else:
+        print("\nNo results to save")
+        print("This could be due to:")
+        print("  - Invalid commit hashes in CSV")
+        print("  - Network connectivity issues during repository clone")
+        print("  - All commits lacking .c file changes")
     
     print("\n" + "=" * 80)
     print("Extraction complete!")
     print("=" * 80)
+
 
 if __name__ == "__main__":
     main()
