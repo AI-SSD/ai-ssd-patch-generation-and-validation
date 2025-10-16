@@ -1,0 +1,11 @@
+# Repository-level .gitignore
+# Ignore the local glibc checkout used by the extract-patches-script
+/extract-patches-script/glibc_repo/
+
+# Also ignore any top-level glibc_repo if present
+/glibc_repo/
+
+# Python and macOS common ignores
+__pycache__/
+*.py[cod]
+.DS_Store
