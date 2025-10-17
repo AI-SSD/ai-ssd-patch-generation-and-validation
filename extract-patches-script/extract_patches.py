@@ -8,6 +8,7 @@ Key Features:
 - Processes each unique P_COMMIT only once (deduplicates commits)
 - Extracts ALL .c files from each commit, regardless of FilePath
 - Aggregates all code changes from multiple .c files in the same commit
+- **NEW**: Adds V_COMMIT column storing the parent commit (vulnerability commit)
 
 Requirements:
 - pandas
@@ -18,7 +19,7 @@ import pandas as pd
 import git
 import os
 import csv
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 
 # Configuration
 CSV_FILENAME = "dump-glibc.csv"
@@ -109,30 +110,34 @@ def get_full_file_content(repo: git.Repo, commit_hash: str, file_path: str) -> O
         return None
 
 
-def extract_all_c_files_from_commit(repo: git.Repo, commit_hash: str) -> List[Dict]:
+def extract_all_c_files_from_commit(repo: git.Repo, commit_hash: str) -> Tuple[Optional[str], List[Dict]]:
     """
     Extract FULL vulnerable and patched code from ALL .c files in a git commit.
     Gets the complete file content before and after the commit for every .c file.
     
     Args:
         repo: GitPython Repo object
-        commit_hash: The commit hash to analyze
+        commit_hash: The commit hash to analyze (P_COMMIT)
         
     Returns:
-        List of dicts with keys: file_path, vulnerable_code (full), patched_code (full)
+        Tuple: (V_COMMIT hash, List of dicts with file_path, vulnerable_code, patched_code)
     """
     print(f"Processing commit hash: {commit_hash}")
     
+    v_commit_hash: Optional[str] = None
+    
     try:
-        # Get the commit object
+        # Get the commit object (P_COMMIT)
         commit = repo.commit(commit_hash)
         
-        # Get parent commit (the vulnerable version)
+        # Get parent commit (the vulnerable version - V_COMMIT)
         if not commit.parents:
             print(f"Commit {commit_hash} has no parents (initial commit), skipping...")
-            return []
+            return None, []
         
         parent_commit = commit.parents[0]
+        v_commit_hash = parent_commit.hexsha # Store the parent commit hash
+        print(f"Parent commit (V_COMMIT): {v_commit_hash}")
         
         # Get the diff to find which files were modified
         diffs = parent_commit.diff(commit)
@@ -156,7 +161,7 @@ def extract_all_c_files_from_commit(repo: git.Repo, commit_hash: str) -> List[Di
             c_files_found += 1
             
             # Get FULL file content from parent commit (vulnerable version)
-            vulnerable_code = get_full_file_content(repo, parent_commit.hexsha, file_path)
+            vulnerable_code = get_full_file_content(repo, v_commit_hash, file_path)
             
             # Get FULL file content from current commit (patched version)
             patched_code = get_full_file_content(repo, commit.hexsha, file_path)
@@ -183,20 +188,20 @@ def extract_all_c_files_from_commit(repo: git.Repo, commit_hash: str) -> List[Di
             patch_lines = len(patched_code.splitlines()) if patched_code else 0
             
             print(f"  ✓ {file_path}:")
-            print(f"    - Vulnerable version: {vuln_lines} lines")
-            print(f"    - Patched version: {patch_lines} lines")
+            print(f"    - Vulnerable version: {vuln_lines} lines (at {v_commit_hash[:7]})")
+            print(f"    - Patched version: {patch_lines} lines (at {commit_hash[:7]})")
         
         print(f"Extracted {len(results)} .c file(s) from commit (found {c_files_found} total .c files)")
-        return results
+        return v_commit_hash, results
     
     except git.exc.BadName:
         print(f"Error: Commit {commit_hash} not found in repository")
-        return []
+        return None, []
     except Exception as e:
         print(f"Error processing commit {commit_hash}: {e}")
         import traceback
         traceback.print_exc()
-        return []
+        return None, []
 
 
 def group_cves_by_commit(df: pd.DataFrame) -> Dict[str, List[str]]:
@@ -281,16 +286,18 @@ def main():
         print(f"{'='*80}")
         
         # Extract all .c files from this commit
-        file_results = extract_all_c_files_from_commit(repo, commit_hash)
+        # extract_all_c_files_from_commit now returns the parent commit hash (V_COMMIT)
+        v_commit, file_results = extract_all_c_files_from_commit(repo, commit_hash)
         
-        if not file_results:
-            print(f"No .c files extracted from commit {commit_hash}")
+        if not file_results or not v_commit:
+            print(f"No .c files or parent commit found for P_COMMIT {commit_hash}")
             continue
         
         for cve_id in cve_list:
             for file_result in file_results:
                 result = {
                     'CVE': cve_id,
+                    'V_COMMIT': v_commit,
                     'P_COMMIT': commit_hash,
                     'FilePath': file_result['file_path'],
                     'V_CODE': file_result['vulnerable_code'],
@@ -299,7 +306,7 @@ def main():
                 all_results.append(result)
         
         print(f"Extracted {len(file_results)} .c file(s) for {len(cve_list)} CVE(s)")
-        print(f"Created {len(file_results) * len(cve_list)} output rows")
+        print(f"Created {len(file_results) * len(cve_list)} output rows (V_COMMIT={v_commit[:7]})")
         print(f"Progress: {len(all_results)} total rows from {idx} commits")
     
     # Step 4: Save results to CSV
@@ -321,8 +328,8 @@ def main():
         print(f"  - Unique .c files extracted: {results_df['FilePath'].nunique()}")
         
         # Show sample of results
-        print(f"\nSample of extracted data:")
-        print(results_df[['CVE', 'P_COMMIT', 'FilePath']].head(10))
+        print(f"\nSample of extracted data (including V_COMMIT):")
+        print(results_df[['CVE', 'P_COMMIT', 'V_COMMIT', 'FilePath']].head(10))
         
         # Show statistics about code sizes
         results_df['V_CODE_lines'] = results_df['V_CODE'].apply(lambda x: len(x.splitlines()) if x else 0)
