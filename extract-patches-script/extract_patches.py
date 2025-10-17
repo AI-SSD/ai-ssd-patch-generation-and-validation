@@ -253,9 +253,9 @@ def main():
     print(f"\nData types:")
     print(df.dtypes)
     
-    # Filter for patched vulnerabilities (Patched != 0)
-    patched_df = df[df['Patched'] != 0].copy()
-    print(f"\nFound {len(patched_df)} patched vulnerabilities out of {len(df)} total")
+    # Include all rows from the CSV (do not filter by Patched)
+    patched_df = df.copy()
+    print(f"\nProcessing all {len(patched_df)} vulnerabilities from {len(df)} total rows")
     
     print("\nGrouping CVEs by commit hash...")
     commit_to_cves = group_cves_by_commit(patched_df)
@@ -298,8 +298,8 @@ def main():
                 }
                 all_results.append(result)
         
-        print(f"✓ Extracted {len(file_results)} .c file(s) for {len(cve_list)} CVE(s)")
-        print(f"  Created {len(file_results) * len(cve_list)} output rows")
+        print(f"Extracted {len(file_results)} .c file(s) for {len(cve_list)} CVE(s)")
+        print(f"Created {len(file_results) * len(cve_list)} output rows")
         print(f"Progress: {len(all_results)} total rows from {idx} commits")
     
     # Step 4: Save results to CSV
@@ -311,7 +311,7 @@ def main():
         results_df = pd.DataFrame(all_results)
         results_df.to_csv(OUTPUT_FILE, index=False, quoting=csv.QUOTE_ALL)
         
-        print(f"✓ Results saved successfully!")
+        print(f"Results saved successfully!")
         print(f"\nFinal Summary:")
         print(f"  - Total vulnerabilities in CSV: {len(df)}")
         print(f"  - Patched vulnerabilities: {len(patched_df)}")
