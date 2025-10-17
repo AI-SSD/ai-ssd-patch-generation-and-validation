@@ -1,84 +1,92 @@
-# CVE Patch Extractor for Glibc Vulnerabilities (Git-based)
 
-This Python script is designed to build a dataset of vulnerable and patched code by directly interacting with the **Glibc Git repository** using the `gitpython` library. It processes a local CSV file containing Glibc vulnerability information, identifies relevant patch commits, and extracts the **full file content** before (vulnerable) and after (patched) each patch commit for all affected `.c` files.
+# CVE Patch Extractor for Glibc Vulnerabilities
 
-Unlike methods relying on web scraping, this approach provides a direct, efficient, and reliable way to access the exact state of the source code.
+This Python script, `extract_patches.py`, leverages **GitPython** to directly interact with the official `glibc` Git repository. Its primary function is to extract the **full file contents,** both the **vulnerable** and **patched** versions, for all `.c` files modified within a security-related Git commit.
+
+This approach provides a complete code-context dataset for training models or performing in-depth analysis, eliminating the need for complex web scraping or parsing of patch files.
 
 ## Key Features
 
-* **Git-Native Extraction:** Uses `gitpython` to interact with a locally cloned repository, eliminating the need for web scraping or relying on external API rate limits.
-* **Commit Deduplication:** Each unique patch commit (`P_COMMIT`) is processed only once, regardless of how many CVEs it fixes.
-* **Comprehensive File Extraction:** Extracts the complete source code for **ALL** modified `.c` files within a single patch commit.
-* **Full Code Context:** Stores the **FULL** vulnerable code and the **FULL** patched code for each affected file, providing complete context for analysis.
-* **Local Caching:** Clones the Glibc repository once to a local directory (`./glibc_repo`) and reuses it for subsequent runs, speeding up the process.
+* **Direct Git Integration:** Uses `gitpython` to clone and query the official `glibc` repository (`https://github.com/bminor/glibc.git`).
+* **Commit Deduplication:** Processes each unique patch commit (`P_COMMIT`) only once, regardless of how many CVEs reference it.
+* **Full File Extraction:** Extracts the complete file content (the entire source file) for the parent commit (vulnerable state) and the patch commit (patched state).
+* **Comprehensive .c File Coverage:** Extracts and aggregates code changes from **ALL** `.c` files associated with a single security commit.
+* **Structured Output:** Generates a clean CSV file (`patched_dataset.csv`) mapping CVEs to their corresponding full vulnerable and patched code files.
 
 ## Requirements
 
-The script is written in Python and requires the following libraries:
-
-1. **pandas**: For reading and processing the input CSV data.
-2. **gitpython**: For interacting with the Git repository.
-
-### Installation
-
-You can install the required dependencies using `pip`:
+To run this script, you must have **Git** installed on your system. The following Python packages are also required:
 
 ```bash
 pip install pandas gitpython
 ```
 
-## Setup and Usage
+## Usage
 
-### 1. Prepare the Input Data
+### 1. Setup
 
-The script requires a CSV file containing Glibc vulnerability metadata.
-
-* **File Name:** The expected input file must be named ****`dump-glibc.csv`** (as configured in** `CSV_FILENAME`).
-* **Location:** Place the CSV file in the same directory as the script.
-* **Required Columns:** The CSV must contain at least the following columns:
-  * `CVE`: The CVE identifier (e.g., `CVE-2023-XXXX`).
-  * `P_COMMIT`: The Git commit hash corresponding to the patch.
-  * `Patched`: A numerical column where **`0` indicates no patch and any other value (`1`,** `2`, etc.) indicates a patch.
-
-### 2. Run the Script
-
-Execute the Python script directly:
+Clone the repository containing the script and navigate into its directory:
 
 ```
-python your_script_name.py
+git clone https://github.com/AI-SSD/ai-ssd-patch-generation-and-validation/tree/main/extract-patches-script
+cd extract-patches-script
 ```
 
-### Execution Steps
+### 2. Data Preparation
 
-1. **Load CSV:** The script reads **`dump-glibc.csv` and filters for rows where** `Patched != 0`.
-2. **Group Commits:** It aggregates CVEs by their unique `P_COMMIT` hash.
-3. **Repository Setup:** It clones the Glibc repository from **`https://github.com/bminor/glibc.git` into the** `./glibc_repo` directory. If the directory exists, it attempts to open the existing repository and fetch the latest changes.
-4. **Extraction:** It iterates through each unique commit, identifies all modified **`.c` files, and extracts the full source code content of the file from the** ****parent commit** (`V_CODE`) and the** **current commit** (`P_CODE`).
-5. **Data Aggregation:** The results are combined, linking each file change back to all associated CVEs for that commit.
+Place your input CSV file, which contains the mapping of CVEs to their patch commits, in the same directory as the script. 
 
----
+The script expects the input file to be named:
 
-## Output
+* **`dump-glibc.csv`** or setup the file name on **`CSV_FILENAME`.**
 
-The final dataset is saved as a new CSV file named **`patched_dataset.csv`** in the same directory.
+The CSV must contain, at a minimum, the following two columns:
 
-### Output File: `patched_dataset.csv`
+1. **`CVE`** : The CVE identifier (e.g., `CVE-2019-1010002`).
+2. **`P_COMMIT`** : The Git hash of the commit that contains the fix.
 
-| Column Name  | Description                                                                          | Example Value                                  |
-| ------------ | ------------------------------------------------------------------------------------ | ---------------------------------------------- |
-| `CVE`      | The vulnerability identifier.                                                        | `CVE-2021-3595`                              |
-| `P_COMMIT` | The hash of the patch commit.                                                        | `23e7f4c568f54c9`                            |
-| `FilePath` | The path to the affected `.c` file.                                                | `sysdeps/unix/sysv/linux/powerpc/getdents.c` |
-| `V_CODE`   | The**FULL** source code of the file *before* the patch (vulnerable version). | `(long string of code)`                      |
-| `P_CODE`   | The**FULL** source code of the file *after* the patch (patched version).     | `(long string of code)`                      |
+### 3. Execution
 
----
+Run the script from your terminal:
 
-## Troubleshooting
+```
+python extract_patches.py
+```
 
-* **`FileNotFoundError: CSV file not found`** : Ensure `dump-glibc.csv` is in the same directory as the script.
-* **Cloning takes too long** : The initial clone of the Glibc repository is large and can take several minutes. Subsequent runs will be much faster as the repository is cached in `./glibc_repo`.
-* **Commit not found** : If a `P_COMMIT` is not found, the script will print an error message. This usually means the commit hash in the input CSV is incorrect or belongs to a branch/repository not tracked by the main Glibc repository.
-* **`gitpython.exc.GitCommandError`** : Ensure you have Git installed and accessible in your system's PATH.
+* **First Run:** The script will automatically clone the large **`glibc` Git repository into a local directory named** **`glibc_repo`** . This may take several minutes.
+* **Subsequent Runs:** The script will open the existing local repository and perform a fast `git fetch` to ensure it is up-to-date.
 
----
+### 4. Output
+
+Upon completion, a new file will be generated in the script directory:
+
+* **`patched_dataset.csv`**
+
+This file contains the final dataset with the following columns:
+
+| Column       | Description                                                                                   |
+| ------------ | --------------------------------------------------------------------------------------------- |
+| `CVE`      | The CVE ID.                                                                                   |
+| `P_COMMIT` | The Git hash of the patch commit.                                                             |
+| `FilePath` | The path to the modified `.c` file.                                                         |
+| `V_CODE`   | The**full** content of the file **before** the patch commit (vulnerable version). |
+| `P_CODE`   | The**full** content of the file **after** the patch commit (patched version).     |
+
+Exportar para Sheets
+
+## Configuration
+
+You can easily adjust the script's configuration variables at the top of the file:
+
+| Variable           | Default Value                             | Description                                                    |
+| ------------------ | ----------------------------------------- | -------------------------------------------------------------- |
+| `CSV_FILENAME`   | `"dump-glibc.csv"` or other             | The name of the input CSV file.                                |
+| `OUTPUT_FILE`    | `"patched_dataset.csv"`                 | The name of the output CSV file.                               |
+| `GLIBC_REPO_URL` | `"https://github.com/bminor/glibc.git"` | The Git URL for the glibc repository.                          |
+| `REPO_CACHE_DIR` | `"glibc_repo"`                          | The local directory where the glibc repository will be cloned. |
+
+Exportar para Sheets
+
+## Notes on Repository Cloning
+
+The repositories can sometimes be quite large. The initial clone process will consume significant disk space and may take time, depending on your network connection. This is a one-time operation, and the script handles updates efficiently afterward.
