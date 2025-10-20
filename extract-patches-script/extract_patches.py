@@ -1,71 +1,64 @@
-"""
-CVE Patch Extractor for Glibc Vulnerabilities - Git-based Version
-
-This script uses GitPython to directly extract FULL vulnerable and patched code 
-from git commits, eliminating the need for web scraping. It now also extracts 
-and compares individual C functions AND multi-line MACROS to generate a 
-separate function-level dataset.
-
-Key Features:
-- Processes each unique P_COMMIT only once (deduplicates commits)
-- Extracts ALL .c files from each commit, regardless of FilePath
-- Aggregates all code changes from multiple .c files in the same commit
-- Adds V_COMMIT column storing the parent commit (vulnerability commit)
-- Generates a separate dataset containing only modified functions 
-  and modified multi-line macros (like the 'BODY' macro).
-- Filters out function/macro units where only comments or whitespace have changed.
-
-Requirements:
-- pandas
-- gitpython
-"""
-
 import pandas as pd
 import git
 import os
 import csv
 import re
 import difflib
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, TextIO
 
 # Configuration
-# Updated CSV_FILENAME to the uploaded file name
 CSV_FILENAME = "dump-glibc.csv"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FULL_FILE_OUTPUT_FILE = os.path.join(SCRIPT_DIR, "file_dataset.csv")
 FUNCTION_OUTPUT_FILE = os.path.join(SCRIPT_DIR, "function_dataset.csv")
+LOG_OUTPUT_FILE = os.path.join(SCRIPT_DIR, "script.log")
 
 GLIBC_REPO_URL = "https://github.com/bminor/glibc.git"
 REPO_CACHE_DIR = os.path.join(SCRIPT_DIR, "glibc_repo")
+
+# --- Custom Logging Setup ---
+
+# Global variable for the log file
+log_file: Optional[TextIO] = None
+
+# Store a reference to the built-in print function before it's potentially overwritten
+# This MUST be done outside of the function that gets aliased to print
+_original_print = __builtins__.print  # <--- FIX: Store the original print
+
+def custom_log(*args, **kwargs):
+    """Prints to console and writes to the log file."""
+    message = " ".join(map(str, args))
+    
+    # 1. Print to console using the stored original function
+    _original_print(message, **kwargs) # <--- FIX: Use the original print
+    
+    # 2. Write to log file
+    if log_file:
+        log_file.write(message + '\n')
+        log_file.flush() # Ensure it's written immediately
+
+# Replace the standard print with the custom logger
+# This is where all subsequent 'print' calls will redirect
+print = custom_log 
+
+# --- End Custom Logging Setup ---
 
 
 def strip_code_for_comparison(code: str) -> str:
     """
     Strips C-style comments and normalizes whitespace for comparison purposes.
     This is used to identify units where only comments or indentation changed.
-    
-    Args:
-        code: The source code string.
-        
-    Returns:
-        Code string with comments and excessive whitespace removed.
     """
     if not code:
         return ""
     
     # 1. Remove C-style multi-line comments /* ... */
-    # The DOTALL flag ensures it works across multiple lines.
     code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
     
     # 2. Remove C++ style single-line comments // ...
     code = re.sub(r'//.*', '', code)
     
-    # 3. Remove backslash line continuations inside macros, but be careful not to remove 
-    # backslashes used for strings or character literals. For now, rely on 
-    # step 4 to collapse the resulting whitespace after a backslash/newline pair.
-
-    # 4. Collapse all remaining whitespace (spaces, newlines, tabs) into a single space
-    # This step effectively removes indentation and empty lines.
+    # 3. Collapse all remaining whitespace (spaces, newlines, tabs) into a single space
     code = re.sub(r'\s+', ' ', code)
     
     return code.strip()
@@ -74,17 +67,7 @@ def strip_code_for_comparison(code: str) -> str:
 def extract_c_functions(code: str) -> Dict[str, str]:
     """
     Extracts C function definitions (name and body) from a source code string.
-    Uses regex to find the signature and a simple brace-counting mechanism 
-    to robustly capture the function body.
-    
-    Only extracts actual function definitions, NOT control flow structures
-    like while, if, for, switch, etc.
-    
-    Args:
-        code: The full source code content as a string.
-        
-    Returns:
-        Dictionary mapping {function_name: full_function_code_string}.
+    ... [Function body remains the same as provided] ...
     """
     functions = {}
     
@@ -150,58 +133,73 @@ def extract_c_functions(code: str) -> Dict[str, str]:
 
 def extract_c_macros(code: str) -> Dict[str, str]:
     """
-    Extracts multi-line C macro definitions, especially those containing complex 
-    code bodies (like the user's BODY example).
+    Extracts multi-line C macro definitions, specifically those that might contain
+    significant code changes (like function-like macros or multi-line bodies).
     
-    The pattern uses negative lookbehind (?<!\\) to stop capturing content 
-    only when a newline is NOT preceded by a backslash, effectively capturing 
-    the entire definition block including line continuations.
-    
-    Args:
-        code: The full source code content as a string.
-        
-    Returns:
-        Dictionary mapping {macro_name: full_macro_code_string}.
+    REVISED Pattern: Focuses on matching a #define line followed by zero or more 
+    lines that are continued using a backslash (\) character.
     """
     macros = {}
     
-    # Pattern: 
-    # ^\s*#define\s+([\w]+)\s* -> Match #define and capture the name (Group 1)
-    # (.*?)                     -> Non-greedy capture of content (Group 2)
-    # (?<!\\)\n                 -> Stop when a newline is found that is NOT preceded by a backslash
+    # Pattern:
+    # 1. ^\s*#define\s+([\w]+(?:\([\w,]*\))?)\s* -> Match #define and capture the name/params (Group 1)
+    # 2. (?:[^\n]*\\\n)+?                       -> Non-greedy match for 1+ lines ending in a backslash
+    # 3. [^\n]*$                                -> Match the final line that does NOT end with a backslash
     MACRO_BLOCK_PATTERN = re.compile(
-        r'^\s*#define\s+([\w]+)\s*(.*?)(?<!\\)\n',
-        re.MULTILINE | re.DOTALL
+        # Group 1: Macro Name (and optional parameters, e.g., MACRO(a, b))
+        r'^\s*#define\s+([\w]+(?:[\w,()]*))' 
+        # Group 2: The entire macro content block
+        r'(\s*(?:[^\n]*\\\n)*[^\n]*)\s*',
+        re.MULTILINE
     )
 
     for match in MACRO_BLOCK_PATTERN.finditer(code):
-        m_name = match.group(1)
+        # The full name (potentially with params)
+        m_name_raw = match.group(1).strip()
+        # Clean up name by removing parameters if present
+        m_name = m_name_raw.split('(')[0].strip() 
         
-        # Determine the start of the line containing #define to capture the full definition line
+        # Determine the full starting line index (to capture #define)
         define_line_start = code.rfind('\n', 0, match.start()) + 1
         
-        # The full macro code is from the start of the #define line up to the end of the match
+        # The content ends at the end of the match
         macro_code = code[define_line_start:match.end()].strip()
-        macros[m_name] = macro_code
+        
+        # Simple heuristic check: only include macros that span multiple lines or 
+        # contain complex structure (e.g., braces, semicolons)
+        if '\n' in macro_code or re.search(r'[{;]', strip_code_for_comparison(macro_code)):
+            if m_name not in macros:
+                macros[m_name] = macro_code
+                print(f"  [Macro Extracted] {m_name}")
+        else:
+             # Filters out simple #define PREPARE_LOOP \ int save_curcs; ...
+             # These are single logical lines, but multi-line in text. We still
+             # need to be careful. The previous simple filter was too harsh.
+             # Let's trust the regex more and filter less aggressively here.
+             
+             # Reverting to basic logic: if it's found, include it, but ensure we 
+             # are not capturing simple single-word definitions.
+             
+             # Final check: A macro that contains code (braces) or is explicitly multi-line is kept.
+             if '\n' in macro_code or re.search(r'[{;]', strip_code_for_comparison(macro_code)):
+                 if m_name not in macros:
+                    macros[m_name] = macro_code
+                    print(f"  [Macro Extracted] {m_name}")
+             else:
+                 print(f"  [Macro Skipped - Simple Definition] {m_name}")
 
+
+    print(f"Total multi-line/complex macros extracted: {len(macros)}")
     return macros
 
 
 def generate_changes_diff(v_code: str, p_code: str) -> str:
     """
     Generates a unified diff string between the vulnerable and patched code unit.
-    
-    Args:
-        v_code: Vulnerable code string.
-        p_code: Patched code string.
-        
-    Returns:
-        Unified diff string (empty if no changes found).
     """
     v_lines = v_code.splitlines(keepends=True)
     p_lines = p_code.splitlines(keepends=True)
     
-    # Generate unified diff, excluding timestamps and file paths for cleaner output
     diff = difflib.unified_diff(
         v_lines, 
         p_lines, 
@@ -210,22 +208,12 @@ def generate_changes_diff(v_code: str, p_code: str) -> str:
         lineterm=''
     )
     
-    # Join diff lines into a single string
     return "".join(diff)
 
 def get_function_level_changes(full_df: pd.DataFrame) -> pd.DataFrame:
     """
     Analyzes the full file dataset to extract and compare individual C functions
     AND multi-line C macros that have been modified, generating the function-level dataset.
-    
-    Uses stripped code for comparison filtering but generates output using the original code.
-    
-    Args:
-        full_df: The DataFrame generated by the main extraction process, 
-                 containing V_CODE and P_CODE columns.
-        
-    Returns:
-        DataFrame containing only the modified code units with required columns.
     """
     function_results = []
     
@@ -239,14 +227,22 @@ def get_function_level_changes(full_df: pd.DataFrame) -> pd.DataFrame:
         v_full_code = row['V_CODE']
         p_full_code = row['P_CODE']
         
+        # Ensure code exists for comparison (handle additions/deletions)
+        if not v_full_code and not p_full_code:
+            continue
+        
+        print(f"-> Analyzing {file_path} for CVE {cve_id}...")
+        
         # 1. Extract Functions
         v_funcs = extract_c_functions(v_full_code)
         p_funcs = extract_c_functions(p_full_code)
+        print(f"  Vulnerable Functions: {len(v_funcs)}, Patched Functions: {len(p_funcs)}")
         
         # 2. Extract Macros
         v_macros = extract_c_macros(v_full_code)
         p_macros = extract_c_macros(p_full_code)
-        
+        print(f"  Vulnerable Macros: {len(v_macros)}, Patched Macros: {len(p_macros)}")
+
         # 3. Combine Functions and Macros into one dictionary for comparison
         v_units = {**v_funcs, **v_macros}
         p_units = {**p_funcs, **p_macros}
@@ -255,6 +251,8 @@ def get_function_level_changes(full_df: pd.DataFrame) -> pd.DataFrame:
         all_unit_names = set(v_units.keys()) | set(p_units.keys())
         
         for unit_name in sorted(list(all_unit_names)):
+            unit_type = "MACRO" if unit_name in v_macros or unit_name in p_macros else "FUNCTION"
+            
             v_unit_code = v_units.get(unit_name, "")
             p_unit_code = p_units.get(unit_name, "")
             
@@ -264,6 +262,8 @@ def get_function_level_changes(full_df: pd.DataFrame) -> pd.DataFrame:
             
             if v_unit_code_stripped != p_unit_code_stripped:
                 # Code unit was modified by logical content
+                
+                print(f"  *** Found modified unit: {unit_name} ({unit_type}) ***")
                 
                 # 5. Generate the diff string using the ORIGINAL code (to keep full context)
                 changes_diff = generate_changes_diff(v_unit_code, p_unit_code)
@@ -275,6 +275,7 @@ def get_function_level_changes(full_df: pd.DataFrame) -> pd.DataFrame:
                     'P_COMMIT': p_commit,
                     'FilePath': file_path,
                     'F_NAME': unit_name,
+                    'UNIT_TYPE': unit_type, # Added for clarity
                     'V_FUNCTION': v_unit_code,
                     'P_FUNCTION': p_unit_code,
                     'CHANGES': changes_diff
@@ -286,19 +287,11 @@ def get_function_level_changes(full_df: pd.DataFrame) -> pd.DataFrame:
         
     results_df = pd.DataFrame(function_results)
     
-    return results_df[['CVE', 'V_COMMIT', 'P_COMMIT', 'FilePath', 'F_NAME', 'V_FUNCTION', 'P_FUNCTION', 'CHANGES']]
+    return results_df[['CVE', 'V_COMMIT', 'P_COMMIT', 'FilePath', 'F_NAME', 'UNIT_TYPE', 'V_FUNCTION', 'P_FUNCTION', 'CHANGES']]
 
 
 def fetch_csv_data_from_local(filename: str) -> pd.DataFrame:
-    """
-    Read and parse a CSV file located in the same directory as this script.
-    
-    Args:
-        filename: Name of the CSV file in the script directory
-        
-    Returns:
-        DataFrame containing the CSV data
-    """
+    """Read and parse a CSV file located in the same directory as this script."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(script_dir, filename)
     
@@ -314,21 +307,11 @@ def fetch_csv_data_from_local(filename: str) -> pd.DataFrame:
 
 
 def setup_git_repository(repo_path: str, repo_url: str) -> git.Repo:
-    """
-    Clone or open the glibc git repository.
-    
-    Args:
-        repo_path: Local path where repository should be stored
-        repo_url: URL of the git repository
-        
-    Returns:
-        GitPython Repo object
-    """
+    """Clone or open the glibc git repository."""
     if os.path.exists(repo_path):
         print(f"Opening existing repository at {repo_path}")
         repo = git.Repo(repo_path)
         
-        # Fetch latest changes
         print("Fetching latest changes from remote...")
         try:
             origin = repo.remotes.origin
@@ -346,24 +329,12 @@ def setup_git_repository(repo_path: str, repo_url: str) -> git.Repo:
 
 
 def get_full_file_content(repo: git.Repo, commit_hash: str, file_path: str) -> Optional[str]:
-    """
-    Get the full content of a file at a specific commit.
-    
-    Args:
-        repo: GitPython Repo object
-        commit_hash: The commit hash
-        file_path: Path to the file in the repository
-        
-    Returns:
-        Full file content as string, or None if file doesn't exist
-    """
+    """Get the full content of a file at a specific commit."""
     try:
         commit = repo.commit(commit_hash)
-        # Use git show to get file content at specific commit
         file_content = (commit.tree / file_path).data_stream.read()
         return file_content.decode('utf-8', errors='ignore')
     except (KeyError, AttributeError):
-        # File doesn't exist at this commit
         return None
     except Exception as e:
         print(f"Error reading file {file_path} at commit {commit_hash}: {e}")
@@ -371,26 +342,14 @@ def get_full_file_content(repo: git.Repo, commit_hash: str, file_path: str) -> O
 
 
 def extract_all_c_files_from_commit(repo: git.Repo, commit_hash: str) -> Tuple[Optional[str], List[Dict]]:
-    """
-    Extract FULL vulnerable and patched code from ALL .c files in a git commit.
-    Gets the complete file content before and after the commit for every .c file.
-    
-    Args:
-        repo: GitPython Repo object
-        commit_hash: The commit hash to analyze (P_COMMIT)
-        
-    Returns:
-        Tuple: (V_COMMIT hash, List of dicts with file_path, vulnerable_code, patched_code)
-    """
+    """Extract FULL vulnerable and patched code from ALL .c files in a git commit."""
     print(f"Processing commit hash: {commit_hash}")
     
     v_commit_hash: Optional[str] = None
     
     try:
-        # Get the commit object (P_COMMIT)
         commit = repo.commit(commit_hash)
         
-        # Get parent commit (the vulnerable version - V_COMMIT)
         if not commit.parents:
             print(f"Commit {commit_hash} has no parents (initial commit), skipping...")
             return None, []
@@ -399,7 +358,6 @@ def extract_all_c_files_from_commit(repo: git.Repo, commit_hash: str) -> Tuple[O
         v_commit_hash = parent_commit.hexsha
         print(f"Parent commit (V_COMMIT): {v_commit_hash}")
         
-        # Get the diff to find which files were modified
         diffs = parent_commit.diff(commit)
         
         print(f"Found {len(diffs)} file(s) changed in commit")
@@ -408,25 +366,18 @@ def extract_all_c_files_from_commit(repo: git.Repo, commit_hash: str) -> Tuple[O
         c_files_found = 0
         
         for diff_item in diffs:
-            # Get the file path
             file_path = diff_item.b_path or diff_item.a_path
             
-            if not file_path:
-                continue
-            
-            if not file_path.endswith('.c'):
-                print(f"  Skipping {file_path} (not a .c file)")
+            if not file_path or not file_path.endswith('.c'):
                 continue
             
             c_files_found += 1
             
-            # Get FULL file content from parent commit (vulnerable version)
             vulnerable_code = get_full_file_content(repo, v_commit_hash, file_path)
-            
-            # Get FULL file content from current commit (patched version)
             patched_code = get_full_file_content(repo, commit.hexsha, file_path)
             
-            # Handle file additions/deletions
+            # ... [Code for handling additions/deletions/skipping remains the same] ...
+            
             if vulnerable_code is None and patched_code is not None:
                 print(f"  ℹ {file_path}: New file added (no vulnerable version)")
                 vulnerable_code = ""
@@ -460,20 +411,13 @@ def extract_all_c_files_from_commit(repo: git.Repo, commit_hash: str) -> Tuple[O
     except Exception as e:
         print(f"Error processing commit {commit_hash}: {e}")
         import traceback
-        traceback.print_exc()
+        print(traceback.format_exc())
         return None, []
 
 
 def group_cves_by_commit(df: pd.DataFrame) -> Dict[str, List[str]]:
-    """
-    Group CVE IDs by their P_COMMIT hash to avoid processing the same commit multiple times.
-    
-    Args:
-        df: DataFrame with CVE and P_COMMIT columns
-        
-    Returns:
-        Dictionary mapping commit_hash -> list of CVE IDs
-    """
+    """Group CVE IDs by their P_COMMIT hash to avoid processing the same commit multiple times."""
+    # ... [Function body remains the same as provided] ...
     commit_to_cves = {}
     
     for _, row in df.iterrows():
@@ -489,7 +433,6 @@ def group_cves_by_commit(df: pd.DataFrame) -> Dict[str, List[str]]:
         if commit_hash not in commit_to_cves:
             commit_to_cves[commit_hash] = []
         
-        # Add CVE to this commit's list (avoid duplicates)
         if cve_id not in commit_to_cves[commit_hash]:
             commit_to_cves[commit_hash].append(cve_id)
     
@@ -497,9 +440,17 @@ def group_cves_by_commit(df: pd.DataFrame) -> Dict[str, List[str]]:
 
 
 def main():
-    """
-    Main function to orchestrate the entire extraction process.
-    """
+    """Main function to orchestrate the entire extraction process."""
+    global log_file
+    
+    # Step 0: Initialize Logging
+    try:
+        log_file = open(LOG_OUTPUT_FILE, 'w')
+        print(f"Logging output to {LOG_OUTPUT_FILE}")
+    except Exception as e:
+        print(f"FATAL: Could not open log file {LOG_OUTPUT_FILE}: {e}")
+        return
+        
     print("=" * 80)
     print("CVE Patch Extractor - Full File & Function Level Version")
     print("=" * 80)
@@ -523,8 +474,7 @@ def main():
         repo = setup_git_repository(REPO_CACHE_DIR, GLIBC_REPO_URL)
     except Exception as e:
         print(f"Error setting up repository: {e}")
-        import traceback
-        traceback.print_exc()
+        print(traceback.format_exc())
         return
     
     all_file_results = []
@@ -567,12 +517,12 @@ def main():
         print(f"{'='*80}")
         
         full_df = pd.DataFrame(all_file_results)
-        # Use quoting=csv.QUOTE_ALL for multiline code strings
         full_df.to_csv(FULL_FILE_OUTPUT_FILE, index=False, quoting=csv.QUOTE_ALL)
         
         print(f"Full file dataset saved successfully!")
     else:
         print("\nNo full file results to save. Cannot proceed to function analysis.")
+        log_file.close()
         return
     
     # Step 5: Generate Function-Level Dataset
@@ -584,27 +534,33 @@ def main():
         print(f"Saving {len(function_df)} rows to FUNCTION LEVEL DATASET: {FUNCTION_OUTPUT_FILE}")
         print(f"{'='*80}")
         
+        # Ensure the new UNIT_TYPE column is included
         function_df.to_csv(FUNCTION_OUTPUT_FILE, index=False, quoting=csv.QUOTE_ALL)
         print(f"Function-level dataset saved successfully!")
         
         # Show sample of function-level results
         print(f"\nSample of function-level data:")
-        print(function_df[['CVE', 'V_COMMIT', 'F_NAME']].head(10))
+        print(function_df[['CVE', 'V_COMMIT', 'F_NAME', 'UNIT_TYPE']].head(10))
         
         # Show statistics about function code sizes
         function_df['V_FUNC_lines'] = function_df['V_FUNCTION'].apply(lambda x: len(x.splitlines()) if x else 0)
         function_df['P_FUNC_lines'] = function_df['P_FUNCTION'].apply(lambda x: len(x.splitlines()) if x else 0)
         print(f"\nFunction code size statistics:")
-        print(f"  - Total unique modified functions: {function_df['F_NAME'].nunique()}")
-        print(f"  - Average vulnerable function lines: {function_df['V_FUNC_lines'].mean():.1f}")
-        print(f"  - Average patched function lines: {function_df['P_FUNC_lines'].mean():.1f}")
+        print(f"  - Total unique modified units (Funcs/Macros): {len(function_df)}")
+        print(f"  - Modified Functions: {len(function_df[function_df['UNIT_TYPE'] == 'FUNCTION'])}")
+        print(f"  - Modified MACROS: {len(function_df[function_df['UNIT_TYPE'] == 'MACRO'])}")
+        print(f"  - Average vulnerable unit lines: {function_df['V_FUNC_lines'].mean():.1f}")
+        print(f"  - Average patched unit lines: {function_df['P_FUNC_lines'].mean():.1f}")
     else:
         print("\nNo function-level changes found to save.")
     
     print("\n" + "=" * 80)
     print("Extraction and analysis complete!")
     print("=" * 80)
-
+    
+    # Final cleanup
+    if log_file:
+        log_file.close()
 
 if __name__ == "__main__":
     main()
