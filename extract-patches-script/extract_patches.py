@@ -1,3 +1,4 @@
+import traceback
 import pandas as pd
 import git
 import os
