@@ -9,5 +9,5 @@
 __pycache__/
 *.py[cod]
 .DS_Store
-.file_dataset.csv
-.function_dataset.csv
+file_dataset.csv
+function_dataset.csv
