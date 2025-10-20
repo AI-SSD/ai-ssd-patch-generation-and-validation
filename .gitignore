@@ -9,5 +9,7 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# Ignore dataset CSV files
 file_dataset.csv
 function_dataset.csv
