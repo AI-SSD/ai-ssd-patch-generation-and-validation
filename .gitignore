@@ -11,7 +11,4 @@ __pycache__/
 .DS_Store
 
 # Ignore dataset CSV files
-file_dataset.csv
-function_dataset.csv
 patched_dataset1.csv
-script.log
