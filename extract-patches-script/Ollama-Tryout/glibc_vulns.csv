@@ -1,0 +1,626 @@
+CVE;V_COMMIT;P_COMMIT;FilePath;F_NAME;UNIT_TYPE;V_FUNCTION;P_FUNCTION;CHANGES
+CVE-2005-3590;9c06eb66b5b4662c22532ab03525eab46c4cf2eb;6c215a8d6c972ca3324107109c393f21e782fb10;grp/initgroups.c;getgrouplist;FUNCTION;"int
+getgrouplist (const char *user, gid_t group, gid_t *groups, int *ngroups)
+{
+  gid_t *newgroups;
+  long int size = MAX (1, *ngroups);
+  int result;
+
+  newgroups = (gid_t *) malloc ((size + 1) * sizeof (gid_t));
+  if (__builtin_expect (newgroups == NULL, 0))
+    /* No more memory.  */
+    // XXX This is wrong.  The user provided memory, we have to use
+    // XXX it.  The internal functions must be called with the user
+    // XXX provided buffer and not try to increase the size if it is
+    // XXX too small.  For initgroups a flag could say: increase size.
+    return -1;
+
+  result = internal_getgrouplist (user, group, &size, &newgroups, -1);
+
+  memcpy (groups, newgroups, MIN (*ngroups, result) * sizeof (gid_t));
+
+  if (result > *ngroups)
+    {
+      *ngroups = result;
+      result = -1;
+    }
+  else
+    *ngroups = result;
+
+  free (newgroups);
+  return result;
+}";"int
+getgrouplist (const char *user, gid_t group, gid_t *groups, int *ngroups)
+{
+  long int size = MAX (1, *ngroups);
+
+  gid_t *newgroups = (gid_t *) malloc ((size + 1) * sizeof (gid_t));
+  if (__builtin_expect (newgroups == NULL, 0))
+    /* No more memory.  */
+    // XXX This is wrong.  The user provided memory, we have to use
+    // XXX it.  The internal functions must be called with the user
+    // XXX provided buffer and not try to increase the size if it is
+    // XXX too small.  For initgroups a flag could say: increase size.
+    return -1;
+
+  int total = internal_getgrouplist (user, group, &size, &newgroups, -1);
+
+  memcpy (groups, newgroups, MIN (*ngroups, total) * sizeof (gid_t));
+
+  free (newgroups);
+
+  int retval = total > *ngroups ? -1 : total;
+  *ngroups = total;
+
+  return retval;
+}";"--- vulnerable+++ patched@@ -1,11 +1,9 @@ int
+ getgrouplist (const char *user, gid_t group, gid_t *groups, int *ngroups)
+ {
+-  gid_t *newgroups;
+   long int size = MAX (1, *ngroups);
+-  int result;
+ 
+-  newgroups = (gid_t *) malloc ((size + 1) * sizeof (gid_t));
++  gid_t *newgroups = (gid_t *) malloc ((size + 1) * sizeof (gid_t));
+   if (__builtin_expect (newgroups == NULL, 0))
+     /* No more memory.  */
+     // XXX This is wrong.  The user provided memory, we have to use
+@@ -14,18 +12,14 @@     // XXX too small.  For initgroups a flag could say: increase size.
+     return -1;
+ 
+-  result = internal_getgrouplist (user, group, &size, &newgroups, -1);
++  int total = internal_getgrouplist (user, group, &size, &newgroups, -1);
+ 
+-  memcpy (groups, newgroups, MIN (*ngroups, result) * sizeof (gid_t));
+-
+-  if (result > *ngroups)
+-    {
+-      *ngroups = result;
+-      result = -1;
+-    }
+-  else
+-    *ngroups = result;
++  memcpy (groups, newgroups, MIN (*ngroups, total) * sizeof (gid_t));
+ 
+   free (newgroups);
+-  return result;
++
++  int retval = total > *ngroups ? -1 : total;
++  *ngroups = total;
++
++  return retval;
+ }"
+CVE-2013-4332;1159a193696ad48ec86e5895f6dee3e539619c0e;55e17aadc1ef17a1df9626fb0e9fba290ece3331;malloc/malloc.c;__libc_valloc;FUNCTION;"*
+__libc_valloc(size_t bytes)
+{
+  mstate ar_ptr;
+  void *p;
+
+  if(__malloc_initialized < 0)
+    ptmalloc_init ();
+
+  size_t pagesz = GLRO(dl_pagesize);
+
+  void *(*hook) (size_t, size_t, const void *) =
+    force_reg (__memalign_hook);
+  if (__builtin_expect (hook != NULL, 0))
+    return (*hook)(pagesz, bytes, RETURN_ADDRESS (0));
+
+  arena_get(ar_ptr, bytes + pagesz + MINSIZE);
+  if(!ar_ptr)
+    return 0;
+  p = _int_valloc(ar_ptr, bytes);
+  if(!p) {
+    ar_ptr = arena_get_retry (ar_ptr, bytes);
+    if (__builtin_expect(ar_ptr != NULL, 1)) {
+      p = _int_memalign(ar_ptr, pagesz, bytes);
+      (void)mutex_unlock(&ar_ptr->mutex);
+    }
+  } else
+    (void)mutex_unlock (&ar_ptr->mutex);
+  assert(!p || chunk_is_mmapped(mem2chunk(p)) ||
+	 ar_ptr == arena_for_chunk(mem2chunk(p)));
+
+  return p;
+}";"*
+__libc_valloc(size_t bytes)
+{
+  mstate ar_ptr;
+  void *p;
+
+  if(__malloc_initialized < 0)
+    ptmalloc_init ();
+
+  size_t pagesz = GLRO(dl_pagesize);
+
+  /* Check for overflow.  */
+  if (bytes > SIZE_MAX - pagesz - MINSIZE)
+    {
+      __set_errno (ENOMEM);
+      return 0;
+    }
+
+  void *(*hook) (size_t, size_t, const void *) =
+    force_reg (__memalign_hook);
+  if (__builtin_expect (hook != NULL, 0))
+    return (*hook)(pagesz, bytes, RETURN_ADDRESS (0));
+
+  arena_get(ar_ptr, bytes + pagesz + MINSIZE);
+  if(!ar_ptr)
+    return 0;
+  p = _int_valloc(ar_ptr, bytes);
+  if(!p) {
+    ar_ptr = arena_get_retry (ar_ptr, bytes);
+    if (__builtin_expect(ar_ptr != NULL, 1)) {
+      p = _int_memalign(ar_ptr, pagesz, bytes);
+      (void)mutex_unlock(&ar_ptr->mutex);
+    }
+  } else
+    (void)mutex_unlock (&ar_ptr->mutex);
+  assert(!p || chunk_is_mmapped(mem2chunk(p)) ||
+	 ar_ptr == arena_for_chunk(mem2chunk(p)));
+
+  return p;
+}";"--- vulnerable+++ patched@@ -8,6 +8,13 @@     ptmalloc_init ();
+ 
+   size_t pagesz = GLRO(dl_pagesize);
++
++  /* Check for overflow.  */
++  if (bytes > SIZE_MAX - pagesz - MINSIZE)
++    {
++      __set_errno (ENOMEM);
++      return 0;
++    }
+ 
+   void *(*hook) (size_t, size_t, const void *) =
+     force_reg (__memalign_hook);"
+CVE-2013-4332;c7cabd1355e79b7e111904bb3985908cae185b73;1159a193696ad48ec86e5895f6dee3e539619c0e;malloc/malloc.c;__libc_pvalloc;FUNCTION;"*
+__libc_pvalloc(size_t bytes)
+{
+  mstate ar_ptr;
+  void *p;
+
+  if(__malloc_initialized < 0)
+    ptmalloc_init ();
+
+  size_t pagesz = GLRO(dl_pagesize);
+  size_t page_mask = GLRO(dl_pagesize) - 1;
+  size_t rounded_bytes = (bytes + page_mask) & ~(page_mask);
+
+  void *(*hook) (size_t, size_t, const void *) =
+    force_reg (__memalign_hook);
+  if (__builtin_expect (hook != NULL, 0))
+    return (*hook)(pagesz, rounded_bytes, RETURN_ADDRESS (0));
+
+  arena_get(ar_ptr, bytes + 2*pagesz + MINSIZE);
+  p = _int_pvalloc(ar_ptr, bytes);
+  if(!p) {
+    ar_ptr = arena_get_retry (ar_ptr, bytes + 2*pagesz + MINSIZE);
+    if (__builtin_expect(ar_ptr != NULL, 1)) {
+      p = _int_memalign(ar_ptr, pagesz, rounded_bytes);
+      (void)mutex_unlock(&ar_ptr->mutex);
+    }
+  } else
+    (void)mutex_unlock(&ar_ptr->mutex);
+  assert(!p || chunk_is_mmapped(mem2chunk(p)) ||
+	 ar_ptr == arena_for_chunk(mem2chunk(p)));
+
+  return p;
+}";"*
+__libc_pvalloc(size_t bytes)
+{
+  mstate ar_ptr;
+  void *p;
+
+  if(__malloc_initialized < 0)
+    ptmalloc_init ();
+
+  size_t pagesz = GLRO(dl_pagesize);
+  size_t page_mask = GLRO(dl_pagesize) - 1;
+  size_t rounded_bytes = (bytes + page_mask) & ~(page_mask);
+
+  /* Check for overflow.  */
+  if (bytes > SIZE_MAX - 2*pagesz - MINSIZE)
+    {
+      __set_errno (ENOMEM);
+      return 0;
+    }
+
+  void *(*hook) (size_t, size_t, const void *) =
+    force_reg (__memalign_hook);
+  if (__builtin_expect (hook != NULL, 0))
+    return (*hook)(pagesz, rounded_bytes, RETURN_ADDRESS (0));
+
+  arena_get(ar_ptr, bytes + 2*pagesz + MINSIZE);
+  p = _int_pvalloc(ar_ptr, bytes);
+  if(!p) {
+    ar_ptr = arena_get_retry (ar_ptr, bytes + 2*pagesz + MINSIZE);
+    if (__builtin_expect(ar_ptr != NULL, 1)) {
+      p = _int_memalign(ar_ptr, pagesz, rounded_bytes);
+      (void)mutex_unlock(&ar_ptr->mutex);
+    }
+  } else
+    (void)mutex_unlock(&ar_ptr->mutex);
+  assert(!p || chunk_is_mmapped(mem2chunk(p)) ||
+	 ar_ptr == arena_for_chunk(mem2chunk(p)));
+
+  return p;
+}";"--- vulnerable+++ patched@@ -10,6 +10,13 @@   size_t pagesz = GLRO(dl_pagesize);
+   size_t page_mask = GLRO(dl_pagesize) - 1;
+   size_t rounded_bytes = (bytes + page_mask) & ~(page_mask);
++
++  /* Check for overflow.  */
++  if (bytes > SIZE_MAX - 2*pagesz - MINSIZE)
++    {
++      __set_errno (ENOMEM);
++      return 0;
++    }
+ 
+   void *(*hook) (size_t, size_t, const void *) =
+     force_reg (__memalign_hook);"
+CVE-2016-5417;2beb1010e4cc7083f8e253db8af615476c9959fd;5e7fdabd7df1fc6c56d104e61390bf5a6b526c38;resolv/res_init.c;__res_iclose;FUNCTION;"void
+__res_iclose(res_state statp, bool free_addr) {
+	int ns;
+
+	if (statp->_vcsock >= 0) {
+		close_not_cancel_no_status(statp->_vcsock);
+		statp->_vcsock = -1;
+		statp->_flags &= ~(RES_F_VC | RES_F_CONN);
+	}
+	for (ns = 0; ns < statp->_u._ext.nscount; ns++)
+		if (statp->_u._ext.nsaddrs[ns]) {
+			if (statp->_u._ext.nssocks[ns] != -1) {
+				close_not_cancel_no_status(statp->_u._ext.nssocks[ns]);
+				statp->_u._ext.nssocks[ns] = -1;
+			}
+			if (free_addr) {
+				free (statp->_u._ext.nsaddrs[ns]);
+				statp->_u._ext.nsaddrs[ns] = NULL;
+			}
+		}
+}";"void
+__res_iclose(res_state statp, bool free_addr) {
+	int ns;
+
+	if (statp->_vcsock >= 0) {
+		close_not_cancel_no_status(statp->_vcsock);
+		statp->_vcsock = -1;
+		statp->_flags &= ~(RES_F_VC | RES_F_CONN);
+	}
+	for (ns = 0; ns < statp->nscount; ns++)
+		if (statp->_u._ext.nsaddrs[ns]) {
+			if (statp->_u._ext.nssocks[ns] != -1) {
+				close_not_cancel_no_status(statp->_u._ext.nssocks[ns]);
+				statp->_u._ext.nssocks[ns] = -1;
+			}
+			if (free_addr) {
+				free (statp->_u._ext.nsaddrs[ns]);
+				statp->_u._ext.nsaddrs[ns] = NULL;
+			}
+		}
+}";"--- vulnerable+++ patched@@ -7,7 +7,7 @@ 		statp->_vcsock = -1;
+ 		statp->_flags &= ~(RES_F_VC | RES_F_CONN);
+ 	}
+-	for (ns = 0; ns < statp->_u._ext.nscount; ns++)
++	for (ns = 0; ns < statp->nscount; ns++)
+ 		if (statp->_u._ext.nsaddrs[ns]) {
+ 			if (statp->_u._ext.nssocks[ns] != -1) {
+ 				close_not_cancel_no_status(statp->_u._ext.nssocks[ns]);"
+CVE-2014-9761;79e0d340a9e7fb2c931686462131c92b99611003;8f5e8b01a1da2a207228f2072c934fa5918554b8;math/s_nan.c;__nan;FUNCTION;"double
+__nan (const char *tagp)
+{
+  if (tagp[0] != '\0')
+    {
+      char buf[6 + strlen (tagp)];
+      sprintf (buf, ""NAN(%s)"", tagp);
+      return strtod (buf, NULL);
+    }
+
+  return NAN;
+}";"double
+__nan (const char *tagp)
+{
+  return __strtod_nan (tagp, NULL, 0);
+}";"--- vulnerable+++ patched@@ -1,12 +1,5 @@ double
+ __nan (const char *tagp)
+ {
+-  if (tagp[0] != '\0')
+-    {
+-      char buf[6 + strlen (tagp)];
+-      sprintf (buf, ""NAN(%s)"", tagp);
+-      return strtod (buf, NULL);
+-    }
+-
+-  return NAN;
++  return __strtod_nan (tagp, NULL, 0);
+ }"
+CVE-2014-9761;79e0d340a9e7fb2c931686462131c92b99611003;8f5e8b01a1da2a207228f2072c934fa5918554b8;math/s_nanf.c;__nanf;FUNCTION;"float
+__nanf (const char *tagp)
+{
+  if (tagp[0] != '\0')
+    {
+      char buf[6 + strlen (tagp)];
+      sprintf (buf, ""NAN(%s)"", tagp);
+      return strtof (buf, NULL);
+    }
+
+  return NAN;
+}";"float
+__nanf (const char *tagp)
+{
+  return __strtof_nan (tagp, NULL, 0);
+}";"--- vulnerable+++ patched@@ -1,12 +1,5 @@ float
+ __nanf (const char *tagp)
+ {
+-  if (tagp[0] != '\0')
+-    {
+-      char buf[6 + strlen (tagp)];
+-      sprintf (buf, ""NAN(%s)"", tagp);
+-      return strtof (buf, NULL);
+-    }
+-
+-  return NAN;
++  return __strtof_nan (tagp, NULL, 0);
+ }"
+CVE-2014-9761;79e0d340a9e7fb2c931686462131c92b99611003;8f5e8b01a1da2a207228f2072c934fa5918554b8;math/s_nanl.c;__nanl;FUNCTION;"long double
+__nanl (const char *tagp)
+{
+  if (tagp[0] != '\0')
+    {
+      char buf[6 + strlen (tagp)];
+      sprintf (buf, ""NAN(%s)"", tagp);
+      return strtold (buf, NULL);
+    }
+
+  return NAN;
+}";"long double
+__nanl (const char *tagp)
+{
+  return __strtold_nan (tagp, NULL, 0);
+}";"--- vulnerable+++ patched@@ -1,12 +1,5 @@ long double
+ __nanl (const char *tagp)
+ {
+-  if (tagp[0] != '\0')
+-    {
+-      char buf[6 + strlen (tagp)];
+-      sprintf (buf, ""NAN(%s)"", tagp);
+-      return strtold (buf, NULL);
+-    }
+-
+-  return NAN;
++  return __strtold_nan (tagp, NULL, 0);
+ }"
+CVE-2015-8778;8a71d2e27fd067a85059aefb93c9ce83142b03e9;bae7c7c764413b23e61cb099ce33be4c4ee259bb;misc/hsearch_r.c;__hcreate_r;FUNCTION;"int
+__hcreate_r (size_t nel, struct hsearch_data *htab)
+{
+  /* Test for correct arguments.  */
+  if (htab == NULL)
+    {
+      __set_errno (EINVAL);
+      return 0;
+    }
+
+  if (nel >= SIZE_MAX / sizeof (_ENTRY))
+    {
+      __set_errno (ENOMEM);
+      return 0;
+    }
+
+
+  /* There is still another table active. Return with error. */
+  if (htab->table != NULL)
+    return 0;
+
+  /* We need a size of at least 3.  Otherwise the hash functions we
+     use will not work.  */
+  if (nel < 3)
+    nel = 3;
+  /* Change nel to the first prime number not smaller as nel. */
+  nel |= 1;      /* make odd */
+  while (!isprime (nel))
+    nel += 2;
+
+  htab->size = nel;
+  htab->filled = 0;
+
+  /* allocate memory and zero out */
+  htab->table = (_ENTRY *) calloc (htab->size + 1, sizeof (_ENTRY));
+  if (htab->table == NULL)
+    return 0;
+
+  /* everything went alright */
+  return 1;
+}";"int
+__hcreate_r (size_t nel, struct hsearch_data *htab)
+{
+  /* Test for correct arguments.  */
+  if (htab == NULL)
+    {
+      __set_errno (EINVAL);
+      return 0;
+    }
+
+  /* There is still another table active. Return with error. */
+  if (htab->table != NULL)
+    return 0;
+
+  /* We need a size of at least 3.  Otherwise the hash functions we
+     use will not work.  */
+  if (nel < 3)
+    nel = 3;
+
+  /* Change nel to the first prime number in the range [nel, UINT_MAX - 2],
+     The '- 2' means 'nel += 2' cannot overflow.  */
+  for (nel |= 1; ; nel += 2)
+    {
+      if (UINT_MAX - 2 < nel)
+	{
+	  __set_errno (ENOMEM);
+	  return 0;
+	}
+      if (isprime (nel))
+	break;
+    }
+
+  htab->size = nel;
+  htab->filled = 0;
+
+  /* allocate memory and zero out */
+  htab->table = (_ENTRY *) calloc (htab->size + 1, sizeof (_ENTRY));
+  if (htab->table == NULL)
+    return 0;
+
+  /* everything went alright */
+  return 1;
+}";"--- vulnerable+++ patched@@ -8,13 +8,6 @@       return 0;
+     }
+ 
+-  if (nel >= SIZE_MAX / sizeof (_ENTRY))
+-    {
+-      __set_errno (ENOMEM);
+-      return 0;
+-    }
+-
+-
+   /* There is still another table active. Return with error. */
+   if (htab->table != NULL)
+     return 0;
+@@ -23,10 +16,19 @@      use will not work.  */
+   if (nel < 3)
+     nel = 3;
+-  /* Change nel to the first prime number not smaller as nel. */
+-  nel |= 1;      /* make odd */
+-  while (!isprime (nel))
+-    nel += 2;
++
++  /* Change nel to the first prime number in the range [nel, UINT_MAX - 2],
++     The '- 2' means 'nel += 2' cannot overflow.  */
++  for (nel |= 1; ; nel += 2)
++    {
++      if (UINT_MAX - 2 < nel)
++	{
++	  __set_errno (ENOMEM);
++	  return 0;
++	}
++      if (isprime (nel))
++	break;
++    }
+ 
+   htab->size = nel;
+   htab->filled = 0;"
+CVE-2015-8778;8a71d2e27fd067a85059aefb93c9ce83142b03e9;bae7c7c764413b23e61cb099ce33be4c4ee259bb;misc/hsearch_r.c;isprime;FUNCTION;"static int
+isprime (unsigned int number)
+{
+  /* no even number will be passed */
+  unsigned int div = 3;
+
+  while (div * div < number && number % div != 0)
+    div += 2;
+
+  return number % div != 0;
+}";"static int
+isprime (unsigned int number)
+{
+  /* no even number will be passed */
+  for (unsigned int div = 3; div <= number / div; div += 2)
+    if (number % div == 0)
+      return 0;
+  return 1;
+}";"--- vulnerable+++ patched@@ -2,10 +2,8 @@ isprime (unsigned int number)
+ {
+   /* no even number will be passed */
+-  unsigned int div = 3;
+-
+-  while (div * div < number && number % div != 0)
+-    div += 2;
+-
+-  return number % div != 0;
++  for (unsigned int div = 3; div <= number / div; div += 2)
++    if (number % div == 0)
++      return 0;
++  return 1;
+ }"
+CVE-2013-4332;55e17aadc1ef17a1df9626fb0e9fba290ece3331;b73ed247781d533628b681f57257dc85882645d3;malloc/malloc.c;__libc_memalign;FUNCTION;"*
+__libc_memalign(size_t alignment, size_t bytes)
+{
+  mstate ar_ptr;
+  void *p;
+
+  void *(*hook) (size_t, size_t, const void *) =
+    force_reg (__memalign_hook);
+  if (__builtin_expect (hook != NULL, 0))
+    return (*hook)(alignment, bytes, RETURN_ADDRESS (0));
+
+  /* If need less alignment than we give anyway, just relay to malloc */
+  if (alignment <= MALLOC_ALIGNMENT) return __libc_malloc(bytes);
+
+  /* Otherwise, ensure that it is at least a minimum chunk size */
+  if (alignment <  MINSIZE) alignment = MINSIZE;
+
+  arena_get(ar_ptr, bytes + alignment + MINSIZE);
+  if(!ar_ptr)
+    return 0;
+  p = _int_memalign(ar_ptr, alignment, bytes);
+  if(!p) {
+    ar_ptr = arena_get_retry (ar_ptr, bytes);
+    if (__builtin_expect(ar_ptr != NULL, 1)) {
+      p = _int_memalign(ar_ptr, alignment, bytes);
+      (void)mutex_unlock(&ar_ptr->mutex);
+    }
+  } else
+    (void)mutex_unlock(&ar_ptr->mutex);
+  assert(!p || chunk_is_mmapped(mem2chunk(p)) ||
+	 ar_ptr == arena_for_chunk(mem2chunk(p)));
+  return p;
+}";"*
+__libc_memalign(size_t alignment, size_t bytes)
+{
+  mstate ar_ptr;
+  void *p;
+
+  void *(*hook) (size_t, size_t, const void *) =
+    force_reg (__memalign_hook);
+  if (__builtin_expect (hook != NULL, 0))
+    return (*hook)(alignment, bytes, RETURN_ADDRESS (0));
+
+  /* If need less alignment than we give anyway, just relay to malloc */
+  if (alignment <= MALLOC_ALIGNMENT) return __libc_malloc(bytes);
+
+  /* Otherwise, ensure that it is at least a minimum chunk size */
+  if (alignment <  MINSIZE) alignment = MINSIZE;
+
+  /* Check for overflow.  */
+  if (bytes > SIZE_MAX - alignment - MINSIZE)
+    {
+      __set_errno (ENOMEM);
+      return 0;
+    }
+
+  arena_get(ar_ptr, bytes + alignment + MINSIZE);
+  if(!ar_ptr)
+    return 0;
+  p = _int_memalign(ar_ptr, alignment, bytes);
+  if(!p) {
+    ar_ptr = arena_get_retry (ar_ptr, bytes);
+    if (__builtin_expect(ar_ptr != NULL, 1)) {
+      p = _int_memalign(ar_ptr, alignment, bytes);
+      (void)mutex_unlock(&ar_ptr->mutex);
+    }
+  } else
+    (void)mutex_unlock(&ar_ptr->mutex);
+  assert(!p || chunk_is_mmapped(mem2chunk(p)) ||
+	 ar_ptr == arena_for_chunk(mem2chunk(p)));
+  return p;
+}";"--- vulnerable+++ patched@@ -15,6 +15,13 @@   /* Otherwise, ensure that it is at least a minimum chunk size */
+   if (alignment <  MINSIZE) alignment = MINSIZE;
+ 
++  /* Check for overflow.  */
++  if (bytes > SIZE_MAX - alignment - MINSIZE)
++    {
++      __set_errno (ENOMEM);
++      return 0;
++    }
++
+   arena_get(ar_ptr, bytes + alignment + MINSIZE);
+   if(!ar_ptr)
+     return 0;"

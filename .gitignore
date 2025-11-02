@@ -1,15 +1,22 @@
 # Repository-level .gitignore
-# Ignore the local glibc checkout used by the extract-patches-script
-/extract-patches-script/glibc_repo/
 
-# Also ignore any top-level glibc_repo if present
-/glibc_repo/
+# 1) Local glibc checkouts anywhere
+**/glibc_repo/
 
-# Python and macOS common ignores
+# 2) Ignore PoC-RAG folder at repo root
+**/PoC-RAG/
+
+# 3) Ignore specific generated datasets
+**/patched_dataset1.csv
+**/Ollama-Tryout/10-PoC.csv
+
+# 4) Python and macOS clutter
 __pycache__/
 *.py[cod]
-.DS_Store
 
-# Ignore dataset CSV files
-patched_dataset1.csv
-PoC.py
+# 5) Ignore general dotfiles (e.g., .DS_Store) but keep essential VCS/config
+.*
+!.gitignore
+!.gitattributes
+!.github/
+!.vscode/
