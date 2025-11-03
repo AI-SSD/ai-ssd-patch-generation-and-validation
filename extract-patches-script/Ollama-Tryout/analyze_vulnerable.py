@@ -19,7 +19,6 @@ def analyze_code(client, index, cve, vulnerable_code):
     print(f"\n--- Analyzing CVE: {cve} (Row: {index}) ---")
     
     safe_cve_name = cve.replace('/', '_')
-    # CHANGED: Added the row index to the filename to make it unique
     output_filename = os.path.join(OUTPUT_DIR, f"{safe_cve_name}_Row-{index}_analysis.md")
     
     analysis_content = f"Analysis for CVE: {cve} (from CSV Row {index})\n"
