@@ -3,8 +3,10 @@
 # 1) Local glibc checkouts anywhere
 **/glibc_repo/
 
-# 2) Ignore PoC-RAG folder at repo root
+# 2) Ignore folder at repo root
 **/PoC-RAG/
+**/30128677/
+**/prompts/
 
 # 3) Ignore specific generated datasets
 **/patched_dataset1.csv
