@@ -3,11 +3,12 @@ import pandas as pd
 import ollama
 import sys
 import os
+import csv
 
 # --- Configuration ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Input CSV file
-CSV_FILE_PATH = os.path.join(SCRIPT_DIR, 'glibc_vulns.csv')
+CSV_FILE_PATH = os.path.join(SCRIPT_DIR, 'glibc_vulns_full_context.csv')
 
 # --- Outputs ---
 # 1. Directory for individual .md files
@@ -18,10 +19,13 @@ OUTPUT_CSV_PATH = os.path.join(OUTPUT_MD_DIR, 'glibc_vulns_analyzed.csv')
 MODEL_NAME = 'qwen2.5-coder:7b'
 # ---------------------
 
-def analyze_code(client, index, cve, vulnerable_code):
+def analyze_code(client, index, cve, vulnerable_code, full_file_content):
     """
     Analyzes a vulnerable function using Ollama and returns the
     analysis, patched code, and explanation.
+    
+    Provides the LLM with the full file content for context, 
+    but prompts it to focus on the specific function.
     
     Returns a dictionary:
     {
@@ -33,16 +37,32 @@ def analyze_code(client, index, cve, vulnerable_code):
     print(f"\n--- Analyzing CVE: {cve} (Row: {index}) ---")
     results = {}
 
+    # --- Create the context string for the full file, if it exists ---
+    file_context_prompt = ""
+    # This check now handles 'full_file_content' being None
+    if full_file_content and not pd.isna(full_file_content) and full_file_content.strip():
+        file_context_prompt = f"""
+    For additional context, this function is from the following full file:
+    ```c
+    {full_file_content}
+    ```
+    """
+    # -----------------------------------------------------------------
+
     try:
-        # --- Prompt 1: Analyze the vulnerability ---
+        # --- Prompt 1: Analyze the vulnerability (No changes) ---
+        # This prompt is correctly focused on analyzing the *problem*.
         prompt1 = f"""
-        Here is a vulnerable C function from glibc (CVE: {cve}):
+        {file_context_prompt}
+
+        Here is the specific vulnerable C function from glibc (CVE: {cve}) that you must analyze:
         ```c
         {vulnerable_code}
         ```
-        Analyze this code and identify the security vulnerability.
+        Analyze *this specific function* and identify the security vulnerability.
         Explain the type of vulnerability (e.g., buffer overflow, integer overflow, use-after-free)
         and describe how it could be triggered. Do NOT generate a Proof of Concept (PoC).
+        Your analysis must focus on the function provided above, using the full file for context only.
         """
         response1 = client.chat(
             model=MODEL_NAME,
@@ -53,16 +73,43 @@ def analyze_code(client, index, cve, vulnerable_code):
         print("\n[Vulnerability Analysis]: Complete.")
         # print(vuln_analysis) # Optional: uncomment to see full analysis
 
-        # --- Prompt 2: Generate a patch (IMPROVED) ---
-        # Re-feed the vulnerable code to ensure context is not lost
+        # --- Prompt 2: Generate a patch (CHANGED) ---
+        # This prompt now explicitly allows for new helper functions
+        # but strictly enforces the single markdown block format.
         prompt2 = f"""
         You just analyzed the following vulnerable code for {cve}:
         ```c
         {vulnerable_code}
         ```
-        Based on your analysis, please generate a patched version of *this exact function* that fixes the security flaw.
-        Do not invent a new function. Modify the function provided above.
-        Only output the complete, patched C function, including the markdown backticks (```c ... ```).
+        {file_context_prompt}
+
+        Based on your analysis, please generate the patched C code to fix the vulnerability.
+
+        **Your output MUST adhere to these rules:**
+        1.  You **must** provide the complete, patched version of the original function (`{vulnerable_code}`).
+        2.  If the fix requires creating a **new helper function**, you **must** include that new helper function in your response.
+        3.  Your entire output **must** be a single C code block, enclosed in one pair of markdown backticks (```c ... ```). Place any new helper functions *before* the patched original function.
+
+        Example format (if a new helper is needed):
+        ```c
+        // New helper function (if required)
+        static int my_new_safe_check(char *input)
+        {{
+            // ... validation logic ...
+        }}
+
+        // Patched original function
+        void original_function_name(char *input, ...)
+        {{
+            // ... patched logic ...
+            if (!my_new_safe_check(input)) {{
+                // ... handle error ...
+            }}
+            // ...
+        }}
+        ```
+        
+        Only output the code. Do not add any explanation before or after the ````c` block.
         """
         response2 = client.chat(
             model=MODEL_NAME,
@@ -74,8 +121,9 @@ def analyze_code(client, index, cve, vulnerable_code):
         print("\n[Suggested Patch]: Complete.")
         # print(patched_code_raw) # Optional: uncomment to see full patch
 
-        # --- Prompt 3: Explain the patch (IMPROVED) ---
-        # Re-feed BOTH the original and the new patch for an accurate explanation
+        # --- Prompt 3: Explain the patch (CHANGED) ---
+        # This prompt is updated to ask for an explanation
+        # of any *new* functions that were created.
         prompt3 = f"""
         You just generated the following patch for {cve}:
         {patched_code_raw}
@@ -86,8 +134,10 @@ def analyze_code(client, index, cve, vulnerable_code):
         ```
         Explain the changes you made (the "diff") and why they
         effectively mitigate the vulnerability.
-        Please be specific about the lines changed and the logic behind the fix.
-        Format this explanation like a git commit message or diff notes.
+
+        - Be specific about the lines changed in the original function.
+        - **If you added any new helper functions,** explain their purpose and why they were necessary for the fix.
+        - Format this explanation like a git commit message or diff notes.
         """
         response3 = client.chat(
             model=MODEL_NAME,
@@ -109,6 +159,14 @@ def analyze_code(client, index, cve, vulnerable_code):
         }
 
 def main():
+    # Increase CSV field limit for large file contents
+    try:
+        # Set to the maximum size supported by the system
+        csv.field_size_limit(sys.maxsize)
+    except OverflowError:
+        # Handle potential OverflowError on 32-bit systems
+        csv.field_size_limit(int(2**31 - 1))
+
     # Create output directory for markdown files if it doesn't exist
     if not os.path.exists(OUTPUT_MD_DIR):
         os.makedirs(OUTPUT_MD_DIR)
@@ -125,17 +183,26 @@ def main():
         print(f"Error reading CSV: {e}")
         sys.exit(1)
 
-    # Define the columns we expect to read
-    input_columns = ['CVE', 'V_COMMIT', 'FilePath', 'F_NAME', 'UNIT_TYPE', 'V_FUNCTION']
+    # --- CHANGED: Make V_FILE optional ---
+
+    # Define the columns we absolutely REQUIRE
+    required_input_columns = ['CVE', 'V_COMMIT', 'FilePath', 'F_NAME', 'UNIT_TYPE', 'V_FUNCTION']
     
-    # Check if all required input columns exist
-    missing_cols = [col for col in input_columns if col not in df.columns]
+    # Check if all REQUIRED input columns exist
+    missing_cols = [col for col in required_input_columns if col not in df.columns]
     if missing_cols:
         print(f"Error: Input CSV is missing required columns: {missing_cols}")
+        print(f"Available columns are: {df.columns.tolist()}")
         sys.exit(1)
         
-    # Keep only the input columns for processing
-    df_input = df[input_columns].copy()
+    # Check if the optional V_FILE column exists and notify the user
+    has_v_file = 'V_FILE' in df.columns
+    if has_v_file:
+        print("Found optional 'V_FILE' column. It will be used for context.")
+    else:
+        print("Optional 'V_FILE' column not found. Proceeding without full file context.")
+    
+    # --- END OF CHANGE ---
 
     try:
         client = ollama.Client()
@@ -149,21 +216,24 @@ def main():
     # This list will store dictionaries for the new CSV
     csv_results_list = []
 
-    for index, row in df_input.iterrows():
+    # Iterate over the original dataframe (df) to have access to all columns
+    for index, row in df.iterrows():
         cve = row.get('CVE', f'Row_{index}')
         v_function = row.get('V_FUNCTION')
+        # Get V_FILE if it exists, otherwise it will be None
+        v_file = row.get('V_FILE') if has_v_file else None
 
         if pd.isna(v_function) or not v_function.strip():
             print(f"Skipping row {index} (CVE: {cve}) due to missing V_FUNCTION.")
             # Add a row with skip info for the CSV
-            new_row = row.to_dict()
+            new_row = row.to_dict() # This gets all original columns
             new_row['P_FUNCTION'] = "Skipped - Missing V_FUNCTION"
             new_row['CHANGES'] = "Skipped - Missing V_FUNCTION"
             csv_results_list.append(new_row)
             continue
             
-        # 1. Analyze the code
-        llm_results = analyze_code(client, index, cve, v_function)
+        # 1. Analyze the code (passes v_file, which is None if not found)
+        llm_results = analyze_code(client, index, cve, v_function, v_file)
         
         # --- 2. Save the individual .md file ---
         safe_cve_name = str(cve).replace('/', '_').replace('\\', '_')
@@ -203,10 +273,20 @@ def main():
     # --- 4. Save the consolidated CSV file ---
     
     # Define the final output columns
-    output_columns = ['CVE', 'V_COMMIT', 'FilePath', 'F_NAME', 'UNIT_TYPE', 'V_FUNCTION', 'P_FUNCTION', 'CHANGES']
+    # Start with all original columns from the input file
+    original_columns = df.columns.tolist()
+    # Add the new ones
+    output_columns = original_columns + ['P_FUNCTION', 'CHANGES']
+    
+    # Remove duplicates (in case P_FUNCTION or CHANGES was already in the CSV)
+    output_columns_final = []
+    [output_columns_final.append(item) for item in output_columns if item not in output_columns_final]
+
     
     # Convert the list of dictionaries to a DataFrame
-    output_df = pd.DataFrame(csv_results_list, columns=output_columns)
+    output_df = pd.DataFrame(csv_results_list)
+    # Re-order columns to match the new list
+    output_df = output_df.reindex(columns=output_columns_final)
     
     # Save the new DataFrame to the output CSV
     try:
