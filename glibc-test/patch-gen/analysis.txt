@@ -1,0 +1,31 @@
+================================================================================
+LLM VULNERABILITY ANALYSIS BENCHMARK RESULTS
+================================================================================
+Total CVEs analyzed: 5
+Total analysis rows generated: 20
+
+### 1. Performance Overview (Success Rate & Runtime)
+| Model              |   Successes |   Errors | Success Rate   |   Avg Runtime (s) |
+|:-------------------|------------:|---------:|:---------------|------------------:|
+| qwen2.5-coder:1.5b |           4 |        1 | 80.00%         |             54.25 |
+| qwen2.5-coder:7b   |           4 |        1 | 80.00%         |            133.18 |
+| qwen2.5:1.5b       |           4 |        1 | 80.00%         |             46.41 |
+| qwen2.5:7b         |           4 |        1 | 80.00%         |            139.95 |
+
+### 2. Vulnerability Type Consistency (CVE by CVE)
+
+Total CVEs: 5
+CVEs where all successful models agreed on type: 3
+Consistency Rate: 60.00%
+
+### 3. Aggregated Vulnerability Type Distribution
+
+Raw Counts of Detected Vulnerability Types:
+|                    |   Buffer Overflow |   Skipped |   Use-After-Free |
+|:-------------------|------------------:|----------:|-----------------:|
+| qwen2.5-coder:1.5b |                 4 |         1 |                0 |
+| qwen2.5-coder:7b   |                 3 |         1 |                1 |
+| qwen2.5:1.5b       |                 4 |         1 |                0 |
+| qwen2.5:7b         |                 4 |         1 |                0 |
+
+================================================================================

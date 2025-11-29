@@ -1,0 +1,28 @@
+
+================================================================================
+LLM VULNERABILITY ANALYSIS BENCHMARK RESULTS
+================================================================================
+Total CVEs analyzed: 5
+Total analysis rows generated: 16
+
+### 1. Performance Overview
+| Model              |   Successes |   Errors | Success Rate   |   Avg Runtime (s) |
+|:-------------------|------------:|---------:|:---------------|------------------:|
+| qwen2.5-coder:1.5b |           4 |        0 | 100.00%        |             51.17 |
+| qwen2.5-coder:7b   |           4 |        0 | 100.00%        |            138.7  |
+| qwen2.5:1.5b       |           4 |        0 | 100.00%        |            315.35 |
+| qwen2.5:7b         |           4 |        0 | 100.00%        |            138.7  |
+
+### 2. Vulnerability Type Distribution
+|                    |   Buffer Overflow |   Race Condition |   Use-After-Free |
+|:-------------------|------------------:|-----------------:|-----------------:|
+| qwen2.5-coder:1.5b |                 4 |                0 |                0 |
+| qwen2.5-coder:7b   |                 2 |                1 |                1 |
+| qwen2.5:1.5b       |                 4 |                0 |                0 |
+| qwen2.5:7b         |                 3 |                0 |                1 |
+
+================================================================================
+Patched Snippets: /Users/tiagoalmeida/Documents/Tese/ai-ssd-patch-generation-and-validation/glibc-test/patch-gen/patched_code_benchmark
+Full Patched Files: /Users/tiagoalmeida/Documents/Tese/ai-ssd-patch-generation-and-validation/glibc-test/patch-gen/full_patched_files_benchmark
+Full Analytics Log: /Users/tiagoalmeida/Documents/Tese/ai-ssd-patch-generation-and-validation/glibc-test/patch-gen/vulnerable_analysis_benchmark/benchmark_summary.txt
+================================================================================
