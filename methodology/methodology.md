@@ -57,4 +57,6 @@ This phase is critical for validating the quality and security of the AI-generat
 
 # Thesis Methodology Diagram
 
+![1764589960284](image/methodology/1764589960284.png)
+
 ---

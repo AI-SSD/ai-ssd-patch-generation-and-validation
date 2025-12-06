@@ -226,41 +226,53 @@ def save_patched_code(model_name, cve, row_index, patched_code_content, f_name):
     except Exception as e:
         print(f"  [!] Error saving .c file {output_c_filename}: {e}")
 
-def save_full_patched_file(model_name, cve, row_index, full_file_content, v_function, patched_code, original_file_path):
+def save_aggregated_file(model_name, cve, original_file_path, original_content, patches):
     """
-    Saves the FULL original file with the vulnerable function replaced by the patched version.
+    Saves the FULL original file with ALL vulnerable functions replaced by their patched versions.
+    Aggregates multiple patches for the same file.
     """
-    if not full_file_content or pd.isna(full_file_content) or "Error:" in patched_code:
+    if not original_content or pd.isna(original_content):
         return
 
-    model_full_dir = os.path.join(OUTPUT_FULL_PATCH_DIR, model_name.replace(':', '_'))
-    if not os.path.exists(model_full_dir):
-        os.makedirs(model_full_dir)
+    # Directory Structure: OUTPUT_FULL_PATCH_DIR / CVE_ID / MODEL_NAME
+    safe_cve = str(cve).replace('/', '_').replace('\\', '_')
+    safe_model = model_name.replace(':', '_')
+    
+    target_dir = os.path.join(OUTPUT_FULL_PATCH_DIR, safe_cve, safe_model)
+    if not os.path.exists(target_dir):
+        os.makedirs(target_dir)
 
-    if v_function in full_file_content:
-        new_full_content = full_file_content.replace(v_function, patched_code)
-        status = "Success"
-    else:
-        if v_function.strip() in full_file_content:
-             new_full_content = full_file_content.replace(v_function.strip(), patched_code)
-             status = "Success (Strip Fallback)"
+    # Prepare content
+    new_full_content = original_content
+    
+    # Apply all patches for this file
+    for v_function, patched_code in patches:
+        if "Error:" in patched_code:
+            continue
+            
+        # Try exact replacement
+        if v_function in new_full_content:
+            new_full_content = new_full_content.replace(v_function, patched_code)
+        # Try stripped replacement
+        elif v_function.strip() in new_full_content:
+            new_full_content = new_full_content.replace(v_function.strip(), patched_code)
         else:
-            print(f"  [!] Warning: Could not locate V_FUNCTION string inside V_FILE for replacement on Row {row_index}.")
-            new_full_content = full_file_content + "\n\n/* AUTOMATED NOTE: REPLACEMENT FAILED - PATCH APPENDED BELOW */\n" + patched_code
-            status = "Failed (Appended)"
+            print(f"  [!] Warning: Could not locate function in {original_file_path} for CVE {cve}")
+            # Append fallback
+            new_full_content += f"\n\n/* AUTOMATED NOTE: REPLACEMENT FAILED - PATCH APPENDED BELOW */\n{patched_code}"
 
+    # Filename: actual_filename.c
+    # Use os.path.basename(original_file_path)
     base_name = os.path.basename(str(original_file_path))
     if not base_name or base_name == 'nan':
         base_name = "unknown_file.c"
-    
-    safe_cve = str(cve).replace('/', '_').replace('\\', '_')
-    output_filename = f"{safe_cve}_Row-{row_index}_{base_name}"
-    output_path = os.path.join(model_full_dir, output_filename)
+        
+    output_path = os.path.join(target_dir, base_name)
 
     try:
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(new_full_content)
-        print(f"  [+] Full patched file saved ({status}): {output_filename}")
+        print(f"  [+] Full patched file saved: {output_path}")
     except Exception as e:
         print(f"  [!] Error saving full file {output_path}: {e}")
 
@@ -365,12 +377,16 @@ def main():
         print(f"  STARTING BENCHMARK FOR MODEL: {model_name}")
         print("#"*80)
         
+        # Dictionary to aggregate patches per file
+        # Key: (CVE, FilePath) -> Value: {'content': V_FILE, 'patches': [(v_func, patched_code)]}
+        model_file_aggregations = {} 
+
         for index, row in df.iterrows():
             cve = row.get('CVE', f'Row_{index}')
             v_function = row.get('V_FUNCTION')
             f_name = row.get('F_NAME', 'unknown_func')
             v_file = row.get('V_FILE') if has_v_file else None
-            file_path_col = row.get('FilePath', 'unknown.c')
+            file_path_col = str(row.get('FilePath', 'unknown.c')).strip()
 
             # Load PoC
             poc_code = None
@@ -394,11 +410,18 @@ def main():
             patched_code_raw = llm_results.get('patched_code_raw', 'Error')
             patched_code_clean = patched_code_raw.strip().replace('```c', '').replace('```', '').strip()
 
-            # 3. Save Isolated Snippet
+            # 3. Save Isolated Snippet (Keep existing logic for snippets)
             save_patched_code(model_name, cve, index, patched_code_clean, f_name)
 
-            # 4. Save FULL Patched File
-            save_full_patched_file(model_name, cve, index, v_file, v_function, patched_code_clean, file_path_col)
+            # 4. Aggregate for Full Patched File
+            # We store the patch to be applied later
+            file_key = (cve, file_path_col)
+            if file_key not in model_file_aggregations:
+                model_file_aggregations[file_key] = {
+                    'content': v_file,
+                    'patches': []
+                }
+            model_file_aggregations[file_key]['patches'].append((v_function, patched_code_clean))
             
             # 5. Save MD Analysis
             model_md_dir = os.path.join(OUTPUT_MD_DIR, model_name.replace(':', '_'))
@@ -425,6 +448,11 @@ def main():
                     new_row[f'FUNCTION_{i+1}'] = h
             
             csv_results_list.append(new_row)
+
+        # After iterating all rows for this model, save the aggregated files
+        print(f"\n--- Generating Aggregated Full Files for {model_name} ---")
+        for (cve, f_path), data in model_file_aggregations.items():
+            save_aggregated_file(model_name, cve, f_path, data['content'], data['patches'])
 
     # Final CSV Save & Stats
     if csv_results_list:

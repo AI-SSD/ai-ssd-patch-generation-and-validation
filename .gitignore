@@ -7,6 +7,7 @@
 **/PoC-RAG/
 **/30128677/
 **/prompts/
+**/SA-Presentation/
 
 # 3) Ignore specific generated datasets
 **/patched_dataset1.csv
