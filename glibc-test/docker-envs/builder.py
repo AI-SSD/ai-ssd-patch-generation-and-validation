@@ -19,8 +19,6 @@ def load_cve_info(csv_path):
         reader = csv.DictReader(f, delimiter=';')
         for row in reader:
             cve = row['CVE']
-            # We assume the first entry for a CVE gives the correct Commit and FilePath
-            # for the file that needs to be patched.
             if cve not in cve_info:
                 cve_info[cve] = {
                     'commit': row['COMMIT'],
@@ -44,17 +42,12 @@ def build_image(cve_folder_name, model, patched_file_path, cve_data):
     print(f"  Target File: {target_filepath}")
     print(f"  Patched File: {patched_file_path}")
 
-    # Prepare build context
-    # 1. Copy patched file
     shutil.copy(patched_file_path, PATCHED_FILE_DEST)
     
-    # 2. Copy exploits folder (if not exists)
     if os.path.exists(EXPLOITS_DEST_DIR):
         shutil.rmtree(EXPLOITS_DEST_DIR)
     shutil.copytree(EXPLOITS_SRC_DIR, EXPLOITS_DEST_DIR)
 
-    # 3. Build Docker image
-    # Tag format: glibc-test:CVE-FOLDER-MODEL (replace spaces with dashes)
     tag_cve = cve_folder_name.replace(' ', '-')
     tag = f"glibc-test:{tag_cve}-{model}"
     
@@ -92,25 +85,21 @@ def main():
         print(f"Error: Patches directory not found at {PATCHES_DIR}")
         return
 
-    # Iterate through CVE folders
     for cve_folder in os.listdir(PATCHES_DIR):
         cve_path = os.path.join(PATCHES_DIR, cve_folder)
         if not os.path.isdir(cve_path):
             continue
             
-        # Iterate through Model folders
         for model_folder in os.listdir(cve_path):
             model_path = os.path.join(cve_path, model_folder)
             if not os.path.isdir(model_path):
                 continue
                 
-            # Find the patched .c file
             patched_files = [f for f in os.listdir(model_path) if f.endswith('.c')]
             if not patched_files:
                 print(f"Warning: No .c file found in {model_path}")
                 continue
             
-            # Assuming one patched file per model folder
             patched_file = patched_files[0]
             patched_file_path = os.path.join(model_path, patched_file)
             

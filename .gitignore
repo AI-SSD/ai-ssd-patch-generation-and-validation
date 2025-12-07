@@ -8,6 +8,7 @@
 **/30128677/
 **/prompts/
 **/SA-Presentation/
+**/glibc-test/docker-envs/collected_reports/
 
 # 3) Ignore specific generated datasets
 **/patched_dataset1.csv
