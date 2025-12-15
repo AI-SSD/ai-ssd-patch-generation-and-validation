@@ -53,7 +53,6 @@ def build_image(cve_folder_name, model, patched_file_path, cve_data):
     
     cmd = [
         "docker", "build",
-        "--platform", "linux/amd64",
         "--build-arg", f"GIT_COMMIT={commit}",
         "--build-arg", f"CVE={cve_id}",
         "--build-arg", f"MODEL={model}",
