@@ -21,7 +21,7 @@ def load_cve_info(csv_path):
             cve = row['CVE']
             if cve not in cve_info:
                 cve_info[cve] = {
-                    'commit': row['COMMIT'],
+                    'commit': row['V_COMMIT'],
                     'filepath': row['FilePath']
                 }
     return cve_info

@@ -261,11 +261,15 @@ def save_aggregated_file(model_name, cve, original_file_path, original_content, 
             # Append fallback
             new_full_content += f"\n\n/* AUTOMATED NOTE: REPLACEMENT FAILED - PATCH APPENDED BELOW */\n{patched_code}"
 
-    # Filename: actual_filename.c
+# Filename: actual_filename.c
     # Use os.path.basename(original_file_path)
     base_name = os.path.basename(str(original_file_path))
     if not base_name or base_name == 'nan':
         base_name = "unknown_file.c"
+    
+    # Prepend underscore to match docker-envs/patches structure
+    if not base_name.startswith('_'):
+        base_name = "_" + base_name
         
     output_path = os.path.join(target_dir, base_name)
 
@@ -361,6 +365,9 @@ def main():
         print(f"Error reading CSV: {e}")
         sys.exit(1)
 
+    # Pre-calculate CVE frequencies to determine if versioning is needed
+    cve_counts_total = df['CVE'].value_counts().to_dict()
+
     has_v_file = 'V_FILE' in df.columns
     
     try:
@@ -380,9 +387,22 @@ def main():
         # Dictionary to aggregate patches per file
         # Key: (CVE, FilePath) -> Value: {'content': V_FILE, 'patches': [(v_func, patched_code)]}
         model_file_aggregations = {} 
+        
+        # Track current version for each CVE within this model's run
+        current_cve_versions = defaultdict(int)
 
         for index, row in df.iterrows():
-            cve = row.get('CVE', f'Row_{index}')
+            original_cve = row.get('CVE', f'Row_{index}')
+            
+            # Determine Output CVE Name (Versioning)
+            current_cve_versions[original_cve] += 1
+            if cve_counts_total.get(original_cve, 0) > 1:
+                cve_folder_name = f"{original_cve} v{current_cve_versions[original_cve]}"
+            else:
+                cve_folder_name = original_cve
+            
+            cve = original_cve
+
             v_function = row.get('V_FUNCTION')
             f_name = row.get('F_NAME', 'unknown_func')
             v_file = row.get('V_FILE') if has_v_file else None
@@ -390,7 +410,7 @@ def main():
 
             # Load PoC
             poc_code = None
-            cve_str = str(cve)
+            cve_str = str(original_cve)
             for filename in [cve_str, f"{cve_str}.c", f"{cve_str}.txt"]:
                 poc_path = os.path.join(EXPLOITS_DIR, filename)
                 if os.path.exists(poc_path):
@@ -404,18 +424,30 @@ def main():
                 continue
                 
             # 1. Analyze
-            llm_results = analyze_code(client, model_name, index, cve, v_function, v_file, poc_code)
+            llm_results = analyze_code(client, model_name, index, original_cve, v_function, v_file, poc_code)
             
             # 2. Extract Patch
             patched_code_raw = llm_results.get('patched_code_raw', 'Error')
-            patched_code_clean = patched_code_raw.strip().replace('```c', '').replace('```', '').strip()
+            
+            # Try to extract code block using regex
+            code_block_match = re.search(r'```c\s*(.*?)\s*```', patched_code_raw, re.DOTALL | re.IGNORECASE)
+            if code_block_match:
+                patched_code_clean = code_block_match.group(1).strip()
+            else:
+                # Fallback: try to find any code block
+                code_block_match = re.search(r'```\s*(.*?)\s*```', patched_code_raw, re.DOTALL)
+                if code_block_match:
+                    patched_code_clean = code_block_match.group(1).strip()
+                else:
+                    # Fallback: just strip (risky but better than nothing if no blocks)
+                    patched_code_clean = patched_code_raw.strip().replace('```c', '').replace('```', '').strip()
 
             # 3. Save Isolated Snippet (Keep existing logic for snippets)
             save_patched_code(model_name, cve, index, patched_code_clean, f_name)
 
             # 4. Aggregate for Full Patched File
             # We store the patch to be applied later
-            file_key = (cve, file_path_col)
+            file_key = (cve_folder_name, file_path_col)
             if file_key not in model_file_aggregations:
                 model_file_aggregations[file_key] = {
                     'content': v_file,

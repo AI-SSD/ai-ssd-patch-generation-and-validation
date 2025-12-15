@@ -46,8 +46,8 @@ cd /root/glibc-test/glibc-source
 
 # Update config.guess and config.sub to support aarch64 (needed for older glibc on newer hardware)
 echo "    Updating config.guess and config.sub..."
-wget -q -O scripts/config.guess 'https://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.guess;hb=HEAD'
-wget -q -O scripts/config.sub 'https://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.sub;hb=HEAD'
+wget -q -O scripts/config.guess 'https://raw.githubusercontent.com/gcc-mirror/gcc/master/config.guess'
+wget -q -O scripts/config.sub 'https://raw.githubusercontent.com/gcc-mirror/gcc/master/config.sub'
 chmod +x scripts/config.guess scripts/config.sub
 
 mkdir -p build
