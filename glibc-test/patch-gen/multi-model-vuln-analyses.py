@@ -408,15 +408,7 @@ def main():
             
             # 2. Extract Patch
             patched_code_raw = llm_results.get('patched_code_raw', 'Error')
-            
-            # Improved extraction logic to handle conversational text
-            code_block_pattern = r"```(?:c|C)?\s*(.*?)```"
-            match = re.search(code_block_pattern, patched_code_raw, re.DOTALL)
-            if match:
-                patched_code_clean = match.group(1).strip()
-            else:
-                # Fallback: try to clean up if no code blocks are found but backticks might exist
-                patched_code_clean = patched_code_raw.strip().replace('```c', '').replace('```', '').strip()
+            patched_code_clean = patched_code_raw.strip().replace('```c', '').replace('```', '').strip()
 
             # 3. Save Isolated Snippet (Keep existing logic for snippets)
             save_patched_code(model_name, cve, index, patched_code_clean, f_name)
