@@ -43,7 +43,7 @@ RUN git checkout ${GIT_COMMIT}
 COPY patched.c /input/patched.c
 
 # Copy specific exploit file
-COPY exploits/${CVE}.c /root/glibc-test/exploits/${CVE}.c
+COPY exploits/ /root/glibc-test/exploits/
 
 # Copy the test runner script
 COPY run_test.sh /root/glibc-test/run_test.sh
