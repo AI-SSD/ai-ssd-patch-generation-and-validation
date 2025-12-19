@@ -8,7 +8,7 @@ import sys
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PATCH_GEN_DIR = os.path.abspath(os.path.join(BASE_DIR, '../patch-gen'))
 CSV_FILE = os.path.join(PATCH_GEN_DIR, 'file-function.csv')
-PATCHES_DIR = os.path.join(PATCH_GEN_DIR, 'full_patched_files_benchmark')
+PATCHES_DIR = os.path.join(BASE_DIR, 'patches')
 EXPLOITS_SRC_DIR = os.path.join(PATCH_GEN_DIR, 'exploits')
 EXPLOITS_DEST_DIR = os.path.join(BASE_DIR, 'exploits')
 PATCHED_FILE_DEST = os.path.join(BASE_DIR, 'patched.c')
