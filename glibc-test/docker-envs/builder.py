@@ -13,6 +13,14 @@ EXPLOITS_SRC_DIR = os.path.join(PATCH_GEN_DIR, 'exploits')
 EXPLOITS_DEST_DIR = os.path.join(BASE_DIR, 'exploits')
 PATCHED_FILE_DEST = os.path.join(BASE_DIR, 'patched.c')
 
+# Determine if we need sudo for docker
+DOCKER_PREFIX = []
+try:
+    subprocess.run(["docker", "ps"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+except Exception:
+    print("[!] Docker seems to require sudo or is not running. Attempting to use sudo...")
+    DOCKER_PREFIX = ["sudo"]
+
 def load_cve_info(csv_path):
     cve_info = {}
     with open(csv_path, 'r', encoding='utf-8') as f:
@@ -51,7 +59,7 @@ def build_image(cve_folder_name, model, patched_file_path, cve_data):
     tag_cve = cve_folder_name.replace(' ', '-')
     tag = f"glibc-test:{tag_cve}-{model}"
     
-    cmd = [
+    cmd = DOCKER_PREFIX + [
         "docker", "build",
         "--build-arg", f"GIT_COMMIT={commit}",
         "--build-arg", f"CVE={cve_id}",

@@ -5,6 +5,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COLLECT_DIR="$ROOT_DIR/collected_reports"
 mkdir -p "$COLLECT_DIR"
 
+DOCKER_CMD="docker"
+if ! docker ps >/dev/null 2>&1; then
+    echo "Docker requires sudo or is not running. Switching to sudo..."
+    DOCKER_CMD="sudo docker"
+fi
+
 IMAGES=()
 images_found=0
 while IFS= read -r img; do
@@ -12,7 +18,7 @@ while IFS= read -r img; do
     IMAGES+=("$img")
     images_found=1
   fi
-done < <(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^glibc-test:' || true)
+done < <($DOCKER_CMD images --format '{{.Repository}}:{{.Tag}}' | grep '^glibc-test:' || true)
 
 if [ "$images_found" -eq 0 ]; then
   echo "No images found matching 'glibc-test:*'. Build images first."
@@ -31,7 +37,7 @@ for img in "${IMAGES[@]}"; do
   echo "  Output directory: $outdir"
 
   echo "  Starting container..."
-  if docker run --rm -v "$outdir:/output" "$img" > "$outdir/container.log" 2>&1; then
+  if $DOCKER_CMD run --rm -v "$outdir:/output" "$img" > "$outdir/container.log" 2>&1; then
     echo "  Completed successfully. Log: $outdir/container.log"
   else
     echo "  Container exited with non-zero status. Log: $outdir/container.log"

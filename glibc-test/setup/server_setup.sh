@@ -5,17 +5,33 @@ set -euo pipefail
 # Usage: sudo ./install_ubuntu.sh [--pull-models]
 # If run without sudo, the script will use sudo where required.
 
-PULL_MODELS=0
+# By default, automatically pull models and run the pipeline
+PULL_MODELS=1
+RUN_PIPELINE=1
 for arg in "$@"; do
   case "$arg" in
+    --no-pull-models) PULL_MODELS=0 ;;
+    --no-run) RUN_PIPELINE=0 ;;
     --pull-models) PULL_MODELS=1 ;;
-    --help|-h) echo "Usage: sudo ./install_ubuntu.sh [--pull-models]"; exit 0 ;;
+    --run) RUN_PIPELINE=1 ;;
+    --help|-h) echo "Usage: sudo ./server_setup.sh [--no-pull-models] [--no-run]"; exit 0 ;;
   esac
 done
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="$REPO_DIR/.venv"
-USER_NAME="$(logname 2>/dev/null || echo $SUDO_USER || echo $USER)"
+USER_NAME="$(logname 2>/dev/null || echo ${SUDO_USER:-${USER}})"
+
+# If USER_NAME is root, try to detect real user from path if possible
+if [ "$USER_NAME" = "root" ]; then
+    if [[ "$REPO_DIR" == /home/* ]]; then
+        POSSIBLE_USER=$(echo "$REPO_DIR" | cut -d/ -f3)
+        if [ -n "$POSSIBLE_USER" ] && [ "$POSSIBLE_USER" != "root" ]; then
+             echo "Warning: Detected user is root, but path suggests user '$POSSIBLE_USER'. Using '$POSSIBLE_USER'."
+             USER_NAME="$POSSIBLE_USER"
+        fi
+    fi
+fi
 
 echo "Repository root: $REPO_DIR"
 echo "Installer will create a Python venv at: $VENV_DIR"
@@ -69,6 +85,14 @@ else
   echo "Docker already installed. Skipping." 
 fi
 
+# Ensure Docker service is running
+echo "Starting Docker service (enable --now)..."
+sudo systemctl enable --now docker || true
+sleep 2
+if ! systemctl is-active --quiet docker; then
+  echo "Warning: Docker service is not active. Check 'sudo systemctl status docker' for details."
+fi
+
 # Add user to docker group (so they can run docker without sudo)
 if id -nG "$USER_NAME" | grep -qw docker; then
   echo "User $USER_NAME already in docker group"
@@ -76,6 +100,15 @@ else
   echo "Adding $USER_NAME to docker group"
   sudo usermod -aG docker "$USER_NAME" || true
   echo "Note: You must log out and back in (or reboot) for group changes to take effect."
+
+  # Verify docker access for the user
+  echo "Verifying docker access for user '$USER_NAME'..."
+  if su - "$USER_NAME" -c "docker run --rm hello-world > /dev/null 2>&1"; then
+    echo "Verification successful: User '$USER_NAME' can run docker commands."
+  else
+    echo "Verification failed (expected until re-login): User '$USER_NAME' cannot run docker commands yet."
+    echo "Please log out and log back in (or run 'newgrp docker') to apply the group change."
+  fi
 fi
 
 # 3) Python venv & pip packages
@@ -93,52 +126,46 @@ REQ_FILE="$REPO_DIR/glibc-test/requirements.txt"
 if [ -f "$REQ_FILE" ]; then
   pip install -r "$REQ_FILE"
 else
-  pip install pandas ollama
+  pip install pandas requests
 fi
 
-# 4) Ollama install
-echo "\n[4/6] Installing Ollama..."
-if ! command -v ollama >/dev/null 2>&1; then
-  echo "Installing Ollama via install script (requires sudo)..."
-  curl -fsSL https://ollama.com/install.sh | sudo bash || {
-    echo "Ollama install script failed. Please follow https://ollama.com/docs to install manually.";
-  }
-else
-  echo "Ollama already installed."
-fi
+# 4) Ollama install - DISABLED (Using External API)
+# echo "\n[4/6] Installing Ollama..."
+# ... (Ollama installation skipped)
 
-# 5) Start Ollama daemon
-echo "\n[5/6] Starting Ollama daemon (if installed)..."
-if command -v ollama >/dev/null 2>&1; then
-  # Try to start daemon; if system has systemd service, enable it; otherwise use daemon start
-  if sudo systemctl list-unit-files | grep -q '^ollama'; then
-    sudo systemctl enable --now ollama || true
+# 5) Start Ollama daemon - DISABLED (Using External API)
+# echo "\n[5/6] Starting Ollama daemon (if installed)..."
+# ... (Ollama daemon start skipped)
+
+# 6) Optional: pull models - DISABLED (Using External API)
+# if [ "$PULL_MODELS" -eq 1 ]; then
+#   echo "\n[6/6] Pulling recommended models (this may take a long time and consume lots of disk)."
+#   ... (Model pulling skipped)
+# fi
+
+# 7) Optionally run the full pipeline automatically
+if [ "$RUN_PIPELINE" -eq 1 ]; then
+  echo "\n[7/7] Running full methodology pipeline automatically. This will run Phases 1-4 and may take a long time."
+  PIPE_LOG="$REPO_DIR/pipeline_run.log"
+  echo "Pipeline logs will be written to: $PIPE_LOG"
+  # Ensure venv is active (we already sourced it earlier)
+  if [ -f "$VENV_DIR/bin/activate" ]; then
+    # run pipeline in background so installer can finish
+    nohup bash -lc "source $VENV_DIR/bin/activate && python3 $REPO_DIR/run_methodology.py" > "$PIPE_LOG" 2>&1 &
+    PID=$!
+    echo "Pipeline started (PID: $PID). Tail the logs with: tail -f $PIPE_LOG"
   else
-    # Attempt user-level daemon start
-    ollama daemon start || true
+    echo "Virtualenv not found at $VENV_DIR; cannot start pipeline."
   fi
-  echo "Waiting for ollama to become responsive (max 60s)"
-  for i in {1..30}; do
-    if ollama list >/dev/null 2>&1; then
-      echo "Ollama is responsive." && break
-    fi
-    sleep 2
-  done
 else
-  echo "Ollama not found. Skipping daemon start."
+  echo "Pipeline run skipped by request. To run manually: source $VENV_DIR/bin/activate && python3 $REPO_DIR/run_methodology.py"
 fi
 
-# 6) Optional: pull models
-if [ "$PULL_MODELS" -eq 1 ]; then
-  echo "\n[6/6] Pulling recommended models (this may take a long time and consume lots of disk)."
-  MODELS=("qwen2.5-coder:1.5b" "qwen2.5-coder:7b" "qwen2.5:1.5b" "qwen2.5:7b")
-  for m in "${MODELS[@]}"; do
-    echo "Pulling model: $m"
-    ollama pull "$m" || echo "Failed to pull $m"
-  done
-else
-  echo "\n[6/6] Skipping model pulls. To pull models automatically, run: sudo ./install_ubuntu.sh --pull-models"
-fi
+# Ensure repo files are owned by the target user to avoid permission issues
+echo "\nFixing ownership of repository files for user: $USER_NAME"
+sudo chown -R "$USER_NAME":"$USER_NAME" "$REPO_DIR" || {
+  echo "Warning: failed to chown $REPO_DIR to $USER_NAME. You may need to run this manually.";
+}
 
 # Final notes
 echo "\nInstallation finished. Quick checklist and next steps:"

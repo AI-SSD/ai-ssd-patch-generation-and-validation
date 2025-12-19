@@ -1,6 +1,7 @@
 # Save as: analyze_vulns_and_benchmark.py
 import pandas as pd
-import ollama
+import requests
+import json
 import sys
 import os
 import csv
@@ -14,6 +15,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_FILE_PATH = os.path.join(SCRIPT_DIR, 'file-function.csv')
 # Input Exploits Directory
 EXPLOITS_DIR = os.path.join(SCRIPT_DIR, 'exploits')
+
+# --- API Configuration ---
+QUERY_ENDPOINT = "http://10.3.2.171:80/api/generate"
+CHAT_ENDPOINT = "http://10.3.2.171:80/api/chat"
 
 # --- Models to Benchmark ---
 MODEL_NAMES = [
@@ -75,9 +80,27 @@ def separate_functions(code_block, f_name):
         print(f"  [!] Warning: Function parsing failed: {e}")
         return code_block, []
 
-def analyze_code(client, model_name, index, cve, vulnerable_code, full_file_content, poc_code):
+def chat_with_api(model_name, messages):
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "temperature": 0.2
+        }
+    }
+    
+    try:
+        response = requests.post(CHAT_ENDPOINT, json=payload)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        print(f"API Request Error: {e}")
+        raise e
+
+def analyze_code(model_name, index, cve, vulnerable_code, full_file_content, poc_code):
     """
-    Analyzes a vulnerable function using Ollama.
+    Analyzes a vulnerable function using the LLM API.
     """
     print(f"\n--- Analyzing CVE: {cve} (Row: {index}) with Model: {model_name} ---")
     results = {}
@@ -117,9 +140,9 @@ def analyze_code(client, model_name, index, cve, vulnerable_code, full_file_cont
         Explain the type of vulnerability (e.g., buffer overflow, integer overflow, use-after-free).
         Do NOT generate a new Proof of Concept (PoC).
         """
-        response1 = client.chat(
-            model=model_name,
-            messages=[{'role': 'user', 'content': prompt1}]
+        response1 = chat_with_api(
+            model_name,
+            [{'role': 'user', 'content': prompt1}]
         )
         vuln_analysis = response1['message']['content']
         results['vulnerability_analysis'] = vuln_analysis
@@ -143,9 +166,9 @@ def analyze_code(client, model_name, index, cve, vulnerable_code, full_file_cont
         
         Only output the code.
         """
-        response2 = client.chat(
-            model=model_name,
-            messages=[{'role': 'user', 'content': prompt2}]
+        response2 = chat_with_api(
+            model_name,
+            [{'role': 'user', 'content': prompt2}]
         )
         patched_code_raw = response2['message']['content']
         results['patched_code_raw'] = patched_code_raw
@@ -159,9 +182,9 @@ def analyze_code(client, model_name, index, cve, vulnerable_code, full_file_cont
         Explain the changes you made (the "diff") and why they effectively mitigate the vulnerability.
         Format this explanation like a git commit message or diff notes.
         """
-        response3 = client.chat(
-            model=model_name,
-            messages=[{'role': 'user', 'content': prompt3}]
+        response3 = chat_with_api(
+            model_name,
+            [{'role': 'user', 'content': prompt3}]
         )
         patch_explanation = response3['message']['content']
         results['patch_explanation'] = patch_explanation
@@ -210,8 +233,13 @@ def extract_vuln_type(analysis_text):
 def save_patched_code(model_name, cve, row_index, patched_code_content, f_name):
     """Saves the extracted patched C code (snippet only)."""
     model_patch_dir = os.path.join(OUTPUT_PATCH_DIR, model_name.replace(':', '_'))
-    if not os.path.exists(model_patch_dir):
-        os.makedirs(model_patch_dir)
+    try:
+        if not os.path.exists(model_patch_dir):
+            os.makedirs(model_patch_dir)
+    except PermissionError:
+        print(f"\n[!] CRITICAL ERROR: Permission denied creating directory: {model_patch_dir}")
+        print(f"[!] Please run: sudo chown -R $USER {os.path.dirname(OUTPUT_PATCH_DIR)}")
+        sys.exit(1)
         
     safe_cve_name = str(cve).replace('/', '_').replace('\\', '_')
     safe_f_name = str(f_name).replace('/', '_').replace('\\', '_')
@@ -239,8 +267,12 @@ def save_aggregated_file(model_name, cve, original_file_path, original_content, 
     safe_model = model_name.replace(':', '_')
     
     target_dir = os.path.join(OUTPUT_FULL_PATCH_DIR, safe_cve, safe_model)
-    if not os.path.exists(target_dir):
-        os.makedirs(target_dir)
+    try:
+        if not os.path.exists(target_dir):
+            os.makedirs(target_dir)
+    except PermissionError:
+        print(f"  [!] Permission denied creating directory {target_dir}. Skipping full file save.")
+        return
 
     # Prepare content
     new_full_content = original_content
@@ -370,12 +402,7 @@ def main():
 
     has_v_file = 'V_FILE' in df.columns
     
-    try:
-        client = ollama.Client()
-        client.list()
-    except Exception as e:
-        print(f"Error connecting to Ollama: {e}")
-        sys.exit(1)
+    # Removed Ollama client initialization as we are using the API now
 
     csv_results_list = []
 
@@ -424,7 +451,7 @@ def main():
                 continue
                 
             # 1. Analyze
-            llm_results = analyze_code(client, model_name, index, original_cve, v_function, v_file, poc_code)
+            llm_results = analyze_code(model_name, index, original_cve, v_function, v_file, poc_code)
             
             # 2. Extract Patch
             patched_code_raw = llm_results.get('patched_code_raw', 'Error')
@@ -457,13 +484,18 @@ def main():
             
             # 5. Save MD Analysis
             model_md_dir = os.path.join(OUTPUT_MD_DIR, model_name.replace(':', '_'))
-            if not os.path.exists(model_md_dir): os.makedirs(model_md_dir)
-            safe_cve = str(cve).replace('/', '_')
-            
-            md_content = f"Model: {model_name}\nCVE: {cve}\n\n[Analysis]\n{llm_results.get('vulnerability_analysis')}\n\n[Patch]\n{patched_code_raw}\n\n[Explanation]\n{llm_results.get('patch_explanation')}"
-            
-            with open(os.path.join(model_md_dir, f"{safe_cve}_Row-{index}_analysis.md"), 'w', encoding='utf-8') as f:
-                f.write(md_content)
+            try:
+                if not os.path.exists(model_md_dir): os.makedirs(model_md_dir)
+                safe_cve = str(cve).replace('/', '_')
+                
+                md_content = f"Model: {model_name}\nCVE: {cve}\n\n[Analysis]\n{llm_results.get('vulnerability_analysis')}\n\n[Patch]\n{patched_code_raw}\n\n[Explanation]\n{llm_results.get('patch_explanation')}"
+                
+                with open(os.path.join(model_md_dir, f"{safe_cve}_Row-{index}_analysis.md"), 'w', encoding='utf-8') as f:
+                    f.write(md_content)
+            except PermissionError:
+                print(f"  [!] Permission denied saving MD analysis for {cve}. Skipping file write.")
+            except Exception as e:
+                print(f"  [!] Error saving MD analysis for {cve}: {e}")
 
             # 6. Prepare CSV Row
             main_func, helper_funcs = separate_functions(patched_code_clean, f_name)
@@ -493,7 +525,13 @@ def main():
         new_static = ['MODEL_NAME', 'VULN_TYPE', 'RUNTIME_S', 'P_FUNCTION', 'CHANGES']
         helpers = sorted([c for c in output_df.columns if c.startswith('FUNCTION_')], key=lambda x: int(x.split('_')[1]))
         output_df = output_df.reindex(columns=original_cols + new_static + helpers)
-        output_df.to_csv(OUTPUT_CSV_PATH, sep=';', index=False, encoding='utf-8')
+        try:
+            output_df.to_csv(OUTPUT_CSV_PATH, sep=';', index=False, encoding='utf-8')
+            print(f"\n[+] Benchmark complete. Results saved to {OUTPUT_CSV_PATH}")
+        except PermissionError:
+            print(f"\n[!] Permission denied saving CSV to {OUTPUT_CSV_PATH}")
+        except Exception as e:
+            print(f"\n[!] Error saving CSV: {e}")
         
         generate_benchmark_stats(output_df, len(df))
 

@@ -38,7 +38,7 @@ def main():
     print(f"Base Directory: {BASE_DIR}")
 
     # Phase 2: Automated Patch Gen (GenAI)
-    # Note: This requires Ollama to be running and models to be pulled.
+    # Note: This uses an external API for LLM generation.
     if not run_step("Phase 2: LLM Patch Generation", ["python3", "multi-model-vuln-analyses.py"], PATCH_GEN_DIR):
         print("Pipeline aborted at Phase 2.")
         sys.exit(1)

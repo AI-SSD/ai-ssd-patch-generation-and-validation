@@ -45,10 +45,29 @@ def run_phase(name, script_name):
         print(f"\n[!] Error running {name}: {e}")
         return False
 
+def check_permissions():
+    """Checks if the current user has write permissions to necessary directories."""
+    # Check patch-gen directory
+    patch_gen_dir = os.path.join(BASE_DIR, 'patch-gen')
+    # If patch-gen doesn't exist, check BASE_DIR
+    target_dir = patch_gen_dir if os.path.exists(patch_gen_dir) else BASE_DIR
+    
+    if not os.access(target_dir, os.W_OK):
+        print(f"\n[!] PERMISSION ERROR: Cannot write to {target_dir}")
+        print(f"[!] The directory seems to be owned by another user (likely root).")
+        print(f"[!] Please fix permissions by running:\n")
+        print(f"    sudo chown -R $USER {BASE_DIR}")
+        print(f"\n[!] Aborting pipeline to prevent further errors.")
+        return False
+    return True
+
 def main():
     print("="*50)
     print(" GLIBC VULNERABILITY PATCHING METHODOLOGY PIPELINE")
     print("="*50)
+    
+    if not check_permissions():
+        sys.exit(1)
     
     overall_start = time.time()
     
