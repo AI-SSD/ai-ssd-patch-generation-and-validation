@@ -42,6 +42,42 @@ OUTPUT_STATS_FILE = os.path.join(OUTPUT_MD_DIR, 'benchmark_summary.txt')
 
 # ---------------------
 
+def clean_patch(code):
+    """
+    Cleans the patched code by removing markdown blocks and handling diff formats.
+    """
+    # Remove markdown code blocks if present
+    code = re.sub(r'^```c\s*', '', code, flags=re.IGNORECASE)
+    code = re.sub(r'^```\s*', '', code)
+    code = re.sub(r'\s*```$', '', code)
+    
+    lines = code.split('\n')
+    
+    # Check if it looks like a diff
+    has_diff_markers = False
+    for line in lines[:20]:
+        if line.startswith('diff --git') or line.startswith('index ') or line.startswith('--- ') or line.startswith('+++ ') or line.startswith('@@'):
+            has_diff_markers = True
+            break
+        if line.startswith('+') and not line.strip() == '+':
+             has_diff_markers = True
+             break
+    
+    if has_diff_markers:
+        new_lines = []
+        for line in lines:
+            if line.startswith('diff --git') or line.startswith('index ') or line.startswith('--- ') or line.startswith('+++ ') or line.startswith('@@'):
+                continue
+            if line.startswith('-'):
+                continue
+            if line.startswith('+'):
+                new_lines.append(line[1:])
+            else:
+                new_lines.append(line)
+        return '\n'.join(new_lines)
+    
+    return code
+
 def separate_functions(code_block, f_name):
     """
     Tries to separate a code block into a main patched function
@@ -159,10 +195,12 @@ def analyze_code(model_name, index, cve, vulnerable_code, full_file_content, poc
 
         Based on your analysis, please generate the patched C code to fix the vulnerability.
         
-        **Your output MUST adhere to these rules:**
-        1.  You **must** provide the complete, patched version of the original function (`{vulnerable_code}`).
-        2.  If the fix requires creating a **new helper function**, you **must** include that new helper function in your response.
-        3.  Your entire output **must** be a single C code block, enclosed in one pair of markdown backticks (```c ... ```). Place any new helper functions *before* the patched original function.
+        **CRITICAL RULES FOR GENERATION:**
+        1.  **Self-Contained:** The code must be valid C code. If you use helper functions (like `memcpy`, `strlen`, `malloc`), ensure you include necessary headers (e.g., `#include <string.h>`) OR ensure they are standard enough to be available.
+        2.  **No Implicit Declarations:** If you introduce a new helper function, define it *before* the main function that uses it.
+        3.  **Exact Signature:** The patched function MUST have the EXACT SAME signature (return type, name, arguments) as the original function. Do not change the function name.
+        4.  **Complete Code:** Provide the FULL function body. Do not use placeholders like `// ... existing code ...`.
+        5.  **Format:** Your entire output **must** be a single C code block, enclosed in one pair of markdown backticks (```c ... ```).
         
         Only output the code.
         """
@@ -204,6 +242,64 @@ def analyze_code(model_name, index, cve, vulnerable_code, full_file_content, poc
             "patch_explanation": f"Error: {e}",
             "runtime_s": end_time - start_time
         }
+
+def repair_code(model_name, cve, vulnerable_code, previous_patch, error_log, full_file_content=None):
+    """
+    Repairs a failed patch using the LLM API.
+    """
+    print(f"\n--- REPAIRING CVE: {cve} with Model: {model_name} ---")
+    start_time = time.time()
+
+    file_context_prompt = ""
+    if full_file_content and not pd.isna(full_file_content) and full_file_content.strip():
+        file_context_prompt = f"""
+    For additional context, this function is from the following full file:
+    ```c
+    {full_file_content}
+    ```
+    """
+
+    prompt = f"""
+    You previously attempted to patch a vulnerability in the following C function (CVE: {cve}):
+    
+    **Original Vulnerable Code:**
+    ```c
+    {vulnerable_code}
+    ```
+    {file_context_prompt}
+
+    **Your Previous Patch:**
+    ```c
+    {previous_patch}
+    ```
+
+    **The Build/Test Failed with this Error:**
+    ```text
+    {error_log}
+    ```
+
+    **Task:**
+    Please analyze the error and generate a FIXED version of the patch.
+    
+    **CRITICAL RULES:**
+    1.  **Fix the Error:** Address the specific compiler error or logic failure mentioned in the log.
+    2.  **Self-Contained:** Ensure all used functions and types are defined or standard. If you need a helper function, define it BEFORE the main function.
+    3.  **Exact Signature:** Keep the function signature EXACTLY the same as the original.
+    4.  **Complete Code:** Output the FULL corrected code block.
+    5.  **Format:** Output ONLY the C code block enclosed in markdown backticks (```c ... ```).
+    """
+
+    try:
+        response = chat_with_api(
+            model_name,
+            [{'role': 'user', 'content': prompt}]
+        )
+        fixed_code_raw = response['message']['content']
+        print(f"[Repair Generated]: Complete.")
+        return fixed_code_raw
+    except Exception as e:
+        print(f"Error repairing {cve} with {model_name}: {e}")
+        return f"Error: {e}"
 
 def extract_vuln_type(analysis_text):
     """Extracts vulnerability type from analysis text."""
@@ -251,6 +347,8 @@ def save_patched_code(model_name, cve, row_index, patched_code_content, f_name):
     try:
         with open(output_c_filename, 'w', encoding='utf-8') as f:
             f.write(patched_code_content)
+    except PermissionError:
+        print(f"  [!] Permission denied saving .c file {output_c_filename}. Check directory permissions.")
     except Exception as e:
         print(f"  [!] Error saving .c file {output_c_filename}: {e}")
 
@@ -309,6 +407,8 @@ def save_aggregated_file(model_name, cve, original_file_path, original_content, 
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(new_full_content)
         print(f"  [+] Full patched file saved: {output_path}")
+    except PermissionError:
+        print(f"  [!] Permission denied saving full file {output_path}. Check directory permissions.")
     except Exception as e:
         print(f"  [!] Error saving full file {output_path}: {e}")
 
@@ -351,7 +451,13 @@ def generate_benchmark_stats(benchmark_df, original_df_len):
     
     # Create DataFrame and log the markdown table
     stats_df = pd.DataFrame(stats).set_index('Model')
-    log(stats_df.to_markdown())
+    try:
+        log(stats_df.to_markdown())
+    except ImportError:
+        log(stats_df.to_string())
+    except Exception as e:
+        log(f"Error printing markdown table: {e}")
+        log(stats_df.to_string())
 
     log("\n### 2. Vulnerability Type Distribution")
     type_counts = defaultdict(Counter)
@@ -359,7 +465,13 @@ def generate_benchmark_stats(benchmark_df, original_df_len):
         type_counts[row['MODEL_NAME']][row['VULN_TYPE']] += 1
         
     type_df = pd.DataFrame.from_dict(type_counts, orient='index').fillna(0).astype(int)
-    log(type_df.to_markdown())
+    try:
+        log(type_df.to_markdown())
+    except ImportError:
+        log(type_df.to_string())
+    except Exception as e:
+        log(f"Error printing markdown table: {e}")
+        log(type_df.to_string())
     
     log("\n" + "="*80)
     log(f"Patched Snippets: {OUTPUT_PATCH_DIR}")
@@ -468,6 +580,9 @@ def main():
                 else:
                     # Fallback: just strip (risky but better than nothing if no blocks)
                     patched_code_clean = patched_code_raw.strip().replace('```c', '').replace('```', '').strip()
+
+            # Clean the patch (handle diffs, etc.)
+            patched_code_clean = clean_patch(patched_code_clean)
 
             # 3. Save Isolated Snippet (Keep existing logic for snippets)
             save_patched_code(model_name, cve, index, patched_code_clean, f_name)

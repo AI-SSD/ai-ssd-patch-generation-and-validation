@@ -126,7 +126,7 @@ REQ_FILE="$REPO_DIR/glibc-test/requirements.txt"
 if [ -f "$REQ_FILE" ]; then
   pip install -r "$REQ_FILE"
 else
-  pip install pandas requests
+  pip install pandas requests tabulate
 fi
 
 # 4) Ollama install - DISABLED (Using External API)

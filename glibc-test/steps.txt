@@ -1,4 +1,10 @@
 chmod +x setup/server_setup.sh && ls -l setup/server_setup.sh requirements.txt
 sudo ./setup/server_setup.sh
 source .venv/bin/activate
-python3 run_methodology.py
+sudo ./.venv/bin/python3 run_methodology.py
+
+
+rsync -av --progress \
+  --exclude='.venv' \
+  admin@10.17.0.183:/home/admin/ai-ssd-patch-generation-and-validation/glibc-test/ \
+  Documents/Tese/vm-output/glibc-test/

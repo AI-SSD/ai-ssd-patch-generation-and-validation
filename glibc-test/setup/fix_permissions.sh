@@ -2,7 +2,7 @@
 # Fix permissions for the repository
 # Usage: ./fix_permissions.sh
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Detect the real user (even if run with sudo)
 if [ -n "$SUDO_USER" ]; then

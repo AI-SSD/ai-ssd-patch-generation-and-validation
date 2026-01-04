@@ -19,7 +19,13 @@ def main():
     
     if os.path.exists(src_patches):
         if os.path.exists(dest_patches):
-            shutil.rmtree(dest_patches)
+            # Try to remove using shutil, fallback to sudo rm -rf if permission denied
+            try:
+                shutil.rmtree(dest_patches)
+            except PermissionError:
+                print(f"Permission denied removing {dest_patches}. Trying with sudo...")
+                subprocess.run(["sudo", "rm", "-rf", dest_patches], check=True)
+                
         shutil.copytree(src_patches, dest_patches)
         print(f"Copied {src_patches} to {dest_patches}")
     else:
