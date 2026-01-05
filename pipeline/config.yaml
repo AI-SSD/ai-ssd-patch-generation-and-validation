@@ -1,0 +1,152 @@
+# =============================================================================
+# AI-SSD Project - Pipeline Configuration
+# =============================================================================
+
+# =============================================================================
+# Phase 1: Vulnerability Reproduction Settings
+# =============================================================================
+
+# Timeouts (in seconds)
+build_timeout: 3600
+run_timeout: 300
+
+# Docker settings
+docker:
+  memory_limit: "2g"
+  cpu_limit: 1
+  network_disabled: true
+
+# Paths (relative to base directory)
+paths:
+  csv_file: "documentation/file-function.csv"
+  exploits_dir: "exploits"
+  docker_builds: "docker_builds"
+  results: "results"
+  logs: "logs"
+  patches: "patches"
+
+# OS image mapping based on CVE year
+os_mapping:
+  "2012": "ubuntu:14.04"
+  "2013": "ubuntu:14.04"
+  "2014": "ubuntu:14.04"
+  "2015": "ubuntu:16.04"
+  "2016": "ubuntu:16.04"
+  "2017": "ubuntu:18.04"
+  "2018": "ubuntu:18.04"
+  default: "ubuntu:16.04"
+
+# Vulnerability detection patterns
+detection_patterns:
+  exit_codes:
+    - 139  # SIGSEGV
+    - 134  # SIGABRT
+  log_patterns:
+    - "stack smashing"
+    - "overflow"
+    - "corrupted"
+    - "double free"
+    - "buffer overflow"
+
+# =============================================================================
+# Phase 2: Patch Generation Settings
+# =============================================================================
+
+llm:
+  # LLM API endpoint (Ollama compatible)
+  endpoint: "http://10.3.2.171:80/api/chat"
+  
+  # Models to iterate through for patch generation
+  # Each CVE will be processed with ALL models listed here
+  models:
+    - "qwen2.5-coder:1.5b"
+    - "qwen2.5-coder:7b"
+    - "qwen2.5:1.5b"
+    - "qwen2.5:7b"
+  
+  # Request settings
+  timeout: 300          # Request timeout in seconds
+  retry_attempts: 3     # Number of retry attempts on failure
+  retry_delay: 5        # Delay between retries in seconds
+  
+  # Generation parameters
+  temperature: 0.2      # Lower = more deterministic
+  max_tokens: 8192      # Maximum tokens in response
+
+# =============================================================================
+# Phase 3: Validation Settings
+# =============================================================================
+
+validation:
+  # Whether to automatically validate patches after generation
+  auto_validate: false
+  
+  # Validation timeout per patch (seconds)
+  validate_timeout: 600
+  
+  # Docker build timeout for validation containers (seconds)
+  build_timeout: 3600
+  
+  # PoC execution timeout (seconds)
+  poc_timeout: 300
+  
+  # SAST Configuration
+  sast:
+    # Enable/disable SAST analysis
+    enabled: true
+    
+    # Cppcheck settings
+    cppcheck:
+      enabled: true
+      # Severity levels to report: error, warning, style, performance, portability, information
+      enable_checks: "all"
+      # Suppress specific warnings (IDs)
+      suppress: []
+      # Maximum allowed errors for patch to pass
+      max_errors: 0
+      # Maximum allowed high-severity warnings
+      max_warnings: 10
+    
+    # Flawfinder settings
+    flawfinder:
+      enabled: true
+      # Minimum risk level to report (1-5, where 5 is highest risk)
+      min_level: 1
+      # Maximum allowed high-severity hits (level 4-5) for patch to pass
+      max_high_severity: 0
+      # Maximum total hits allowed
+      max_total_hits: 50
+  
+  # Baseline comparison settings
+  baseline:
+    # Whether to compare against baseline (original vulnerable code)
+    compare_to_baseline: true
+    # Allow this many more issues than baseline
+    tolerance_errors: 0
+    tolerance_warnings: 5
+  
+  # Cleanup settings
+  cleanup:
+    # Remove Docker images after validation
+    remove_images: true
+    # Remove build contexts after validation
+    remove_build_dirs: false
+    # Keep logs for failed validations
+    keep_failure_logs: true
+
+# =============================================================================
+# CVE-specific file mappings
+# =============================================================================
+
+cve_mappings:
+  CVE-2012-3480:
+    glibc_file: "stdlib/strtod_l.c"
+    patch_file: "strtod_l.c"
+    
+  CVE-2014-5119:
+    glibc_file: "iconv/gconv_trans.c"
+    patch_file: "gconv_trans.c"
+    
+  CVE-2015-7547:
+    glibc_file: "resolv/res_send.c"
+    patch_file: "res_send.c"
