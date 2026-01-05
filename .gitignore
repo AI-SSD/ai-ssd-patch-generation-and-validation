@@ -23,3 +23,26 @@ __pycache__/
 !.gitattributes
 !.github/
 !.vscode/
+
+
+**/__pycache__/
+
+# Patches folder
+pipeline/patches/
+pipeline/validation_builds/
+pipeline/venv/
+pipeline/docker_builds/
+pipeline/.venv/
+pipeline/__pycache__/
+pipeline/logs/
+pipeline/results/
+pipeline/implementation/
+pipeline/reports/
+pipeline/validation_results/
+pipeline/phases-results/
+
+# Project files to ignore
+pipeline/QUICKSTART.md
+pipeline/p.txt
+pipeline/docker-debug.txt
+pipeline/random.txt
