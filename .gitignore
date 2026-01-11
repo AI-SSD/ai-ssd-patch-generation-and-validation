@@ -46,5 +46,5 @@ pipeline/QUICKSTART.md
 pipeline/p.txt
 pipeline/docker-debug.txt
 pipeline/random.txt
-dashboard/.env
-dashboard/node_modules/
+pipeline/dashboard/.env
+pipeline/dashboard/node_modules/
