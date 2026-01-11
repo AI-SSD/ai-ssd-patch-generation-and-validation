@@ -139,6 +139,8 @@ def setup_logging(log_dir: Path, verbose: bool = False) -> logging.Logger:
     # Configure root logger
     logger = logging.getLogger('orchestrator')
     logger.setLevel(logging.DEBUG)
+    # Clear existing handlers to prevent duplicates when module is re-imported
+    logger.handlers.clear()
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     
@@ -268,10 +270,18 @@ RUN ../glibc-src/configure \\
     || (cat config.log && exit 1)
 
 # Build glibc (using -k to continue on errors, -j for parallel)
-RUN make -j$(nproc) -k 2>&1 | tee /build/build.log || true
+# Save build status to check later
+RUN make -j$(nproc) -k 2>&1 | tee /build/build.log; \\
+    echo "GLIBC_BUILD_EXIT_CODE=$?" >> /build/build_status
 
 # Install to prefix (may partially succeed)
-RUN make install -k 2>&1 | tee -a /build/build.log || true
+RUN make install -k 2>&1 | tee -a /build/build.log; \\
+    echo "GLIBC_INSTALL_EXIT_CODE=$?" >> /build/build_status
+
+# Verify glibc build produced necessary files
+RUN echo "=== Checking glibc build output ===" && \\
+    ls -la /opt/glibc-vulnerable/lib/ 2>/dev/null || echo "WARNING: /opt/glibc-vulnerable/lib/ not found" && \\
+    ls /opt/glibc-vulnerable/lib/libc.so* 2>/dev/null || echo "WARNING: libc.so not found"
 
 # Create directory for PoC
 RUN mkdir -p /poc
@@ -280,14 +290,62 @@ RUN mkdir -p /poc
 COPY poc_exploit.c /poc/exploit.c
 
 # Compile the PoC against vulnerable glibc
-# Adding common flags: -ldl (dynamic loading), -lpthread (threading)
+# First, find the actual dynamic linker path
+# Use fallback compilation attempts if linking with specific libraries fails
+# Always fall back to system glibc if vulnerable glibc compilation fails
 WORKDIR /poc
-RUN gcc -o exploit exploit.c \\
-    -Wl,-rpath,/opt/glibc-vulnerable/lib \\
-    -Wl,--dynamic-linker=/opt/glibc-vulnerable/lib/ld-linux*.so.* \\
-    -L/opt/glibc-vulnerable/lib \\
-    -ldl -lpthread \\
-    2>&1 || gcc -o exploit exploit.c -ldl -lpthread 2>&1 || gcc -o exploit exploit.c 2>&1
+RUN DYNAMIC_LINKER=$(find /opt/glibc-vulnerable/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
+    echo "Found dynamic linker: $DYNAMIC_LINKER" && \\
+    if [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then \\
+        echo "Attempting compilation with vulnerable glibc..."; \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
+            -L/opt/glibc-vulnerable/lib \\
+            -I/opt/glibc-vulnerable/include \\
+            -ldl -lpthread 2>&1 || \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
+            -L/opt/glibc-vulnerable/lib \\
+            -I/opt/glibc-vulnerable/include \\
+            -ldl 2>&1 || \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
+            -L/opt/glibc-vulnerable/lib \\
+            -I/opt/glibc-vulnerable/include \\
+            -lm 2>&1 || \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
+            -L/opt/glibc-vulnerable/lib \\
+            -I/opt/glibc-vulnerable/include 2>&1 || \\
+        echo "Vulnerable glibc compilation failed"; \\
+    fi && \\
+    if [ ! -f /poc/exploit ]; then \\
+        echo "Falling back to system glibc compilation..." && \\
+        (gcc -o exploit exploit.c -ldl -lpthread 2>&1 || \\
+        gcc -o exploit exploit.c -ldl 2>&1 || \\
+        gcc -o exploit exploit.c -lm 2>&1 || \\
+        gcc -o exploit exploit.c 2>&1); \\
+    fi
+
+# Verify exploit binary was created
+RUN if [ ! -f /poc/exploit ]; then \\
+        echo "ERROR: Failed to compile exploit binary!" && \\
+        echo "=== Compilation environment ===" && \\
+        gcc --version && \\
+        echo "=== Source file ===" && \\
+        head -50 /poc/exploit.c && \\
+        echo "=== Attempting verbose compilation ===" && \\
+        gcc -v -o exploit exploit.c 2>&1 || true; \\
+        exit 1; \\
+    else \\
+        echo "SUCCESS: Exploit binary created" && \\
+        ls -la /poc/exploit && \\
+        file /poc/exploit; \\
+    fi
 
 # Set environment for running with vulnerable glibc
 ENV LD_LIBRARY_PATH=/opt/glibc-vulnerable/lib
@@ -350,10 +408,18 @@ RUN ../glibc-src/configure \\
     || (cat config.log && exit 1)
 
 # Build glibc (using -k to continue on errors)
-RUN make -j$(nproc) -k 2>&1 | tee /build/build.log || true
+# Save build status to check later
+RUN make -j$(nproc) -k 2>&1 | tee /build/build.log; \\
+    echo "GLIBC_BUILD_EXIT_CODE=$?" >> /build/build_status
 
 # Install to prefix
-RUN make install -k 2>&1 | tee -a /build/build.log || true
+RUN make install -k 2>&1 | tee -a /build/build.log; \\
+    echo "GLIBC_INSTALL_EXIT_CODE=$?" >> /build/build_status
+
+# Verify glibc build produced necessary files
+RUN echo "=== Checking glibc build output ===" && \\
+    ls -la /opt/glibc-vulnerable/lib/ 2>/dev/null || echo "WARNING: /opt/glibc-vulnerable/lib/ not found" && \\
+    ls /opt/glibc-vulnerable/lib/libc.so* 2>/dev/null || echo "WARNING: libc.so not found"
 
 # Create directory for PoC
 RUN mkdir -p /poc
@@ -362,14 +428,62 @@ RUN mkdir -p /poc
 COPY poc_exploit.c /poc/exploit.c
 
 # Compile the PoC against vulnerable glibc
-# Adding common flags: -ldl (dynamic loading), -lpthread (threading)
+# First, find the actual dynamic linker path
+# Use fallback compilation attempts if linking with specific libraries fails
+# Always fall back to system glibc if vulnerable glibc compilation fails
 WORKDIR /poc
-RUN gcc -o exploit exploit.c \\
-    -Wl,-rpath,/opt/glibc-vulnerable/lib \\
-    -Wl,--dynamic-linker=/opt/glibc-vulnerable/lib/ld-linux-x86-64.so.2 \\
-    -L/opt/glibc-vulnerable/lib \\
-    -ldl -lpthread \\
-    2>&1 || gcc -o exploit exploit.c -ldl -lpthread 2>&1 || gcc -o exploit exploit.c 2>&1
+RUN DYNAMIC_LINKER=$(find /opt/glibc-vulnerable/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
+    echo "Found dynamic linker: $DYNAMIC_LINKER" && \\
+    if [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then \\
+        echo "Attempting compilation with vulnerable glibc..."; \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
+            -L/opt/glibc-vulnerable/lib \\
+            -I/opt/glibc-vulnerable/include \\
+            -ldl -lpthread 2>&1 || \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
+            -L/opt/glibc-vulnerable/lib \\
+            -I/opt/glibc-vulnerable/include \\
+            -ldl 2>&1 || \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
+            -L/opt/glibc-vulnerable/lib \\
+            -I/opt/glibc-vulnerable/include \\
+            -lm 2>&1 || \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
+            -L/opt/glibc-vulnerable/lib \\
+            -I/opt/glibc-vulnerable/include 2>&1 || \\
+        echo "Vulnerable glibc compilation failed"; \\
+    fi && \\
+    if [ ! -f /poc/exploit ]; then \\
+        echo "Falling back to system glibc compilation..." && \\
+        (gcc -o exploit exploit.c -ldl -lpthread 2>&1 || \\
+        gcc -o exploit exploit.c -ldl 2>&1 || \\
+        gcc -o exploit exploit.c -lm 2>&1 || \\
+        gcc -o exploit exploit.c 2>&1); \\
+    fi
+
+# Verify exploit binary was created
+RUN if [ ! -f /poc/exploit ]; then \\
+        echo "ERROR: Failed to compile exploit binary!" && \\
+        echo "=== Compilation environment ===" && \\
+        gcc --version && \\
+        echo "=== Source file ===" && \\
+        head -50 /poc/exploit.c && \\
+        echo "=== Attempting verbose compilation ===" && \\
+        gcc -v -o exploit exploit.c 2>&1 || true; \\
+        exit 1; \\
+    else \\
+        echo "SUCCESS: Exploit binary created" && \\
+        ls -la /poc/exploit && \\
+        file /poc/exploit; \\
+    fi
 
 # Set environment for running with vulnerable glibc
 ENV LD_LIBRARY_PATH=/opt/glibc-vulnerable/lib
@@ -432,10 +546,18 @@ RUN ../glibc-src/configure \\
     || (cat config.log && exit 1)
 
 # Build glibc
-RUN make -j$(nproc) -k 2>&1 | tee /build/build.log || true
+# Save build status to check later
+RUN make -j$(nproc) -k 2>&1 | tee /build/build.log; \\
+    echo "GLIBC_BUILD_EXIT_CODE=$?" >> /build/build_status
 
 # Install to prefix
-RUN make install -k 2>&1 | tee -a /build/build.log || true
+RUN make install -k 2>&1 | tee -a /build/build.log; \\
+    echo "GLIBC_INSTALL_EXIT_CODE=$?" >> /build/build_status
+
+# Verify glibc build produced necessary files
+RUN echo "=== Checking glibc build output ===" && \\
+    ls -la /opt/glibc-vulnerable/lib/ 2>/dev/null || echo "WARNING: /opt/glibc-vulnerable/lib/ not found" && \\
+    ls /opt/glibc-vulnerable/lib/libc.so* 2>/dev/null || echo "WARNING: libc.so not found"
 
 # Create directory for PoC
 RUN mkdir -p /poc
@@ -444,14 +566,62 @@ RUN mkdir -p /poc
 COPY poc_exploit.c /poc/exploit.c
 
 # Compile the PoC against vulnerable glibc
-# Adding common flags: -ldl (dynamic loading), -lpthread (threading)
+# First, find the actual dynamic linker path
+# Use fallback compilation attempts if linking with specific libraries fails
+# Always fall back to system glibc if vulnerable glibc compilation fails
 WORKDIR /poc
-RUN gcc -o exploit exploit.c \\
-    -Wl,-rpath,/opt/glibc-vulnerable/lib \\
-    -Wl,--dynamic-linker=/opt/glibc-vulnerable/lib/ld-linux-x86-64.so.2 \\
-    -L/opt/glibc-vulnerable/lib \\
-    -ldl -lpthread \\
-    2>&1 || gcc -o exploit exploit.c -ldl -lpthread 2>&1 || gcc -o exploit exploit.c 2>&1
+RUN DYNAMIC_LINKER=$(find /opt/glibc-vulnerable/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
+    echo "Found dynamic linker: $DYNAMIC_LINKER" && \\
+    if [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then \\
+        echo "Attempting compilation with vulnerable glibc..."; \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
+            -L/opt/glibc-vulnerable/lib \\
+            -I/opt/glibc-vulnerable/include \\
+            -ldl -lpthread 2>&1 || \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
+            -L/opt/glibc-vulnerable/lib \\
+            -I/opt/glibc-vulnerable/include \\
+            -ldl 2>&1 || \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
+            -L/opt/glibc-vulnerable/lib \\
+            -I/opt/glibc-vulnerable/include \\
+            -lm 2>&1 || \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
+            -L/opt/glibc-vulnerable/lib \\
+            -I/opt/glibc-vulnerable/include 2>&1 || \\
+        echo "Vulnerable glibc compilation failed"; \\
+    fi && \\
+    if [ ! -f /poc/exploit ]; then \\
+        echo "Falling back to system glibc compilation..." && \\
+        (gcc -o exploit exploit.c -ldl -lpthread 2>&1 || \\
+        gcc -o exploit exploit.c -ldl 2>&1 || \\
+        gcc -o exploit exploit.c -lm 2>&1 || \\
+        gcc -o exploit exploit.c 2>&1); \\
+    fi
+
+# Verify exploit binary was created
+RUN if [ ! -f /poc/exploit ]; then \\
+        echo "ERROR: Failed to compile exploit binary!" && \\
+        echo "=== Compilation environment ===" && \\
+        gcc --version && \\
+        echo "=== Source file ===" && \\
+        head -50 /poc/exploit.c && \\
+        echo "=== Attempting verbose compilation ===" && \\
+        gcc -v -o exploit exploit.c 2>&1 || true; \\
+        exit 1; \\
+    else \\
+        echo "SUCCESS: Exploit binary created" && \\
+        ls -la /poc/exploit && \\
+        file /poc/exploit; \\
+    fi
 
 # Set environment for running with vulnerable glibc
 ENV LD_LIBRARY_PATH=/opt/glibc-vulnerable/lib
@@ -608,6 +778,22 @@ class DockerManager:
     
     def _interpret_exit_code(self, vuln: VulnerabilityInfo, exit_code: int, logs: str) -> bool:
         """Interpret container exit code and logs to determine if vulnerability was triggered"""
+        logs_lower = logs.lower()
+        
+        # FIRST: Check for environment/execution errors - these are NOT successful reproductions
+        # These indicate the test setup failed, not that the vulnerability was exercised
+        if "no such file or directory" in logs_lower:
+            self.logger.error(f"{vuln.cve}: Environment error - exploit binary not found. Build/setup issue.")
+            return False
+        
+        if "exec format error" in logs_lower:
+            self.logger.error(f"{vuln.cve}: Environment error - binary format issue. Build/architecture problem.")
+            return False
+        
+        if "permission denied" in logs_lower and "exec" in logs_lower:
+            self.logger.error(f"{vuln.cve}: Environment error - permission denied executing binary.")
+            return False
+        
         # Segmentation fault (139 = 128 + 11 SIGSEGV)
         if exit_code == 139:
             self.logger.info(f"{vuln.cve}: Segmentation fault detected - vulnerability likely triggered")
@@ -619,12 +805,12 @@ class DockerManager:
             return True
         
         # Stack smashing detected
-        if "stack smashing" in logs.lower():
+        if "stack smashing" in logs_lower:
             self.logger.info(f"{vuln.cve}: Stack smashing detected in logs")
             return True
         
         # Buffer overflow indicators
-        if any(indicator in logs.lower() for indicator in ['overflow', 'corrupted', 'double free']):
+        if any(indicator in logs_lower for indicator in ['overflow', 'corrupted', 'double free']):
             self.logger.info(f"{vuln.cve}: Overflow/corruption detected in logs")
             return True
         
@@ -653,13 +839,23 @@ class DockerManager:
         # This is a complex exploit requiring pkexec and pty helper
         # Simple compilation and execution won't fully trigger it
         if vuln.cve == "CVE-2014-5119":
-            if "corrupted" in logs.lower() or "double-linked" in logs.lower():
+            if "corrupted" in logs_lower or "double-linked" in logs_lower:
                 self.logger.info(f"{vuln.cve}: Heap corruption detected")
                 return True
-            # If it even compiled and ran, consider it partial success
-            if exit_code == 0 or exit_code == 1:
-                self.logger.info(f"{vuln.cve}: Exploit executed (exit {exit_code}) - check logs for details")
+            # Only consider as success if exploit actually ran (not env errors)
+            # and produced meaningful output or specific exit codes
+            if exit_code in [134, 139]:  # SIGABRT or SIGSEGV
+                self.logger.info(f"{vuln.cve}: Crash detected (exit {exit_code}) - vulnerability triggered")
                 return True
+            if exit_code == 0 and logs.strip() and "error" not in logs_lower:
+                self.logger.info(f"{vuln.cve}: Exploit executed successfully (exit 0) - code path exercised")
+                return True
+            # Exit code 1 with no output is likely an error, not success
+            if exit_code == 1 and logs.strip():
+                self.logger.info(f"{vuln.cve}: Exploit completed with exit 1 and output")
+                return True
+            self.logger.warning(f"{vuln.cve}: Unclear result (exit {exit_code}) - marking as not reproduced")
+            return False
         
         # Exit code 0 might also indicate the vulnerability was exercised
         # depending on the specific PoC
@@ -744,17 +940,57 @@ class ReportGenerator:
         """Add a result to the report"""
         self.results.append(result)
     
-    def generate_report(self) -> Path:
-        """Generate JSON report file"""
+    def generate_report(self, phase_start: datetime = None, phase_end: datetime = None) -> Path:
+        """Generate JSON report file with comprehensive timing information"""
         report_path = self.results_dir / "results.json"
+        
+        # Calculate total execution time from all results
+        total_execution_time = sum(r.execution_time_seconds for r in self.results)
+        
+        # Calculate per-CVE timing
+        cve_timings = {}
+        for r in self.results:
+            if r.cve not in cve_timings:
+                cve_timings[r.cve] = {
+                    "execution_time_seconds": 0.0,
+                    "build_success": False,
+                    "vulnerability_reproduced": False
+                }
+            cve_timings[r.cve]["execution_time_seconds"] = r.execution_time_seconds
+            cve_timings[r.cve]["build_success"] = r.build_success
+            cve_timings[r.cve]["vulnerability_reproduced"] = r.vulnerability_reproduced
+        
+        # Count different failure types for better analysis
+        build_errors = sum(1 for r in self.results if r.status == ExecutionStatus.BUILD_ERROR.value)
+        execution_errors = sum(1 for r in self.results if r.status == ExecutionStatus.EXECUTION_ERROR.value)
+        poc_not_found = sum(1 for r in self.results if r.status == ExecutionStatus.POC_NOT_FOUND.value)
+        timeouts = sum(1 for r in self.results if r.status == ExecutionStatus.TIMEOUT.value)
+        unknown_errors = sum(1 for r in self.results if r.status == ExecutionStatus.UNKNOWN_ERROR.value)
+        successful = sum(1 for r in self.results if r.vulnerability_reproduced)
         
         report_data = {
             "metadata": {
                 "generated_at": datetime.now().isoformat(),
+                "phase": "Phase 1 - Vulnerability Reproduction",
                 "total_vulnerabilities": len(self.results),
-                "successful_reproductions": sum(1 for r in self.results if r.vulnerability_reproduced),
+                "successful_reproductions": successful,
                 "failed_builds": sum(1 for r in self.results if not r.build_success),
             },
+            "phase_timing": {
+                "start_time": phase_start.isoformat() if phase_start else None,
+                "end_time": phase_end.isoformat() if phase_end else None,
+                "total_duration_seconds": (phase_end - phase_start).total_seconds() if phase_start and phase_end else total_execution_time,
+            },
+            "failure_breakdown": {
+                "build_errors": build_errors,
+                "execution_errors": execution_errors,
+                "poc_not_found": poc_not_found,
+                "timeouts": timeouts,
+                "unknown_errors": unknown_errors,
+                "total_failures": len(self.results) - successful,
+            },
+            "timing_by_cve": cve_timings,
+            "total_execution_time_seconds": total_execution_time,
             "results": [asdict(r) for r in self.results]
         }
         
@@ -816,7 +1052,12 @@ class PipelineOrchestrator:
     
     def run(self):
         """Execute the full pipeline"""
-        self.logger.info("Starting vulnerability reproduction pipeline...")
+        phase_start_time = datetime.now()
+        
+        self.logger.info("=" * 60)
+        self.logger.info("Starting Phase 1: Vulnerability Reproduction Pipeline")
+        self.logger.info(f"Phase Start Time: {phase_start_time.isoformat()}")
+        self.logger.info("=" * 60)
         self.logger.info(f"Base directory: {self.base_dir}")
         self.logger.info(f"CSV file: {self.csv_path}")
         self.logger.info(f"Exploits directory: {self.exploits_dir}")
@@ -835,20 +1076,32 @@ class PipelineOrchestrator:
                 self.logger.error(f"CVE {self.specific_cve} not found in CSV")
                 sys.exit(1)
         
+        self.logger.info(f"Found {len(vulnerabilities)} vulnerabilities to process")
+        
         # Process each vulnerability
-        for vuln in vulnerabilities:
+        for idx, vuln in enumerate(vulnerabilities, 1):
             self.logger.info(f"\n{'='*60}")
-            self.logger.info(f"Processing: {vuln.cve}")
-            self.logger.info(f"Commit: {vuln.commit_hash} \n{'='*60}")
+            self.logger.info(f"Processing ({idx}/{len(vulnerabilities)}): {vuln.cve}")
+            self.logger.info(f"Commit: {vuln.commit_hash}")
+            self.logger.info(f"{'='*60}")
             
             result = self._process_vulnerability(vuln)
             self.report_gen.add_result(result)
+            self.logger.info(f"Completed {vuln.cve}: {result.status} (duration: {result.execution_time_seconds:.1f}s)")
         
-        # Generate final report
-        report_path = self.report_gen.generate_report()
+        phase_end_time = datetime.now()
+        phase_duration = (phase_end_time - phase_start_time).total_seconds()
+        
+        # Generate final report with phase timing
+        report_path = self.report_gen.generate_report(phase_start_time, phase_end_time)
         self.report_gen.print_summary()
         
-        self.logger.info(f"Pipeline completed. Results saved to: {report_path}")
+        self.logger.info("=" * 60)
+        self.logger.info(f"Phase 1 Complete")
+        self.logger.info(f"Phase End Time: {phase_end_time.isoformat()}")
+        self.logger.info(f"Phase Duration: {phase_duration:.1f}s ({phase_duration/60:.1f}m)")
+        self.logger.info(f"Results saved to: {report_path}")
+        self.logger.info("=" * 60)
     
     def _process_vulnerability(self, vuln: VulnerabilityInfo) -> ExecutionResult:
         """Process a single vulnerability"""

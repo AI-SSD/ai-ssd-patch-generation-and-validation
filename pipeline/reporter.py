@@ -170,6 +170,52 @@ class CVEStats:
     successful_fixes: int = 0
     best_model: Optional[str] = None
 
+
+@dataclass
+class FeedbackLoopAttempt:
+    """Single feedback loop attempt"""
+    attempt_number: int
+    validation_passed: bool
+    poc_blocked: bool
+    sast_passed: bool
+    build_success: bool
+    failure_reasons: List[str]
+    timestamp: str  # Legacy: end timestamp (kept for backwards compatibility)
+    start_time: str = ""  # New: attempt start time
+    end_time: str = ""  # New: attempt end time
+    duration_seconds: float = 0.0  # New: attempt duration
+    generation_duration_seconds: float = 0.0  # New: patch generation duration
+    validation_duration_seconds: float = 0.0  # New: validation duration
+
+
+@dataclass
+class FeedbackLoopEntry:
+    """Feedback loop result for a single CVE/model combination"""
+    cve_id: str
+    model_name: str
+    final_status: str  # "success", "failed", "unpatchable"
+    total_attempts: int
+    max_retries: int
+    attempts: List[FeedbackLoopAttempt]
+    successful_on_attempt: Optional[int]
+    final_patch_path: Optional[str]
+    start_time: str = ""  # New: entry start time
+    end_time: str = ""  # New: entry end time
+    total_duration_seconds: float = 0.0  # New: total duration
+
+
+@dataclass
+class FeedbackLoopStats:
+    """Aggregated feedback loop statistics"""
+    total_entries: int = 0
+    succeeded_first_try: int = 0
+    succeeded_after_retry: int = 0
+    marked_unpatchable: int = 0
+    total_retry_attempts: int = 0
+    avg_attempts_to_success: float = 0.0
+    retry_success_rate: float = 0.0
+    best_model: Optional[str] = None
+
 # =============================================================================
 # Data Loading
 # =============================================================================
@@ -230,13 +276,19 @@ class DataLoader:
                 data = json.load(f)
             
             metadata = {
-                'start_time': data.get('start_time', ''),
-                'end_time': data.get('end_time', ''),
-                'duration_seconds': data.get('duration_seconds', 0),
-                'total_tasks': data.get('total_tasks', 0),
-                'successful': data.get('successful', 0),
-                'syntax_valid': data.get('syntax_valid', 0),
-                'failed': data.get('failed', 0)
+                'phase': data.get('metadata', {}).get('phase', 'Phase 2 - Patch Generation'),
+                'generated_at': data.get('metadata', {}).get('generated_at', ''),
+                # Support both old format and new format
+                'start_time': data.get('phase_timing', {}).get('start_time') or data.get('start_time', ''),
+                'end_time': data.get('phase_timing', {}).get('end_time') or data.get('end_time', ''),
+                'duration_seconds': data.get('phase_timing', {}).get('total_duration_seconds') or data.get('duration_seconds', 0),
+                'total_tasks': data.get('summary', {}).get('total_tasks') or data.get('total_tasks', 0),
+                'successful': data.get('summary', {}).get('successful') or data.get('successful', 0),
+                'syntax_valid': data.get('summary', {}).get('syntax_valid') or data.get('syntax_valid', 0),
+                'failed': data.get('summary', {}).get('failed') or data.get('failed', 0),
+                'total_prompt_tokens': data.get('summary', {}).get('total_prompt_tokens') or data.get('total_prompt_tokens', 0),
+                'total_response_tokens': data.get('summary', {}).get('total_response_tokens') or data.get('total_response_tokens', 0),
+                'total_llm_runtime_seconds': data.get('summary', {}).get('total_llm_runtime_seconds') or data.get('total_llm_runtime_seconds', 0),
             }
             
             results = []
@@ -275,7 +327,14 @@ class DataLoader:
             
             metadata = data.get('metadata', {})
             summary = data.get('summary', {})
+            phase_timing = data.get('phase_timing', {})
+            
+            # Merge metadata with timing information
             metadata.update(summary)
+            metadata['start_time'] = phase_timing.get('start_time', '')
+            metadata['end_time'] = phase_timing.get('end_time', '')
+            metadata['total_duration_seconds'] = phase_timing.get('total_duration_seconds', 0)
+            metadata['total_execution_time_seconds'] = summary.get('total_execution_time_seconds', 0)
             
             results = []
             by_cve = data.get('by_cve', {})
@@ -316,6 +375,99 @@ class DataLoader:
             
         except Exception as e:
             logger.error(f"Error loading Phase 3 results: {e}")
+            return {}, []
+
+    def load_feedback_loop_results(self) -> Tuple[Dict[str, Any], List[FeedbackLoopEntry]]:
+        """Load feedback loop results from JSON files."""
+        # Check both possible locations for feedback loop results:
+        # 1. results/ directory (where pipeline.py saves them)
+        # 2. feedback_loop_results/ directory (legacy location)
+        results_dir = self.base_dir / "results"
+        feedback_dir = self.base_dir / "feedback_loop_results"
+        
+        result_files = []
+        
+        # First check the results directory (primary location)
+        if results_dir.exists():
+            result_files.extend(list(results_dir.glob("feedback_loop_results_*.json")))
+        
+        # Also check legacy feedback_loop_results directory
+        if feedback_dir.exists():
+            result_files.extend(list(feedback_dir.glob("feedback_loop_*.json")))
+        
+        if not result_files:
+            logger.info("No feedback loop results files found")
+            return {}, []
+        
+        if not result_files:
+            logger.info("No feedback loop results files found")
+            return {}, []
+        
+        # Use the most recent file
+        result_file = max(result_files, key=lambda p: p.stat().st_mtime)
+        
+        try:
+            with open(result_file, 'r') as f:
+                data = json.load(f)
+            
+            metadata = data.get('metadata', {})
+            # Support old format without metadata section
+            if not metadata:
+                metadata = {
+                    'timestamp': data.get('timestamp', ''),
+                    'max_retries': data.get('max_retries', 3),
+                }
+            
+            entries = []
+            
+            for item in data.get('results', []):
+                attempts = []
+                # Support both 'attempts' (new) and 'validation_history' (old) field names
+                attempt_list = item.get('attempts', []) or item.get('validation_history', [])
+                for attempt_data in attempt_list:
+                    # Map old field names to new ones
+                    attempt_num = attempt_data.get('attempt_number') or attempt_data.get('attempt', 0)
+                    validation_passed = attempt_data.get('validation_passed', False)
+                    # In old format, check if status is "Success"
+                    if not validation_passed and attempt_data.get('status') == 'Success':
+                        validation_passed = True
+                    
+                    attempts.append(FeedbackLoopAttempt(
+                        attempt_number=attempt_num,
+                        validation_passed=validation_passed,
+                        poc_blocked=attempt_data.get('poc_blocked', False),
+                        sast_passed=attempt_data.get('sast_passed', False),
+                        build_success=attempt_data.get('build_success', True),  # Old format assumes build success if not specified
+                        failure_reasons=attempt_data.get('failure_reasons', []) or ([attempt_data.get('error_message')] if attempt_data.get('error_message') else []),
+                        timestamp=attempt_data.get('timestamp', ''),
+                        # New timestamp fields (with backwards compatibility)
+                        start_time=attempt_data.get('start_time', ''),
+                        end_time=attempt_data.get('end_time', ''),
+                        duration_seconds=attempt_data.get('duration_seconds', 0.0),
+                        generation_duration_seconds=attempt_data.get('generation_duration_seconds', 0.0),
+                        validation_duration_seconds=attempt_data.get('validation_duration_seconds', 0.0)
+                    ))
+                
+                entries.append(FeedbackLoopEntry(
+                    cve_id=item.get('cve_id', ''),
+                    model_name=item.get('model_name', ''),
+                    final_status=item.get('final_status', ''),
+                    total_attempts=item.get('total_attempts', 0),
+                    max_retries=item.get('max_retries', 3) or data.get('max_retries', 3),
+                    attempts=attempts,
+                    successful_on_attempt=item.get('successful_on_attempt') or item.get('successful_attempt'),
+                    final_patch_path=item.get('final_patch_path'),
+                    # New timing fields (with backwards compatibility)
+                    start_time=item.get('start_time', ''),
+                    end_time=item.get('end_time', ''),
+                    total_duration_seconds=item.get('total_duration_seconds', 0.0)
+                ))
+            
+            logger.info(f"Loaded {len(entries)} feedback loop entries")
+            return metadata, entries
+            
+        except Exception as e:
+            logger.error(f"Error loading feedback loop results: {e}")
             return {}, []
 
 # =============================================================================
@@ -443,6 +595,43 @@ class StatsCalculator:
                 summary[tool]['total_findings'] += sast.findings_count
         
         return dict(summary)
+    
+    @staticmethod
+    def get_feedback_loop_stats(entries: List[FeedbackLoopEntry]) -> FeedbackLoopStats:
+        """Calculate feedback loop statistics."""
+        stats = FeedbackLoopStats()
+        
+        if not entries:
+            return stats
+        
+        stats.total_entries = len(entries)
+        successful_attempts = []
+        
+        for entry in entries:
+            if entry.final_status == "success":
+                if entry.successful_on_attempt == 1:
+                    stats.succeeded_first_try += 1
+                else:
+                    stats.succeeded_after_retry += 1
+                if entry.successful_on_attempt:
+                    successful_attempts.append(entry.successful_on_attempt)
+            elif entry.final_status == "unpatchable":
+                stats.marked_unpatchable += 1
+            
+            # Count total retry attempts (attempts beyond the first)
+            if entry.total_attempts > 1:
+                stats.total_retry_attempts += entry.total_attempts - 1
+        
+        # Calculate averages
+        if successful_attempts:
+            stats.avg_attempts_to_success = sum(successful_attempts) / len(successful_attempts)
+        
+        # Calculate retry success rate (successes after retry / total entries that needed retry)
+        entries_needing_retry = stats.succeeded_after_retry + stats.marked_unpatchable
+        if entries_needing_retry > 0:
+            stats.retry_success_rate = (stats.succeeded_after_retry / entries_needing_retry) * 100
+        
+        return stats
     
     def _normalize_model_name(self, name: str) -> str:
         """Normalize model name for consistent comparison."""
@@ -749,7 +938,9 @@ class ReportGenerator:
         model_stats: Dict[str, ModelStats],
         cve_stats: Dict[str, CVEStats],
         sast_summary: Dict[str, Dict[str, int]],
-        chart_paths: Dict[str, Path]
+        chart_paths: Dict[str, Path],
+        feedback_entries: Optional[List[FeedbackLoopEntry]] = None,
+        feedback_stats: Optional[FeedbackLoopStats] = None
     ) -> Path:
         """Generate comprehensive Markdown report."""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -811,6 +1002,12 @@ class ReportGenerator:
         
         if 'cve_success' in chart_paths:
             report.append(f"\n![CVE Success]({chart_paths['cve_success'].name})\n")
+        
+        # Feedback Loop (Self-Healing) Section
+        if feedback_entries is not None and feedback_stats is not None:
+            report.append("\n---\n")
+            report.append("## Iterative Feedback Loop (Self-Healing)\n")
+            report.append(self._generate_feedback_loop_section(feedback_entries, feedback_stats))
         
         # Recommendations
         report.append("\n---\n")
@@ -1050,6 +1247,75 @@ class ReportGenerator:
         
         return '\n'.join(lines)
     
+    def _generate_feedback_loop_section(
+        self,
+        feedback_entries: List[FeedbackLoopEntry],
+        feedback_stats: FeedbackLoopStats
+    ) -> str:
+        """Generate feedback loop (self-healing) section."""
+        lines = []
+        
+        if not feedback_entries:
+            lines.append("*No feedback loop results available. The feedback loop was either disabled or not triggered.*")
+            return '\n'.join(lines)
+        
+        # Summary statistics
+        lines.append("### Feedback Loop Summary\n")
+        lines.append("The iterative feedback loop (self-healing mechanism) automatically retries failed patches "
+                    "by providing failure context to the LLM for improved patch generation.\n")
+        
+        lines.append("| Metric | Value |")
+        lines.append("|--------|-------|")
+        lines.append(f"| Total Patches Processed | {feedback_stats.total_entries} |")
+        lines.append(f"| Succeeded on First Try | {feedback_stats.succeeded_first_try} |")
+        lines.append(f"| Succeeded After Retry | {feedback_stats.succeeded_after_retry} |")
+        lines.append(f"| Marked as Unpatchable | {feedback_stats.marked_unpatchable} |")
+        lines.append(f"| Total Retry Attempts | {feedback_stats.total_retry_attempts} |")
+        lines.append(f"| Avg Attempts to Success | {feedback_stats.avg_attempts_to_success:.2f} |")
+        lines.append(f"| Retry Success Rate | {feedback_stats.retry_success_rate:.1f}% |")
+        lines.append("")
+        
+        # Effectiveness analysis
+        lines.append("### Feedback Loop Effectiveness\n")
+        
+        if feedback_stats.succeeded_after_retry > 0:
+            lines.append(f"✅ **{feedback_stats.succeeded_after_retry}** patches were successfully fixed "
+                        f"through the self-healing mechanism that would have otherwise failed.")
+        
+        if feedback_stats.marked_unpatchable > 0:
+            lines.append(f"⚠️ **{feedback_stats.marked_unpatchable}** patches were marked as **unpatchable** "
+                        f"after exhausting all retry attempts. These require manual review.")
+        
+        lines.append("")
+        
+        # Detailed retry history
+        lines.append("### Detailed Retry History\n")
+        lines.append("| CVE | Model | Final Status | Attempts | Success On |")
+        lines.append("|-----|-------|--------------|----------|------------|")
+        
+        for entry in feedback_entries:
+            status_icon = "✅" if entry.final_status == "success" else ("⚠️" if entry.final_status == "unpatchable" else "❌")
+            success_on = str(entry.successful_on_attempt) if entry.successful_on_attempt else "N/A"
+            lines.append(f"| {entry.cve_id} | {entry.model_name} | {status_icon} {entry.final_status} | "
+                        f"{entry.total_attempts}/{entry.max_retries + 1} | {success_on} |")
+        
+        lines.append("")
+        
+        # Show unpatchable entries with failure reasons
+        unpatchable = [e for e in feedback_entries if e.final_status == "unpatchable"]
+        if unpatchable:
+            lines.append("### Unpatchable Entries - Failure Analysis\n")
+            for entry in unpatchable:
+                lines.append(f"#### {entry.cve_id} - {entry.model_name}\n")
+                lines.append(f"- **Total Attempts:** {entry.total_attempts}")
+                lines.append("- **Failure History:**")
+                for attempt in entry.attempts:
+                    reasons = ", ".join(attempt.failure_reasons) if attempt.failure_reasons else "Unknown"
+                    lines.append(f"  - Attempt {attempt.attempt_number}: {reasons}")
+                lines.append("")
+        
+        return '\n'.join(lines)
+    
     def _generate_recommendations(
         self,
         model_stats: Dict[str, ModelStats],
@@ -1142,6 +1408,14 @@ class PipelineReporter:
         logger.info("Loading Phase 3 results...")
         phase3_metadata, phase3_results = self.loader.load_phase3_results()
         
+        # Load feedback loop results (if available)
+        logger.info("Loading Feedback Loop results...")
+        feedback_metadata, feedback_entries = self.loader.load_feedback_loop_results()
+        feedback_stats = None
+        if feedback_entries:
+            feedback_stats = StatsCalculator.get_feedback_loop_stats(feedback_entries)
+            logger.info(f"Loaded {len(feedback_entries)} feedback loop entries")
+        
         # Calculate statistics
         logger.info("Calculating statistics...")
         calc = StatsCalculator(phase1_results, phase2_results, phase3_results)
@@ -1193,7 +1467,9 @@ class PipelineReporter:
             model_stats=model_stats,
             cve_stats=cve_stats,
             sast_summary=sast_summary,
-            chart_paths=chart_paths
+            chart_paths=chart_paths,
+            feedback_entries=feedback_entries if feedback_entries else None,
+            feedback_stats=feedback_stats
         )
         
         logger.info(f"Report generation complete: {report_path}")

@@ -65,8 +65,8 @@ llm:
     - "qwen2.5:7b"
   
   # Request settings
-  timeout: 300          # Request timeout in seconds
-  retry_attempts: 3     # Number of retry attempts on failure
+  timeout: 180          # Request timeout in seconds (reduced from 300)
+  retry_attempts: 2     # Number of retry attempts on failure (reduced from 3)
   retry_delay: 5        # Delay between retries in seconds
   
   # Generation parameters
@@ -133,6 +133,50 @@ validation:
     remove_build_dirs: false
     # Keep logs for failed validations
     keep_failure_logs: true
+
+# =============================================================================
+# Iterative Feedback Loop (Self-Healing) Settings
+# =============================================================================
+
+feedback_loop:
+  # Enable/disable the iterative feedback loop
+  enabled: true
+  
+  # Maximum retry attempts for failed patches
+  # If a patch fails validation, it will be regenerated with failure context
+  # up to this many times before being marked as "Unpatchable"
+  max_retries: 3
+  
+  # Timeout for the entire feedback loop process (in seconds)
+  # Should account for: max_retries * (generation_time + validation_time)
+  # Default: 2 hours (7200s) to allow for multiple retries
+  timeout: 7200
+  
+  # Retry triggers - which validation failures trigger a retry
+  retry_on:
+    poc_still_works: true    # PoC exploit still triggers vulnerability
+    sast_failed: true        # SAST found new security issues
+    build_error: false       # Build failed (usually indicates fundamental issue)
+  
+  # Context injection settings
+  context_injection:
+    # Include full PoC output in retry prompt
+    include_poc_output: true
+    # Maximum characters of PoC output to include
+    max_poc_output_length: 1500
+    # Include SAST findings in retry prompt
+    include_sast_findings: true
+    # Maximum number of SAST findings to include per tool
+    max_sast_findings: 5
+  
+  # Output settings
+  output:
+    # Save retry patch artifacts
+    save_retry_artifacts: true
+    # Keep validation history for all attempts
+    keep_validation_history: true
+    # Create success marker file when retry succeeds
+    create_success_marker: true
 
 # =============================================================================
 # CVE-specific file mappings

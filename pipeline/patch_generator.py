@@ -31,9 +31,9 @@ import pandas as pd
 
 # API Configuration
 API_ENDPOINT = "http://10.3.2.171:80/api/chat"
-API_TIMEOUT = 300  # 5 minutes timeout for LLM inference
-MAX_RETRIES = 3
-RETRY_DELAY = 10  # seconds between retries
+API_TIMEOUT = 300  # 10 minutes timeout for LLM inference (glibc code is complex)
+MAX_RETRIES = 3    # Retry attempts for failed API calls
+RETRY_DELAY = 10   # seconds between retries
 
 # Model list to iterate through
 MODELS = [
@@ -74,6 +74,9 @@ def setup_logging() -> logging.Logger:
     logger = logging.getLogger('patch_generator')
     logger.setLevel(logging.DEBUG)
     
+    # Clear existing handlers to prevent duplicates when module is re-imported
+    logger.handlers.clear()
+    
     # File handler for all logs
     file_handler = logging.FileHandler(log_file)
     file_handler.setLevel(logging.DEBUG)
@@ -89,6 +92,8 @@ def setup_logging() -> logging.Logger:
     # Setup syntax error logger (separate file)
     syntax_logger = logging.getLogger('syntax_errors')
     syntax_logger.setLevel(logging.ERROR)
+    # Clear existing handlers to prevent duplicates
+    syntax_logger.handlers.clear()
     syntax_handler = logging.FileHandler(syntax_error_log, mode='a')
     syntax_handler.setFormatter(formatter)
     syntax_logger.addHandler(syntax_handler)
@@ -114,6 +119,22 @@ CRITICAL REQUIREMENTS:
 
 OUTPUT FORMAT:
 Return only valid C code. Start directly with the function definition. Do not wrap in markdown code blocks (```). Do not include any text before or after the function code."""
+
+
+# System prompt for retry/feedback loop with failure context
+FEEDBACK_SYSTEM_PROMPT = """You are an expert C security engineer specializing in vulnerability patching for the GNU C Library (glibc). Your previous patch attempt FAILED validation. You must analyze the failure and generate an improved patch.
+
+CRITICAL REQUIREMENTS:
+1. PRESERVE THE EXACT FUNCTION SIGNATURE - Do not modify the return type, function name, or parameter list under any circumstances.
+2. Return ONLY the patched C function code - no explanations, no markdown formatting, no code fences.
+3. Carefully analyze the FAILURE CONTEXT provided to understand why your previous patch failed.
+4. Address both the original vulnerability AND the issues identified in the failure feedback.
+5. Use defensive programming practices: bounds checking, input validation, and safe memory operations.
+6. Do not add new includes or external dependencies unless absolutely necessary for the fix.
+
+OUTPUT FORMAT:
+Return only valid C code. Start directly with the function definition. Do not wrap in markdown code blocks (```). Do not include any text before or after the function code."""
+
 
 def create_patch_prompt(cve_id: str, function_name: str, vulnerable_code: str, file_context: str) -> str:
     """
@@ -152,9 +173,203 @@ REMEMBER:
 
     return prompt
 
+
+def create_feedback_prompt(
+    cve_id: str, 
+    function_name: str, 
+    vulnerable_code: str, 
+    file_context: str,
+    previous_patch: str,
+    failure_context: Dict[str, Any],
+    attempt_number: int
+) -> str:
+    """
+    Create a prompt for retry patch generation with failure feedback context.
+    
+    Args:
+        cve_id: The CVE identifier
+        function_name: Name of the vulnerable function
+        vulnerable_code: The vulnerable function code
+        file_context: Full file content for context
+        previous_patch: The previous failed patch attempt
+        failure_context: Dictionary containing failure details from Phase 3
+        attempt_number: Current retry attempt number
+    
+    Returns:
+        Formatted user prompt string with failure context
+    """
+    # Truncate file context if too long
+    max_context_len = 3000  # Slightly smaller to accommodate failure context
+    if len(file_context) > max_context_len:
+        file_context = file_context[:max_context_len] + "\n/* ... file truncated for brevity ... */"
+    
+    # Truncate previous patch if too long
+    max_patch_len = 2000
+    if len(previous_patch) > max_patch_len:
+        previous_patch = previous_patch[:max_patch_len] + "\n/* ... patch truncated ... */"
+    
+    # Build failure analysis section
+    failure_analysis = _build_failure_analysis(failure_context)
+    
+    prompt = f"""RETRY ATTEMPT #{attempt_number} for VULNERABILITY: {cve_id}
+FUNCTION NAME: {function_name}
+
+═══════════════════════════════════════════════════════════════════
+PREVIOUS PATCH ATTEMPT (FAILED):
+═══════════════════════════════════════════════════════════════════
+{previous_patch}
+
+═══════════════════════════════════════════════════════════════════
+FAILURE ANALYSIS:
+═══════════════════════════════════════════════════════════════════
+{failure_analysis}
+
+═══════════════════════════════════════════════════════════════════
+ORIGINAL VULNERABLE CODE:
+═══════════════════════════════════════════════════════════════════
+{vulnerable_code}
+
+═══════════════════════════════════════════════════════════════════
+FILE CONTEXT (for understanding types and dependencies):
+═══════════════════════════════════════════════════════════════════
+{file_context}
+
+═══════════════════════════════════════════════════════════════════
+TASK: Generate an IMPROVED patch that:
+1. Fixes the original {cve_id} vulnerability
+2. Addresses the specific failures identified above
+3. Maintains the EXACT same function signature
+
+CRITICAL: Learn from the failure. If PoC still works, your previous fix was insufficient.
+If SAST found issues, you may have introduced new vulnerabilities.
+
+REMEMBER:
+- Keep the EXACT same function signature
+- Return ONLY the C code for the function
+- No markdown, no explanations, no code fences
+- Start directly with the function definition"""
+
+    return prompt
+
+
+def _build_failure_analysis(failure_context: Dict[str, Any]) -> str:
+    """
+    Build a human-readable failure analysis from the failure context.
+    
+    Args:
+        failure_context: Dictionary containing failure details
+    
+    Returns:
+        Formatted failure analysis string
+    """
+    lines = []
+    
+    # Validation status
+    status = failure_context.get("status", "Unknown")
+    lines.append(f"Validation Status: {status}")
+    
+    # PoC (Dynamic Check) Results
+    if failure_context.get("poc_blocked") is False:
+        lines.append("\n[DYNAMIC CHECK FAILED - PoC Still Works]")
+        lines.append("The exploit STILL TRIGGERS the vulnerability. Your patch is INSUFFICIENT.")
+        
+        poc_exit_code = failure_context.get("poc_exit_code")
+        if poc_exit_code is not None:
+            lines.append(f"  Exit Code: {poc_exit_code}")
+            if poc_exit_code == 139:
+                lines.append("  (SIGSEGV - Segmentation fault detected)")
+            elif poc_exit_code == 134:
+                lines.append("  (SIGABRT - Abort signal detected)")
+        
+        poc_output = failure_context.get("poc_output", "")
+        if poc_output:
+            # Truncate and clean PoC output
+            poc_output = poc_output[:1500].strip()
+            lines.append(f"\n  PoC Output (truncated):\n  {'-'*40}")
+            for line in poc_output.split('\n')[:30]:
+                lines.append(f"  {line}")
+            lines.append(f"  {'-'*40}")
+    elif failure_context.get("poc_blocked") is True:
+        lines.append("\n[DYNAMIC CHECK PASSED - PoC Blocked]")
+    
+    # SAST (Static Check) Results
+    sast_results = failure_context.get("sast_results", [])
+    sast_passed = failure_context.get("sast_passed", True)
+    
+    if not sast_passed and sast_results:
+        lines.append("\n[STATIC CHECK FAILED - SAST Found Issues]")
+        lines.append("Your patch INTRODUCED new security vulnerabilities:")
+        
+        for sast in sast_results:
+            tool = sast.get("tool", "Unknown")
+            critical = sast.get("critical_count", 0)
+            high = sast.get("high_count", 0)
+            medium = sast.get("medium_count", 0)
+            
+            if critical > 0 or high > 0:
+                lines.append(f"\n  {tool}:")
+                lines.append(f"    Critical: {critical}, High: {high}, Medium: {medium}")
+                
+                # Include findings details if available
+                findings = sast.get("findings", [])
+                for finding in findings[:5]:  # Limit to 5 findings per tool
+                    severity = finding.get("severity", "unknown")
+                    message = finding.get("message", "")
+                    line_num = finding.get("line")
+                    if line_num:
+                        lines.append(f"    Line {line_num} [{severity}]: {message[:100]}")
+                    else:
+                        lines.append(f"    [{severity}]: {message[:100]}")
+    elif sast_passed:
+        lines.append("\n[STATIC CHECK PASSED - No New Vulnerabilities]")
+    
+    # Build error (if applicable)
+    if not failure_context.get("build_success", True):
+        lines.append("\n[BUILD FAILED]")
+        error_msg = failure_context.get("error_message", "Unknown build error")
+        lines.append(f"  Error: {error_msg[:500]}")
+    
+    # General error message
+    error_message = failure_context.get("error_message")
+    if error_message and failure_context.get("build_success", True):
+        lines.append(f"\nAdditional Error Info: {error_message[:300]}")
+    
+    return '\n'.join(lines)
+
+
 # =============================================================================
 # API Integration
 # =============================================================================
+
+def check_api_health() -> bool:
+    """
+    Quick health check to verify LLM API is responsive before processing.
+    
+    Returns:
+        True if API is healthy, False otherwise
+    """
+    try:
+        # Simple test with minimal payload
+        test_payload = {
+            "model": MODELS[0],
+            "messages": [{"role": "user", "content": "test"}],
+            "stream": False,
+            "options": {"num_predict": 1}  # Limit response to 1 token for speed
+        }
+        response = requests.post(API_ENDPOINT, json=test_payload, timeout=30)
+        response.raise_for_status()
+        logger.info("✓ API health check passed")
+        return True
+    except requests.exceptions.Timeout:
+        logger.error("✗ API health check failed: Server not responding (timeout)")
+        return False
+    except requests.exceptions.ConnectionError:
+        logger.error(f"✗ API health check failed: Cannot connect to {API_ENDPOINT}")
+        return False
+    except Exception as e:
+        logger.error(f"✗ API health check failed: {e}")
+        return False
+
 
 def call_llm_api(model: str, user_prompt: str, system_prompt: str = SYSTEM_PROMPT) -> Tuple[Optional[str], Dict[str, Any]]:
     """
@@ -208,6 +423,7 @@ def call_llm_api(model: str, user_prompt: str, system_prompt: str = SYSTEM_PROMP
             metadata["timestamp_end"] = datetime.now().isoformat()
             metadata["success"] = True
             metadata["retries"] = attempt
+            metadata["prompt_tokens"] = result.get('prompt_eval_count', None)
             metadata["response_tokens"] = result.get('eval_count', None)
             metadata["total_duration"] = result.get('total_duration', None)
             
@@ -1038,6 +1254,184 @@ def process_single_vulnerability(
     result["syntax_valid"] = is_valid
     result["output_path"] = str(output_path)
     
+    # Include token usage and runtime metadata
+    result["prompt_tokens"] = metadata.get("prompt_tokens")
+    result["response_tokens"] = metadata.get("response_tokens")
+    result["total_duration_ns"] = metadata.get("total_duration")
+    result["timestamp_start"] = metadata.get("timestamp_start")
+    result["timestamp_end"] = metadata.get("timestamp_end")
+    
+    return result
+
+
+def generate_patch_with_feedback(
+    cve_id: str,
+    function_name: str,
+    vulnerable_code: str,
+    file_context: str,
+    original_filepath: str,
+    model: str,
+    previous_patch: str,
+    failure_context: Dict[str, Any],
+    attempt_number: int,
+    output_dir: Optional[Path] = None
+) -> Dict[str, Any]:
+    """
+    Generate a new patch using failure feedback from Phase 3 validation.
+    
+    This function is called by the iterative feedback loop when a patch fails
+    validation. It provides the LLM with context about why the previous
+    patch failed to guide generation of an improved patch.
+    
+    Args:
+        cve_id: The CVE identifier
+        function_name: Name of the vulnerable function
+        vulnerable_code: The vulnerable function code
+        file_context: Full file content for context
+        original_filepath: Original file path from CSV
+        model: Model name to use
+        previous_patch: The previous failed patch attempt
+        failure_context: Dictionary containing failure details from Phase 3
+        attempt_number: Current retry attempt number (1-based)
+        output_dir: Optional custom output directory
+    
+    Returns:
+        Dictionary with processing results including:
+        - success: Whether patch generation succeeded
+        - syntax_valid: Whether the patch has valid syntax
+        - output_path: Path to saved artifacts
+        - patched_function: The generated patch code
+        - full_patched_file: Complete file with patch integrated
+        - attempt_number: The attempt number
+    """
+    logger.info(f"[FEEDBACK LOOP] Generating retry patch #{attempt_number} for {cve_id} with {model}")
+    
+    result = {
+        "cve_id": cve_id,
+        "function_name": function_name,
+        "model": model,
+        "attempt_number": attempt_number,
+        "success": False,
+        "is_retry": True
+    }
+    
+    # Create feedback-enhanced prompt
+    prompt = create_feedback_prompt(
+        cve_id=cve_id,
+        function_name=function_name,
+        vulnerable_code=vulnerable_code,
+        file_context=file_context,
+        previous_patch=previous_patch,
+        failure_context=failure_context,
+        attempt_number=attempt_number
+    )
+    
+    # Call LLM API with feedback system prompt
+    raw_response, metadata = call_llm_api(model, prompt, system_prompt=FEEDBACK_SYSTEM_PROMPT)
+    
+    # Add retry metadata
+    metadata["is_retry"] = True
+    metadata["attempt_number"] = attempt_number
+    metadata["failure_context_summary"] = {
+        "status": failure_context.get("status"),
+        "poc_blocked": failure_context.get("poc_blocked"),
+        "sast_passed": failure_context.get("sast_passed"),
+        "build_success": failure_context.get("build_success")
+    }
+    
+    if raw_response is None:
+        logger.error(f"Failed to get retry response for {cve_id} with {model}")
+        result["error"] = metadata.get("error", "Unknown error")
+        return result
+    
+    # Extract and clean code
+    patched_function = extract_code_from_response(raw_response, function_name)
+    patched_function = clean_code(patched_function)
+    
+    if not patched_function:
+        logger.warning(f"Could not extract code from retry response for {cve_id} with {model}")
+        patched_function = raw_response
+    
+    # Replace the vulnerable function in the full file content
+    full_patched_file, function_replaced = replace_function_in_file(
+        file_context, function_name, patched_function
+    )
+    
+    if not function_replaced:
+        logger.warning(f"Could not replace function in file for retry {cve_id} with {model}")
+        full_patched_file = patched_function
+    else:
+        logger.info(f"✓ Function replaced in full file for retry {cve_id} with {model}")
+    
+    # Validate syntax
+    is_valid, validation_error = validate_syntax(
+        full_patched_file, function_name, patched_function
+    )
+    
+    if is_valid:
+        logger.info(f"✓ Syntax valid for retry #{attempt_number} of {cve_id} with {model}")
+    else:
+        logger.warning(f"✗ Syntax invalid for retry #{attempt_number}: {validation_error[:100]}...")
+    
+    # Determine output directory (with retry suffix)
+    if output_dir is None:
+        output_dir = OUTPUT_DIR
+    
+    model_safe = sanitize_model_name(model)
+    retry_output_path = output_dir / cve_id / f"{model_safe}_retry{attempt_number}"
+    retry_output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Save artifacts with retry-specific naming
+    original_filename = Path(original_filepath).name
+    base_name = Path(original_filename).stem
+    
+    patch_filename = original_filename if is_valid else f"{base_name}_invalid.c"
+    
+    # Save the full patched file
+    patch_file = retry_output_path / patch_filename
+    with open(patch_file, 'w') as f:
+        f.write(full_patched_file)
+    
+    # Save function only
+    function_file = retry_output_path / f"{base_name}_function_only.c"
+    with open(function_file, 'w') as f:
+        f.write(patched_function)
+    
+    # Save raw response
+    raw_file = retry_output_path / "raw_response.txt"
+    with open(raw_file, 'w') as f:
+        f.write(raw_response if raw_response else "")
+    
+    # Update and save metadata
+    metadata["syntax_valid"] = is_valid
+    metadata["validation_error"] = validation_error if not is_valid else None
+    metadata["output_file"] = str(patch_file)
+    metadata["function_file"] = str(function_file)
+    metadata["original_filepath"] = original_filepath
+    metadata["cve_id"] = cve_id
+    metadata["function_replaced"] = function_replaced
+    
+    metadata_file = retry_output_path / "response.json"
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    logger.info(f"Saved retry patch #{attempt_number} artifacts to: {retry_output_path}")
+    
+    result["success"] = True
+    result["syntax_valid"] = is_valid
+    result["output_path"] = str(retry_output_path)
+    result["patched_function"] = patched_function
+    result["full_patched_file"] = full_patched_file
+    result["patch_file"] = str(patch_file)
+    result["validation_error"] = validation_error if not is_valid else None
+    
+    # Include token usage and runtime metadata
+    result["prompt_tokens"] = metadata.get("prompt_tokens")
+    result["response_tokens"] = metadata.get("response_tokens")
+    result["total_duration_ns"] = metadata.get("total_duration")
+    result["timestamp_start"] = metadata.get("timestamp_start")
+    result["timestamp_end"] = metadata.get("timestamp_end")
+    
     return result
 
 def run_pipeline(
@@ -1056,11 +1450,12 @@ def run_pipeline(
     Returns:
         Pipeline execution summary
     """
-    start_time = datetime.now()
+    phase_start_time = datetime.now()
     logger.info("=" * 60)
-    logger.info("AI-SSD Patch Generation Pipeline Started")
+    logger.info("Starting Phase 2: Patch Generation Pipeline")
+    logger.info(f"Phase Start Time: {phase_start_time.isoformat()}")
+    logger.info("=" * 60)
     logger.info(f"Models: {models}")
-    logger.info("=" * 60)
     
     # Load data
     try:
@@ -1074,6 +1469,8 @@ def run_pipeline(
         df = df[df['CVE'].isin(cve_filter)]
         logger.info(f"Filtered to {len(df)} entries for CVEs: {cve_filter}")
     
+    logger.info(f"Total tasks to process: {len(df) * len(models)}")
+    
     # Process each vulnerability with each model
     results = []
     total_tasks = len(df) * len(models)
@@ -1086,35 +1483,127 @@ def run_pipeline(
         
         for idx, row in df.iterrows():
             current_task += 1
-            logger.info(f"\nTask {current_task}/{total_tasks}")
+            task_start = datetime.now()
+            logger.info(f"\nTask {current_task}/{total_tasks} - {row['CVE']} with {model}")
             
             try:
                 result = process_single_vulnerability(row, model)
                 results.append(result)
+                task_duration = (datetime.now() - task_start).total_seconds()
+                logger.info(f"Completed task {current_task}/{total_tasks} in {task_duration:.1f}s")
             except Exception as e:
                 logger.error(f"Unexpected error processing {row['CVE']} with {model}: {e}")
                 results.append({
                     "cve_id": row['CVE'],
                     "model": model,
                     "success": False,
-                    "error": str(e)
+                    "error": str(e),
+                    "timestamp_start": task_start.isoformat(),
+                    "timestamp_end": datetime.now().isoformat()
                 })
             
             # Small delay between API calls to avoid overwhelming the server
             time.sleep(1)
     
     # Generate summary
-    end_time = datetime.now()
-    duration = (end_time - start_time).total_seconds()
+    phase_end_time = datetime.now()
+    phase_duration = (phase_end_time - phase_start_time).total_seconds()
+    
+    # Calculate aggregate statistics per model
+    model_stats = {}
+    for r in results:
+        model = r.get("model")
+        if model not in model_stats:
+            model_stats[model] = {
+                "total_tasks": 0,
+                "successful": 0,
+                "syntax_valid": 0,
+                "total_prompt_tokens": 0,
+                "total_response_tokens": 0,
+                "total_duration_ns": 0,
+                "total_runtime_seconds": 0.0
+            }
+        model_stats[model]["total_tasks"] += 1
+        if r.get("success"):
+            model_stats[model]["successful"] += 1
+        if r.get("syntax_valid"):
+            model_stats[model]["syntax_valid"] += 1
+        if r.get("prompt_tokens"):
+            model_stats[model]["total_prompt_tokens"] += r.get("prompt_tokens", 0)
+        if r.get("response_tokens"):
+            model_stats[model]["total_response_tokens"] += r.get("response_tokens", 0)
+        if r.get("total_duration_ns"):
+            model_stats[model]["total_duration_ns"] += r.get("total_duration_ns", 0)
+            model_stats[model]["total_runtime_seconds"] += r.get("total_duration_ns", 0) / 1e9
+    
+    # Calculate aggregate statistics per CVE
+    cve_stats = {}
+    for r in results:
+        cve_id = r.get("cve_id")
+        if cve_id not in cve_stats:
+            cve_stats[cve_id] = {
+                "total_tasks": 0,
+                "successful": 0,
+                "syntax_valid": 0,
+                "total_prompt_tokens": 0,
+                "total_response_tokens": 0,
+                "total_duration_ns": 0,
+                "total_runtime_seconds": 0.0
+            }
+        cve_stats[cve_id]["total_tasks"] += 1
+        if r.get("success"):
+            cve_stats[cve_id]["successful"] += 1
+        if r.get("syntax_valid"):
+            cve_stats[cve_id]["syntax_valid"] += 1
+        if r.get("prompt_tokens"):
+            cve_stats[cve_id]["total_prompt_tokens"] += r.get("prompt_tokens", 0)
+        if r.get("response_tokens"):
+            cve_stats[cve_id]["total_response_tokens"] += r.get("response_tokens", 0)
+        if r.get("total_duration_ns"):
+            cve_stats[cve_id]["total_duration_ns"] += r.get("total_duration_ns", 0)
+            cve_stats[cve_id]["total_runtime_seconds"] += r.get("total_duration_ns", 0) / 1e9
+    
+    # Calculate totals
+    total_prompt_tokens = sum(r.get("prompt_tokens", 0) or 0 for r in results)
+    total_response_tokens = sum(r.get("response_tokens", 0) or 0 for r in results)
+    total_llm_duration_ns = sum(r.get("total_duration_ns", 0) or 0 for r in results)
+    total_llm_runtime_seconds = total_llm_duration_ns / 1e9 if total_llm_duration_ns else 0.0
+    
+    # Count different outcomes for better analysis
+    api_success = sum(1 for r in results if r.get("success"))
+    syntax_valid = sum(1 for r in results if r.get("syntax_valid"))
+    api_failures = sum(1 for r in results if not r.get("success"))
+    syntax_invalid = sum(1 for r in results if r.get("success") and not r.get("syntax_valid"))
     
     summary = {
-        "start_time": start_time.isoformat(),
-        "end_time": end_time.isoformat(),
-        "duration_seconds": duration,
-        "total_tasks": total_tasks,
-        "successful": sum(1 for r in results if r.get("success")),
-        "syntax_valid": sum(1 for r in results if r.get("syntax_valid")),
-        "failed": sum(1 for r in results if not r.get("success")),
+        "metadata": {
+            "generated_at": datetime.now().isoformat(),
+            "phase": "Phase 2 - Patch Generation",
+        },
+        "phase_timing": {
+            "start_time": phase_start_time.isoformat(),
+            "end_time": phase_end_time.isoformat(),
+            "total_duration_seconds": phase_duration,
+        },
+        "summary": {
+            "total_tasks": total_tasks,
+            "successful": api_success,
+            "syntax_valid": syntax_valid,
+            "failed": api_failures,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_response_tokens": total_response_tokens,
+            "total_llm_runtime_seconds": total_llm_runtime_seconds,
+        },
+        "outcome_breakdown": {
+            "api_success_count": api_success,
+            "api_failure_count": api_failures,
+            "syntax_valid_count": syntax_valid,
+            "syntax_invalid_count": syntax_invalid,
+            "success_rate": f"{(api_success/total_tasks*100):.1f}%" if total_tasks > 0 else "N/A",
+            "syntax_valid_rate": f"{(syntax_valid/total_tasks*100):.1f}%" if total_tasks > 0 else "N/A",
+        },
+        "model_statistics": model_stats,
+        "cve_statistics": cve_stats,
         "results": results
     }
     
@@ -1126,15 +1615,20 @@ def run_pipeline(
     
     # Print final summary
     logger.info("\n" + "=" * 60)
-    logger.info("PIPELINE COMPLETE")
+    logger.info("Phase 2 Complete")
     logger.info("=" * 60)
-    logger.info(f"Duration: {duration:.1f} seconds")
+    logger.info(f"Phase End Time: {phase_end_time.isoformat()}")
+    logger.info(f"Phase Duration: {phase_duration:.1f}s ({phase_duration/60:.1f}m)")
     logger.info(f"Total tasks: {total_tasks}")
-    logger.info(f"Successful API calls: {summary['successful']}")
-    logger.info(f"Syntax valid patches: {summary['syntax_valid']}")
-    logger.info(f"Failed: {summary['failed']}")
+    logger.info(f"Successful API calls: {summary['summary']['successful']}")
+    logger.info(f"Syntax valid patches: {summary['summary']['syntax_valid']}")
+    logger.info(f"Failed: {summary['summary']['failed']}")
+    logger.info(f"Total prompt tokens: {total_prompt_tokens}")
+    logger.info(f"Total response tokens: {total_response_tokens}")
+    logger.info(f"Total LLM runtime: {total_llm_runtime_seconds:.1f}s")
     logger.info(f"Output directory: {OUTPUT_DIR}")
     logger.info(f"Summary saved to: {summary_file}")
+    logger.info("=" * 60)
     
     return summary
 
@@ -1232,6 +1726,15 @@ Examples:
             print(f"  - {row['CVE']}: {row['F_NAME']} in {row['FilePath']}")
         
         return
+    
+    # Perform API health check before starting
+    logger.info("Checking LLM API connectivity...")
+    if not check_api_health():
+        logger.error("Cannot proceed without a responsive LLM API. Please check:")
+        logger.error(f"  1. Is the server at {API_ENDPOINT} running?")
+        logger.error(f"  2. Are the models loaded? (qwen2.5-coder, qwen2.5)")
+        logger.error(f"  3. Is there network connectivity?")
+        sys.exit(1)
     
     # Run pipeline
     summary = run_pipeline(

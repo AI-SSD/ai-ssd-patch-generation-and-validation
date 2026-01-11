@@ -48,3 +48,6 @@ pipeline/docker-debug.txt
 pipeline/random.txt
 pipeline/dashboard/.env
 pipeline/dashboard/node_modules/
+pipeline/dashboard/package-lock.json
+pipeline/dashboard/client/node_modules/
+pipeline/dashboard/client/package-lock.json

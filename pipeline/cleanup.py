@@ -40,7 +40,7 @@ CLEANUP_TARGETS = {
             'results',
         ],
         'files': [],
-        'docker_images': ['ai-ssd-cve-*', 'glibc-cve-*'],
+        'docker_images': ['glibc-vuln/', 'ai-ssd-cve-', 'glibc-cve-'],
     },
     'phase2': {
         'description': 'Phase 2: Patch Generation',
@@ -57,7 +57,7 @@ CLEANUP_TARGETS = {
             'validation_results',
         ],
         'files': [],
-        'docker_images': ['validation-*', 'ai-ssd-validation-*'],
+        'docker_images': ['glibc-patch/', 'validation-', 'ai-ssd-validation-'],
     },
     'phase4': {
         'description': 'Phase 4: Automated Reporting',
@@ -296,6 +296,143 @@ class PipelineCleaner:
             print_error(f"Failed to remove Docker image {image_id}: {e}")
             return False
     
+    def prune_docker_system(self) -> bool:
+        """Prune Docker system (dangling images, build cache, etc.)."""
+        if self.dry_run:
+            print_info("Would prune Docker system (dangling images, build cache)")
+            return True
+        
+        print_section("Docker System Prune")
+        try:
+            # Prune dangling images and build cache (but NOT volumes to avoid breaking Docker)
+            result = subprocess.run(
+                ['docker', 'system', 'prune', '-af'],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode == 0:
+                print_success("Docker system pruned successfully")
+                if result.stdout:
+                    # Extract space reclaimed info
+                    for line in result.stdout.split('\n'):
+                        if 'reclaimed' in line.lower():
+                            print_info(line.strip())
+                return True
+            else:
+                print_warning(f"Docker prune returned non-zero: {result.stderr}")
+                return False
+        except Exception as e:
+            print_error(f"Failed to prune Docker system: {e}")
+            return False
+    
+    def deep_docker_reset(self) -> bool:
+        """
+        Perform a deep reset of Docker and containerd.
+        
+        This fixes common Docker issues like:
+        - 'stat /var/lib/docker/tmp: no such file or directory'
+        - 'blob not found' errors in containerd
+        - Corrupted Docker storage
+        
+        WARNING: This will delete ALL Docker images, containers, and volumes!
+        Requires sudo/root privileges.
+        """
+        print_section("Deep Docker/Containerd Reset")
+        
+        if self.dry_run:
+            print_info("Would perform deep Docker/containerd reset:")
+            print_info("  1. Stop docker, docker.socket, and containerd services")
+            print_info("  2. Remove /var/lib/docker")
+            print_info("  3. Remove /var/lib/containerd")
+            print_info("  4. Restart containerd service")
+            print_info("  5. Restart docker service")
+            return True
+        
+        # Check if running as root
+        if os.geteuid() != 0:
+            print_error("Deep Docker reset requires root privileges. Run with sudo.")
+            return False
+        
+        try:
+            # Step 1: Stop services
+            print_info("Stopping Docker and containerd services...")
+            services_to_stop = ['docker', 'docker.socket', 'containerd']
+            for service in services_to_stop:
+                result = subprocess.run(
+                    ['systemctl', 'stop', service],
+                    capture_output=True, text=True, timeout=60
+                )
+                if result.returncode == 0:
+                    print_success(f"Stopped {service}")
+                else:
+                    # Service might not exist or already stopped
+                    print_warning(f"Could not stop {service}: {result.stderr.strip()}")
+            
+            # Step 2: Remove Docker storage
+            print_info("Removing Docker storage (/var/lib/docker)...")
+            docker_path = Path('/var/lib/docker')
+            if docker_path.exists():
+                shutil.rmtree(docker_path)
+                print_success("Removed /var/lib/docker")
+            else:
+                print_info("/var/lib/docker does not exist")
+            
+            # Step 3: Remove containerd storage
+            print_info("Removing containerd storage (/var/lib/containerd)...")
+            containerd_path = Path('/var/lib/containerd')
+            if containerd_path.exists():
+                shutil.rmtree(containerd_path)
+                print_success("Removed /var/lib/containerd")
+            else:
+                print_info("/var/lib/containerd does not exist")
+            
+            # Step 4: Restart containerd first
+            print_info("Starting containerd service...")
+            result = subprocess.run(
+                ['systemctl', 'start', 'containerd'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0:
+                print_success("Started containerd")
+            else:
+                print_error(f"Failed to start containerd: {result.stderr.strip()}")
+                return False
+            
+            # Step 5: Restart Docker
+            print_info("Starting Docker service...")
+            result = subprocess.run(
+                ['systemctl', 'start', 'docker'],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0:
+                print_success("Started docker")
+            else:
+                print_error(f"Failed to start docker: {result.stderr.strip()}")
+                return False
+            
+            # Verify Docker is working
+            print_info("Verifying Docker is working...")
+            result = subprocess.run(
+                ['docker', 'info'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0:
+                print_success("Docker is running correctly")
+                return True
+            else:
+                print_error(f"Docker verification failed: {result.stderr.strip()}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            print_error("Operation timed out")
+            return False
+        except PermissionError as e:
+            print_error(f"Permission denied: {e}")
+            print_info("Make sure to run with sudo for deep Docker reset")
+            return False
+        except Exception as e:
+            print_error(f"Deep Docker reset failed: {e}")
+            return False
+
     def clean_target(self, target_key: str) -> bool:
         """Clean a specific target category."""
         if target_key not in CLEANUP_TARGETS:
@@ -465,6 +602,13 @@ Examples:
   # Clean everything without confirmation
   python cleanup.py --force
   
+  # Clean everything AND prune Docker system (recommended for full reset)
+  python cleanup.py --force --prune-docker
+  
+  # Deep reset Docker/containerd (fixes 'blob not found' and storage errors)
+  # WARNING: This deletes ALL Docker data and requires sudo!
+  sudo python cleanup.py --force --deep-docker-reset
+  
   # Clean only specific phases
   python cleanup.py --targets phase2 phase3
   
@@ -511,6 +655,18 @@ Examples:
         '--no-docker',
         action='store_true',
         help='Do not remove Docker images'
+    )
+    
+    parser.add_argument(
+        '--prune-docker',
+        action='store_true',
+        help='Also prune Docker system (removes ALL unused images, build cache, volumes)'
+    )
+    
+    parser.add_argument(
+        '--deep-docker-reset',
+        action='store_true',
+        help='Deep reset Docker/containerd (fixes storage corruption). WARNING: Deletes ALL Docker data! Requires sudo.'
     )
     
     parser.add_argument(
@@ -564,6 +720,27 @@ def main():
             print()
         
         success = cleaner.clean_all(targets)
+        
+        # Prune Docker system if requested
+        if args.prune_docker and not args.no_docker:
+            cleaner.prune_docker_system()
+        
+        # Deep Docker reset if requested (fixes storage corruption)
+        if args.deep_docker_reset and not args.no_docker:
+            if not args.force and not args.dry_run:
+                print(f"\n{Colors.RED}{Colors.BOLD}WARNING: Deep Docker reset will:{Colors.RESET}")
+                print(f"{Colors.RED}  • Stop Docker and containerd services{Colors.RESET}")
+                print(f"{Colors.RED}  • Delete ALL Docker images, containers, and volumes{Colors.RESET}")
+                print(f"{Colors.RED}  • Delete ALL containerd data{Colors.RESET}")
+                print(f"{Colors.RED}  • Require re-downloading all base images{Colors.RESET}")
+                response = input(f"\n{Colors.BOLD}Are you sure? [y/N]: {Colors.RESET}").strip().lower()
+                if response != 'y':
+                    print_info("Deep Docker reset cancelled.")
+                else:
+                    cleaner.deep_docker_reset()
+            else:
+                cleaner.deep_docker_reset()
+        
         cleaner.print_summary()
         
         return 0 if success else 1

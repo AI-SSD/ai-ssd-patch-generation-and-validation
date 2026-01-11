@@ -11,6 +11,11 @@ This script executes the complete AI-SSD pipeline sequentially:
 It handles argument passing between phases and ensures outputs from each
 phase are correctly detected by subsequent phases.
 
+NEW: Implements Iterative Feedback Loop (Self-Healing) between Phase 2 and 3
+- If Phase 3 validation fails, extracts failure context
+- Passes failure context back to Phase 2 for improved patch generation
+- Retries up to MAX_RETRIES times before marking as "Unpatchable"
+
 Author: AI-SSD Project
 Date: 2026-01-04
 """
@@ -22,6 +27,7 @@ import logging
 import argparse
 import subprocess
 import time
+import shutil
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
@@ -34,6 +40,10 @@ from enum import Enum
 
 BASE_DIR = Path(__file__).parent.resolve()
 LOG_DIR = BASE_DIR / "logs"
+
+# Iterative Feedback Loop Configuration
+MAX_RETRIES = 3  # Maximum retry attempts for failed patches
+FEEDBACK_LOOP_ENABLED = True  # Enable/disable the feedback loop
 
 # Default models available for patch generation
 DEFAULT_MODELS = [
@@ -63,6 +73,48 @@ class PhaseStatus(Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
 
+
+class PatchStatus(Enum):
+    """Status of a patch in the iterative feedback loop."""
+    PENDING = "pending"
+    VALIDATING = "validating"
+    SUCCESS = "success"
+    RETRYING = "retrying"
+    UNPATCHABLE = "unpatchable"
+    FAILED = "failed"
+
+
+@dataclass
+class FeedbackLoopResult:
+    """Result of the iterative feedback loop for a single patch."""
+    cve_id: str
+    model_name: str
+    final_status: PatchStatus
+    total_attempts: int
+    successful_attempt: Optional[int] = None  # Which attempt succeeded (1-based)
+    final_patch_path: Optional[str] = None
+    validation_history: List[Dict[str, Any]] = field(default_factory=list)
+    failure_reason: Optional[str] = None
+    total_duration_seconds: float = 0.0
+    start_time: Optional[str] = None  # ISO format start time
+    end_time: Optional[str] = None  # ISO format end time
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "cve_id": self.cve_id,
+            "model_name": self.model_name,
+            "final_status": self.final_status.value,
+            "total_attempts": self.total_attempts,
+            "successful_attempt": self.successful_attempt,
+            "final_patch_path": self.final_patch_path,
+            "validation_history": self.validation_history,
+            "failure_reason": self.failure_reason,
+            "total_duration_seconds": self.total_duration_seconds,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+        }
+
+
 @dataclass
 class PhaseResult:
     """Result of a single phase execution."""
@@ -91,6 +143,10 @@ class PipelineConfig:
     dry_run: bool = False
     build_timeout: int = 3600
     run_timeout: int = 300
+    # Feedback Loop Configuration
+    enable_feedback_loop: bool = True
+    max_retries: int = MAX_RETRIES
+    feedback_loop_timeout: int = 7200  # 2 hours for feedback loop process
 
 @dataclass
 class PipelineSummary:
@@ -103,6 +159,12 @@ class PipelineSummary:
     phases_failed: int
     results: List[Dict[str, Any]]
     overall_status: str
+    # Feedback Loop Summary
+    feedback_loop_results: List[Dict[str, Any]] = field(default_factory=list)
+    total_patches_processed: int = 0
+    patches_successful: int = 0
+    patches_unpatchable: int = 0
+    total_retry_attempts: int = 0
 
 # =============================================================================
 # Logging Setup
@@ -365,12 +427,15 @@ class PhaseExecutor:
     
     def _get_timeout(self, phase: int) -> int:
         """Get timeout for a specific phase."""
-        # Phase 1 and 3 involve Docker builds - allow more time
-        if phase in [1, 3]:
-            return self.config.build_timeout * 5
-        # Phase 2 involves LLM API calls
+        # Phase 1 involves Docker builds for reproduction
+        if phase == 1:
+            return self.config.build_timeout  # ~1 hours
+        # Phase 2 involves LLM API calls (16 tasks × ~10min each worst case)
         elif phase == 2:
-            return 3600  # 1 hour for patch generation
+            return self.config.build_timeout * 3  # 3 hours for patch generation
+        # Phase 3 involves validation - 1h30 as standard
+        elif phase == 3:
+            return self.config.build_timeout * 2  # 1 hour 30 minutes for validation
         # Phase 4 is reporting - should be quick
         else:
             return 600  # 10 minutes
@@ -418,11 +483,386 @@ class PhaseExecutor:
         return output_files
 
 # =============================================================================
+# Iterative Feedback Loop (Self-Healing Mechanism)
+# =============================================================================
+
+class IterativeFeedbackLoop:
+    """
+    Implements the self-healing mechanism between Phase 2 (Patch Generation)
+    and Phase 3 (Validation).
+    
+    When a patch fails validation:
+    1. Extract detailed failure context (PoC results, SAST findings)
+    2. Pass failure context back to LLM for improved patch generation
+    3. Retry validation with the new patch
+    4. Repeat up to MAX_RETRIES times
+    5. Mark as "Unpatchable" if all retries fail
+    """
+    
+    def __init__(self, config: PipelineConfig):
+        self.config = config
+        self.max_retries = config.max_retries
+        self.timeout = config.feedback_loop_timeout  # Total timeout for feedback loop
+        self.feedback_results: List[FeedbackLoopResult] = []
+        
+        # Import required modules
+        self._import_modules()
+        
+        # Initialize logger
+        self.logger = logging.getLogger('pipeline.feedback_loop')
+    
+    def _import_modules(self):
+        """Import Phase 2 and Phase 3 modules dynamically."""
+        import importlib.util
+        
+        # Import patch_generator module
+        gen_spec = importlib.util.spec_from_file_location(
+            "patch_generator",
+            self.config.base_dir / "patch_generator.py"
+        )
+        self.patch_generator = importlib.util.module_from_spec(gen_spec)
+        gen_spec.loader.exec_module(self.patch_generator)
+        
+        # Import patch_validator module
+        val_spec = importlib.util.spec_from_file_location(
+            "patch_validator",
+            self.config.base_dir / "patch_validator.py"
+        )
+        self.patch_validator = importlib.util.module_from_spec(val_spec)
+        val_spec.loader.exec_module(self.patch_validator)
+    
+    def run_with_feedback(
+        self,
+        cve_id: str,
+        model_name: str,
+        vuln_data: Dict[str, Any],
+        initial_validation_result: Any
+    ) -> FeedbackLoopResult:
+        """
+        Execute the iterative feedback loop for a single patch.
+        
+        Args:
+            cve_id: CVE identifier
+            model_name: Model that generated the initial patch
+            vuln_data: Vulnerability data from CSV (contains V_FILE, V_FUNCTION, etc.)
+            initial_validation_result: Initial validation result from Phase 3
+        
+        Returns:
+            FeedbackLoopResult with complete history
+        """
+        start_time = datetime.now()
+        
+        result = FeedbackLoopResult(
+            cve_id=cve_id,
+            model_name=model_name,
+            final_status=PatchStatus.PENDING,
+            total_attempts=1,
+            validation_history=[],
+            start_time=start_time.isoformat()
+        )
+        
+        # Store initial validation result with proper timestamps
+        # The initial validation timestamp serves as the end time for attempt 1
+        initial_end_time = initial_validation_result.timestamp
+        initial_duration = initial_validation_result.execution_time_seconds if hasattr(initial_validation_result, 'execution_time_seconds') else 0.0
+        result.validation_history.append({
+            "attempt": 1,
+            "is_retry": False,
+            "status": initial_validation_result.status,
+            "poc_blocked": initial_validation_result.poc_blocked,
+            "sast_passed": initial_validation_result.sast_passed,
+            "error_message": initial_validation_result.error_message,
+            "start_time": start_time.isoformat(),
+            "end_time": initial_end_time,
+            "duration_seconds": initial_duration,
+        })
+        
+        # Check if initial validation passed
+        if initial_validation_result.status == self.patch_validator.ValidationStatus.SUCCESS.value:
+            end_time = datetime.now()
+            result.final_status = PatchStatus.SUCCESS
+            result.successful_attempt = 1
+            result.final_patch_path = initial_validation_result.patch_file
+            result.total_duration_seconds = (end_time - start_time).total_seconds()
+            result.end_time = end_time.isoformat()
+            self.logger.info(f"✓ {cve_id}/{model_name} passed on first attempt")
+            return result
+        
+        # Initial validation failed - enter feedback loop
+        self.logger.info(
+            f"[FEEDBACK LOOP] Starting retry cycle for {cve_id}/{model_name} "
+            f"(max {self.max_retries} retries)"
+        )
+        
+        current_validation = initial_validation_result
+        previous_patch = self._get_patch_content(cve_id, model_name)
+        
+        for retry in range(1, self.max_retries + 1):
+            # Track attempt start time
+            attempt_start_time = datetime.now()
+            
+            # Check timeout before starting retry
+            elapsed = (attempt_start_time - start_time).total_seconds()
+            if elapsed > self.timeout:
+                timeout_end = datetime.now()
+                self.logger.warning(
+                    f"[TIMEOUT] Feedback loop timeout ({self.timeout}s) exceeded for "
+                    f"{cve_id}/{model_name} after {retry - 1} retries"
+                )
+                result.final_status = PatchStatus.UNPATCHABLE
+                result.failure_reason = f"Timeout after {elapsed:.0f}s ({retry - 1} retries)"
+                result.total_duration_seconds = elapsed
+                result.end_time = timeout_end.isoformat()
+                return result
+            
+            result.total_attempts = retry + 1
+            
+            self.logger.info(f"[RETRY {retry}/{self.max_retries}] {cve_id}/{model_name}")
+            
+            # Extract failure context from previous validation
+            failure_context = current_validation.to_failure_context()
+            
+            # Generate new patch with feedback
+            new_patch_result = self._generate_patch_with_feedback(
+                cve_id=cve_id,
+                model_name=model_name,
+                vuln_data=vuln_data,
+                previous_patch=previous_patch,
+                failure_context=failure_context,
+                attempt_number=retry + 1
+            )
+            
+            if not new_patch_result.get("success"):
+                attempt_end_time = datetime.now()
+                attempt_duration = (attempt_end_time - attempt_start_time).total_seconds()
+                self.logger.warning(
+                    f"Failed to generate retry patch #{retry + 1} for {cve_id}/{model_name}"
+                )
+                result.validation_history.append({
+                    "attempt": retry + 1,
+                    "is_retry": True,
+                    "status": "generation_failed",
+                    "error_message": new_patch_result.get("error", "Unknown generation error"),
+                    "start_time": attempt_start_time.isoformat(),
+                    "end_time": attempt_end_time.isoformat(),
+                    "duration_seconds": attempt_duration,
+                })
+                continue
+            
+            # Validate the new patch
+            new_validation = self._validate_retry_patch(
+                cve_id=cve_id,
+                model_name=model_name,
+                patch_file=Path(new_patch_result["patch_file"]),
+                vuln_data=vuln_data,
+                attempt_number=retry + 1
+            )
+            
+            # Calculate attempt duration
+            attempt_end_time = datetime.now()
+            attempt_duration = (attempt_end_time - attempt_start_time).total_seconds()
+            
+            # Store validation result in history with complete timestamps
+            result.validation_history.append({
+                "attempt": retry + 1,
+                "is_retry": True,
+                "status": new_validation.status,
+                "poc_blocked": new_validation.poc_blocked,
+                "sast_passed": new_validation.sast_passed,
+                "error_message": new_validation.error_message,
+                "start_time": attempt_start_time.isoformat(),
+                "end_time": attempt_end_time.isoformat(),
+                "duration_seconds": attempt_duration,
+                "patch_file": new_patch_result.get("patch_file"),
+                "generation_duration_seconds": new_patch_result.get("total_duration_ns", 0) / 1e9 if new_patch_result.get("total_duration_ns") else None,
+                "validation_duration_seconds": new_validation.execution_time_seconds,
+            })
+            
+            # Check if validation passed
+            if new_validation.status == self.patch_validator.ValidationStatus.SUCCESS.value:
+                success_end_time = datetime.now()
+                result.final_status = PatchStatus.SUCCESS
+                result.successful_attempt = retry + 1
+                result.final_patch_path = new_patch_result.get("patch_file")
+                result.total_duration_seconds = (success_end_time - start_time).total_seconds()
+                result.end_time = success_end_time.isoformat()
+                
+                self.logger.info(
+                    f"✓✓ {cve_id}/{model_name} SUCCEEDED on attempt #{retry + 1}"
+                )
+                
+                # Copy successful retry patch to main patches directory
+                self._promote_successful_patch(
+                    cve_id=cve_id,
+                    model_name=model_name,
+                    retry_patch_path=Path(new_patch_result["patch_file"]),
+                    attempt_number=retry + 1
+                )
+                
+                return result
+            
+            # Update for next iteration
+            current_validation = new_validation
+            previous_patch = new_patch_result.get("patched_function", previous_patch)
+            
+            self.logger.warning(
+                f"Retry #{retry} failed for {cve_id}/{model_name}: {new_validation.status}"
+            )
+        
+        # All retries exhausted
+        final_end_time = datetime.now()
+        result.final_status = PatchStatus.UNPATCHABLE
+        result.failure_reason = (
+            f"Failed after {self.max_retries} retry attempts. "
+            f"Last failure: {current_validation.error_message}"
+        )
+        result.total_duration_seconds = (final_end_time - start_time).total_seconds()
+        result.end_time = final_end_time.isoformat()
+        
+        self.logger.error(
+            f"✗✗ {cve_id}/{model_name} marked as UNPATCHABLE after {result.total_attempts} attempts"
+        )
+        
+        return result
+    
+    def _get_patch_content(self, cve_id: str, model_name: str) -> str:
+        """Get the content of the initial patch."""
+        model_safe = model_name.replace(":", "_").replace(".", "_")
+        patches_dir = self.config.base_dir / "patches" / cve_id / model_safe
+        
+        # Find the function-only file
+        for f in patches_dir.glob("*_function_only.c"):
+            with open(f, 'r') as file:
+                return file.read()
+        
+        # Fallback to main patch file
+        for f in patches_dir.glob("*.c"):
+            if "_invalid" not in f.name and "_function_only" not in f.name:
+                with open(f, 'r') as file:
+                    return file.read()
+        
+        return ""
+    
+    def _generate_patch_with_feedback(
+        self,
+        cve_id: str,
+        model_name: str,
+        vuln_data: Dict[str, Any],
+        previous_patch: str,
+        failure_context: Dict[str, Any],
+        attempt_number: int
+    ) -> Dict[str, Any]:
+        """Generate a new patch using failure feedback."""
+        
+        return self.patch_generator.generate_patch_with_feedback(
+            cve_id=cve_id,
+            function_name=vuln_data['F_NAME'],
+            vulnerable_code=vuln_data['V_FUNCTION'],
+            file_context=vuln_data['V_FILE'],
+            original_filepath=vuln_data['FilePath'],
+            model=model_name,
+            previous_patch=previous_patch,
+            failure_context=failure_context,
+            attempt_number=attempt_number,
+            output_dir=self.config.base_dir / "patches"
+        )
+    
+    def _validate_retry_patch(
+        self,
+        cve_id: str,
+        model_name: str,
+        patch_file: Path,
+        vuln_data: Dict[str, Any],
+        attempt_number: int
+    ) -> Any:
+        """Validate a retry patch."""
+        
+        # Create a minimal args namespace for the validator
+        class ValidatorArgs:
+            def __init__(self, config: PipelineConfig):
+                self.base_dir = str(config.base_dir)
+                self.csv_file = str(config.base_dir / "documentation" / "file-function.csv")
+                self.patches_dir = str(config.base_dir / "patches")
+                self.exploits_dir = str(config.base_dir / "exploits")
+                self.build_timeout = config.build_timeout
+                self.run_timeout = config.run_timeout
+                self.cleanup = config.cleanup
+                self.skip_sast = config.skip_sast
+                self.verbose = config.verbose
+                self.cve = cve_id
+        
+        args = ValidatorArgs(self.config)
+        
+        # Create validator pipeline instance
+        validator = self.patch_validator.ValidationPipeline(args)
+        
+        # Get vulnerability info
+        vuln_info = self.patch_validator.VulnerabilityInfo(
+            cve=cve_id,
+            commit_hash=vuln_data.get('V_COMMIT', ''),
+            file_path=vuln_data.get('FilePath', ''),
+            function_name=vuln_data.get('F_NAME', ''),
+            unit_type=vuln_data.get('UNIT_TYPE', '')
+        )
+        
+        # Validate the retry patch
+        return validator.validate_single_patch_file(
+            patch_file=patch_file,
+            cve_id=cve_id,
+            model_name=model_name,
+            vuln_info=vuln_info,
+            attempt_number=attempt_number,
+            is_retry=True
+        )
+    
+    def _promote_successful_patch(
+        self,
+        cve_id: str,
+        model_name: str,
+        retry_patch_path: Path,
+        attempt_number: int
+    ):
+        """
+        Copy successful retry patch to mark it as the final successful patch.
+        Also create a metadata file indicating the successful attempt.
+        """
+        model_safe = model_name.replace(":", "_").replace(".", "_")
+        main_patch_dir = self.config.base_dir / "patches" / cve_id / model_safe
+        
+        # Create success marker file
+        success_marker = main_patch_dir / "feedback_loop_success.json"
+        with open(success_marker, 'w') as f:
+            json.dump({
+                "successful_attempt": attempt_number,
+                "successful_patch": str(retry_patch_path),
+                "timestamp": datetime.now().isoformat()
+            }, f, indent=2)
+        
+        self.logger.info(f"Created success marker at {success_marker}")
+    
+    def get_results_summary(self) -> Dict[str, Any]:
+        """Get summary of all feedback loop results."""
+        total = len(self.feedback_results)
+        successful = sum(1 for r in self.feedback_results if r.final_status == PatchStatus.SUCCESS)
+        unpatchable = sum(1 for r in self.feedback_results if r.final_status == PatchStatus.UNPATCHABLE)
+        total_retries = sum(r.total_attempts - 1 for r in self.feedback_results)
+        
+        return {
+            "total_patches": total,
+            "successful": successful,
+            "unpatchable": unpatchable,
+            "success_rate": f"{(successful/total*100):.1f}%" if total > 0 else "N/A",
+            "total_retry_attempts": total_retries,
+            "results": [r.to_dict() for r in self.feedback_results]
+        }
+
+
+# =============================================================================
 # Pipeline Orchestrator
 # =============================================================================
 
 class MasterPipeline:
-    """Main pipeline orchestrator."""
+    """Main pipeline orchestrator with iterative feedback loop support."""
     
     def __init__(self, config: PipelineConfig):
         self.config = config
@@ -430,9 +870,12 @@ class MasterPipeline:
         self.results: List[PhaseResult] = []
         self.start_time: Optional[datetime] = None
         self.end_time: Optional[datetime] = None
+        # Feedback loop state
+        self.feedback_loop: Optional[IterativeFeedbackLoop] = None
+        self.feedback_results: List[FeedbackLoopResult] = []
     
     def run(self) -> bool:
-        """Run the complete pipeline."""
+        """Run the complete pipeline with iterative feedback loop support."""
         print_banner()
         
         self.start_time = datetime.now()
@@ -440,6 +883,12 @@ class MasterPipeline:
         
         # Log configuration
         self._log_configuration()
+        
+        # Log feedback loop configuration
+        if self.config.enable_feedback_loop:
+            logger.info(f"Feedback Loop: ENABLED (max_retries={self.config.max_retries})")
+        else:
+            logger.info("Feedback Loop: DISABLED")
         
         # Validate prerequisites
         if not self._validate_prerequisites():
@@ -487,6 +936,10 @@ class MasterPipeline:
                     logger.debug(f"STDOUT:\n{result.stdout[:1000]}")
                 if result.stderr:
                     logger.debug(f"STDERR:\n{result.stderr[:1000]}")
+            
+            # Run feedback loop after Phase 3 if enabled and Phase 3 completed
+            if phase == 3 and self.config.enable_feedback_loop:
+                self._run_feedback_loop()
         
         self.end_time = datetime.now()
         
@@ -495,6 +948,10 @@ class MasterPipeline:
         
         # Print results table
         print_summary_table(self.results)
+        
+        # Print feedback loop summary if applicable
+        if self.feedback_results:
+            self._print_feedback_loop_summary()
         
         # Final status
         total_duration = (self.end_time - self.start_time).total_seconds()
@@ -507,6 +964,271 @@ class MasterPipeline:
         
         return success
     
+    def _run_feedback_loop(self):
+        """
+        Execute the iterative feedback loop for failed validations.
+        
+        This method:
+        1. Loads validation results from Phase 3
+        2. Identifies failed patches
+        3. Runs the feedback loop for each failed patch
+        4. Updates results with retry outcomes
+        """
+        feedback_loop_start = datetime.now()
+        
+        logger.info("\n" + "="*70)
+        logger.info("  ITERATIVE FEEDBACK LOOP (Self-Healing)")
+        logger.info(f"  Started at: {feedback_loop_start.isoformat()}")
+        logger.info("="*70)
+        
+        # Load validation results
+        validation_results = self._load_validation_results()
+        if not validation_results:
+            logger.warning("No validation results found for feedback loop")
+            return
+        
+        # Load vulnerability data from CSV
+        vuln_data_map = self._load_vulnerability_data()
+        if not vuln_data_map:
+            logger.error("Failed to load vulnerability data")
+            return
+        
+        # Initialize feedback loop
+        self.feedback_loop = IterativeFeedbackLoop(self.config)
+        
+        # Identify failed patches that need retry
+        failed_patches = [
+            r for r in validation_results 
+            if r.get("status") != "Success"
+        ]
+        
+        logger.info(f"Found {len(failed_patches)} failed patches for retry")
+        
+        for idx, failed in enumerate(failed_patches, 1):
+            cve_id = failed.get("cve_id")
+            model_name = failed.get("model_name")
+            
+            if not cve_id or not model_name:
+                continue
+            
+            vuln_data = vuln_data_map.get(cve_id)
+            if not vuln_data:
+                logger.warning(f"No vulnerability data found for {cve_id}")
+                continue
+            
+            # Create ValidationResult-like object from loaded data
+            class LoadedValidationResult:
+                def __init__(self, data):
+                    self.status = data.get("status", "Unknown")
+                    self.poc_blocked = data.get("poc_blocked", False)
+                    self.sast_passed = data.get("sast_passed", False)
+                    self.poc_exit_code = data.get("poc_exit_code")
+                    self.poc_output = data.get("poc_output", "")
+                    self.build_success = data.get("build_success", False)
+                    self.build_logs = data.get("build_logs")
+                    self.sast_results = data.get("sast_results", [])
+                    self.sast_findings = data.get("sast_findings", [])
+                    self.error_message = data.get("error_message")
+                    self.timestamp = data.get("timestamp", "")
+                    self.patch_file = data.get("patch_file", "")
+                    self.attempt_number = data.get("attempt_number", 1)
+                    self.execution_time_seconds = data.get("execution_time_seconds", 0.0)
+                
+                def to_failure_context(self):
+                    return {
+                        "status": self.status,
+                        "poc_blocked": self.poc_blocked,
+                        "poc_exit_code": self.poc_exit_code,
+                        "poc_output": self.poc_output,
+                        "build_success": self.build_success,
+                        "build_logs": self.build_logs,
+                        "sast_passed": self.sast_passed,
+                        "sast_results": self.sast_results,
+                        "sast_findings": self.sast_findings,
+                        "error_message": self.error_message,
+                        "attempt_number": self.attempt_number,
+                    }
+            
+            initial_result = LoadedValidationResult(failed)
+            
+            logger.info(f"\n[FEEDBACK LOOP] Processing ({idx}/{len(failed_patches)}): {cve_id}/{model_name}")
+            
+            # Run feedback loop for this patch
+            try:
+                feedback_result = self.feedback_loop.run_with_feedback(
+                    cve_id=cve_id,
+                    model_name=model_name,
+                    vuln_data=vuln_data,
+                    initial_validation_result=initial_result
+                )
+                self.feedback_results.append(feedback_result)
+                logger.info(f"[FEEDBACK LOOP] Completed {cve_id}/{model_name}: {feedback_result.final_status.value} "
+                           f"(attempts: {feedback_result.total_attempts}, duration: {feedback_result.total_duration_seconds:.1f}s)")
+            except Exception as e:
+                logger.exception(f"Error in feedback loop for {cve_id}/{model_name}: {e}")
+                # Create failed result with proper timestamps
+                error_time = datetime.now()
+                self.feedback_results.append(FeedbackLoopResult(
+                    cve_id=cve_id,
+                    model_name=model_name,
+                    final_status=PatchStatus.FAILED,
+                    total_attempts=1,
+                    failure_reason=str(e),
+                    start_time=feedback_loop_start.isoformat(),
+                    end_time=error_time.isoformat(),
+                    total_duration_seconds=(error_time - feedback_loop_start).total_seconds()
+                ))
+        
+        feedback_loop_end = datetime.now()
+        feedback_loop_duration = (feedback_loop_end - feedback_loop_start).total_seconds()
+        
+        logger.info(f"\n[FEEDBACK LOOP] Completed all patches in {feedback_loop_duration:.1f}s")
+        
+        # Save feedback loop results with phase timing
+        self._save_feedback_loop_results(feedback_loop_start, feedback_loop_end)
+    
+    def _load_validation_results(self) -> List[Dict[str, Any]]:
+        """Load validation results from Phase 3."""
+        validation_dir = self.config.base_dir / "validation_results"
+        results = []
+        
+        # Find the most recent summary file
+        summary_files = sorted(validation_dir.glob("validation_summary_*.json"), reverse=True)
+        if summary_files:
+            with open(summary_files[0], 'r') as f:
+                data = json.load(f)
+                results = data.get("all_results", [])
+        
+        return results
+    
+    def _load_vulnerability_data(self) -> Dict[str, Dict[str, Any]]:
+        """Load vulnerability data from CSV."""
+        import pandas as pd
+        
+        csv_file = self.config.base_dir / "documentation" / "file-function.csv"
+        if not csv_file.exists():
+            return {}
+        
+        df = pd.read_csv(csv_file, sep=';')
+        
+        vuln_map = {}
+        for _, row in df.iterrows():
+            cve = row.get('CVE', '')
+            if cve:
+                vuln_map[cve] = row.to_dict()
+        
+        return vuln_map
+    
+    def _save_feedback_loop_results(self, phase_start: datetime = None, phase_end: datetime = None):
+        """Save feedback loop results to file with comprehensive timing information."""
+        if not self.feedback_results:
+            return
+        
+        results_dir = self.config.base_dir / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_file = results_dir / f"feedback_loop_results_{timestamp}.json"
+        
+        # Calculate total durations per CVE and per model
+        duration_by_cve = {}
+        duration_by_model = {}
+        for r in self.feedback_results:
+            # By CVE
+            if r.cve_id not in duration_by_cve:
+                duration_by_cve[r.cve_id] = {"total_duration_seconds": 0.0, "patch_count": 0, "successful": 0, "failed": 0}
+            duration_by_cve[r.cve_id]["total_duration_seconds"] += r.total_duration_seconds
+            duration_by_cve[r.cve_id]["patch_count"] += 1
+            if r.final_status == PatchStatus.SUCCESS:
+                duration_by_cve[r.cve_id]["successful"] += 1
+            else:
+                duration_by_cve[r.cve_id]["failed"] += 1
+            
+            # By Model
+            if r.model_name not in duration_by_model:
+                duration_by_model[r.model_name] = {"total_duration_seconds": 0.0, "patch_count": 0, "successful": 0, "failed": 0}
+            duration_by_model[r.model_name]["total_duration_seconds"] += r.total_duration_seconds
+            duration_by_model[r.model_name]["patch_count"] += 1
+            if r.final_status == PatchStatus.SUCCESS:
+                duration_by_model[r.model_name]["successful"] += 1
+            else:
+                duration_by_model[r.model_name]["failed"] += 1
+        
+        # Calculate phase total duration
+        total_feedback_duration = sum(r.total_duration_seconds for r in self.feedback_results)
+        
+        # Calculate success statistics
+        successful = sum(1 for r in self.feedback_results if r.final_status == PatchStatus.SUCCESS)
+        unpatchable = sum(1 for r in self.feedback_results if r.final_status == PatchStatus.UNPATCHABLE)
+        failed = sum(1 for r in self.feedback_results if r.final_status == PatchStatus.FAILED)
+        total_patches = len(self.feedback_results)
+        
+        summary = {
+            "metadata": {
+                "generated_at": datetime.now().isoformat(),
+                "phase": "Feedback Loop (Self-Healing)",
+            },
+            "phase_timing": {
+                "start_time": phase_start.isoformat() if phase_start else None,
+                "end_time": phase_end.isoformat() if phase_end else None,
+                "total_duration_seconds": (phase_end - phase_start).total_seconds() if phase_start and phase_end else total_feedback_duration,
+            },
+            "configuration": {
+                "max_retries": self.config.max_retries,
+                "feedback_loop_timeout": self.config.feedback_loop_timeout,
+            },
+            "summary": {
+                "total_patches_processed": total_patches,
+                "successful": successful,
+                "unpatchable": unpatchable,
+                "failed": failed,
+                "total_retry_attempts": sum(r.total_attempts - 1 for r in self.feedback_results),
+                "total_processing_duration_seconds": total_feedback_duration,
+                "success_rate": f"{(successful/total_patches*100):.1f}%" if total_patches > 0 else "N/A",
+            },
+            "outcome_breakdown": {
+                "successful_first_try": sum(1 for r in self.feedback_results if r.final_status == PatchStatus.SUCCESS and r.successful_attempt == 1),
+                "successful_after_retry": sum(1 for r in self.feedback_results if r.final_status == PatchStatus.SUCCESS and r.successful_attempt and r.successful_attempt > 1),
+                "exhausted_retries": unpatchable,
+                "error_during_retry": failed,
+            },
+            "duration_by_cve": duration_by_cve,
+            "duration_by_model": duration_by_model,
+            "results": [r.to_dict() for r in self.feedback_results]
+        }
+        
+        with open(results_file, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        logger.info(f"Feedback loop results saved to: {results_file}")
+    
+    def _print_feedback_loop_summary(self):
+        """Print feedback loop summary to console."""
+        total = len(self.feedback_results)
+        successful = sum(1 for r in self.feedback_results if r.final_status == PatchStatus.SUCCESS)
+        unpatchable = sum(1 for r in self.feedback_results if r.final_status == PatchStatus.UNPATCHABLE)
+        total_retries = sum(r.total_attempts - 1 for r in self.feedback_results)
+        
+        print("\n" + "="*70)
+        print("  FEEDBACK LOOP SUMMARY")
+        print("="*70)
+        print(f"\n{'Patches Processed:':<30} {total}")
+        print(f"{'Successful (after retry):':<30} {successful}")
+        print(f"{'Unpatchable:':<30} {unpatchable}")
+        print(f"{'Total Retry Attempts:':<30} {total_retries}")
+        
+        if total > 0:
+            print(f"{'Success Rate:':<30} {(successful/total*100):.1f}%")
+        
+        print("\nDetails:")
+        print("-"*70)
+        for r in self.feedback_results:
+            status_icon = "✓" if r.final_status == PatchStatus.SUCCESS else "✗"
+            attempt_info = f"(attempt #{r.successful_attempt})" if r.successful_attempt else f"(after {r.total_attempts} attempts)"
+            print(f"  {status_icon} {r.cve_id}/{r.model_name}: {r.final_status.value} {attempt_info}")
+        
+        print("-"*70)
+    
     def _log_configuration(self):
         """Log pipeline configuration."""
         logger.info("Pipeline Configuration:")
@@ -517,6 +1239,9 @@ class MasterPipeline:
         logger.info(f"  Verbose: {self.config.verbose}")
         logger.info(f"  Cleanup: {self.config.cleanup}")
         logger.info(f"  Skip SAST: {self.config.skip_sast}")
+        logger.info(f"  Feedback Loop: {'Enabled' if self.config.enable_feedback_loop else 'Disabled'}")
+        if self.config.enable_feedback_loop:
+            logger.info(f"  Max Retries: {self.config.max_retries}")
     
     def _validate_prerequisites(self) -> bool:
         """Validate prerequisites before running pipeline."""
@@ -553,8 +1278,64 @@ class MasterPipeline:
                 logger.error(f"Missing CSV file: {csv_file}")
                 return False
         
+        # Pre-flight LLM API health check for Phase 2
+        if 2 in self.config.phases:
+            logger.info("Checking LLM API connectivity...")
+            if not self._check_llm_api_health():
+                logger.error("LLM API is not accessible - Phase 2 cannot run")
+                logger.error("Please verify the API server is running and accessible")
+                return False
+            logger.info("✓ LLM API is accessible")
+        
         logger.info("Prerequisites validated successfully")
         return True
+    
+    def _check_llm_api_health(self) -> bool:
+        """Check if the LLM API is accessible before starting Phase 2."""
+        import requests
+        
+        # Get API endpoint from config or use default
+        api_endpoint = "http://10.3.2.171:80/api/chat"
+        
+        try:
+            # Test with a minimal request
+            test_payload = {
+                "model": "qwen2.5-coder:1.5b",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": False,
+                "options": {"num_predict": 5}  # Minimal response
+            }
+            
+            logger.info(f"Testing connection to {api_endpoint}...")
+            response = requests.post(
+                api_endpoint,
+                json=test_payload,
+                timeout=60  # 60 second timeout for health check
+            )
+            
+            if response.status_code == 200:
+                # Verify we got a valid response
+                data = response.json()
+                if "message" in data or "response" in data:
+                    return True
+                else:
+                    logger.warning(f"API returned unexpected format: {data.keys()}")
+                    return True  # Still accessible, might work
+            else:
+                logger.error(f"API returned status {response.status_code}: {response.text[:200]}")
+                return False
+                
+        except requests.exceptions.Timeout:
+            logger.error(f"LLM API timeout - server at {api_endpoint} not responding")
+            logger.error("Consider checking if the Ollama server is running")
+            return False
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Cannot connect to LLM API at {api_endpoint}")
+            logger.error(f"Connection error: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"LLM API health check failed: {e}")
+            return False
     
     def _check_phase_dependencies(self, phase: int) -> bool:
         """Check if dependencies for a phase are met."""
@@ -578,16 +1359,54 @@ class MasterPipeline:
                 logger.error("No patches directory found - Phase 2 must run first")
                 return False
             
-            # Check for patch files
-            patch_files = list(patches_dir.glob("CVE-*/*/strtod_l.c")) + \
-                         list(patches_dir.glob("CVE-*/*/gconv_trans.c")) + \
-                         list(patches_dir.glob("CVE-*/*/res_send.c"))
+            # Check for VALID patch files (excluding _invalid.c which means API failed)
+            # Valid patches are .c files that are NOT _function_only.c and NOT _invalid.c
+            all_c_files = list(patches_dir.glob("CVE-*/*/*.c"))
+            invalid_files = [f for f in all_c_files if f.name.endswith("_invalid.c")]
+            function_only_files = [f for f in all_c_files if f.name.endswith("_function_only.c")]
+            valid_patch_files = [f for f in all_c_files 
+                                if not f.name.endswith("_function_only.c") 
+                                and not f.name.endswith("_invalid.c")]
             
-            if not patch_files:
-                logger.error("No patch files found - Phase 2 must run first")
+            if not valid_patch_files:
+                logger.error("="*60)
+                logger.error("NO VALID PATCHES FOUND - Phase 3 cannot proceed")
+                logger.error("="*60)
+                
+                # Provide detailed diagnostics
+                if invalid_files:
+                    logger.error(f"Found {len(invalid_files)} INVALID patch files (API failures):")
+                    for f in invalid_files[:5]:  # Show first 5
+                        logger.error(f"  - {f.relative_to(patches_dir)}")
+                    if len(invalid_files) > 5:
+                        logger.error(f"  ... and {len(invalid_files) - 5} more")
+                
+                # Check pipeline_summary.json for more details
+                summary_file = patches_dir / "pipeline_summary.json"
+                if summary_file.exists():
+                    try:
+                        import json
+                        with open(summary_file) as f:
+                            summary = json.load(f)
+                        stats = summary.get("summary", {})
+                        logger.error(f"\nPhase 2 Summary:")
+                        logger.error(f"  Total tasks: {stats.get('total_tasks', 'N/A')}")
+                        logger.error(f"  Successful: {stats.get('successful', 'N/A')}")
+                        logger.error(f"  Failed: {stats.get('failed', 'N/A')}")
+                        logger.error(f"  Syntax valid: {stats.get('syntax_valid', 'N/A')}")
+                    except Exception:
+                        pass
+                
+                logger.error("\nPossible causes:")
+                logger.error("  1. LLM API was not responding (timeout)")
+                logger.error("  2. All generated patches had syntax errors")
+                logger.error("  3. Phase 2 did not complete successfully")
+                logger.error("\nRecommendation: Check logs/patch_generator_*.log for details")
                 return False
             
-            logger.info(f"Found {len(patch_files)} patch files for validation")
+            logger.info(f"Found {len(valid_patch_files)} valid patch files for validation")
+            if invalid_files:
+                logger.warning(f"Also found {len(invalid_files)} invalid patches (will be skipped)")
             return True
         
         elif phase == 4:
@@ -623,9 +1442,23 @@ class MasterPipeline:
         return names.get(phase, f"Phase {phase}")
     
     def _generate_summary(self):
-        """Generate and save pipeline summary."""
+        """Generate and save pipeline summary including feedback loop results."""
         if not self.start_time or not self.end_time:
             return
+        
+        # Calculate feedback loop statistics
+        feedback_loop_stats = []
+        total_patches = 0
+        patches_successful = 0
+        patches_unpatchable = 0
+        total_retries = 0
+        
+        if self.feedback_results:
+            total_patches = len(self.feedback_results)
+            patches_successful = sum(1 for r in self.feedback_results if r.final_status == PatchStatus.SUCCESS)
+            patches_unpatchable = sum(1 for r in self.feedback_results if r.final_status == PatchStatus.UNPATCHABLE)
+            total_retries = sum(r.total_attempts - 1 for r in self.feedback_results)
+            feedback_loop_stats = [r.to_dict() for r in self.feedback_results]
         
         summary = PipelineSummary(
             start_time=self.start_time.isoformat(),
@@ -638,7 +1471,9 @@ class MasterPipeline:
                 'phases': self.config.phases,
                 'verbose': self.config.verbose,
                 'cleanup': self.config.cleanup,
-                'skip_sast': self.config.skip_sast
+                'skip_sast': self.config.skip_sast,
+                'enable_feedback_loop': self.config.enable_feedback_loop,
+                'max_retries': self.config.max_retries
             },
             phases_completed=sum(1 for r in self.results if r.status == PhaseStatus.SUCCESS),
             phases_failed=sum(1 for r in self.results if r.status == PhaseStatus.FAILED),
@@ -656,7 +1491,13 @@ class MasterPipeline:
             overall_status='success' if all(
                 r.status in [PhaseStatus.SUCCESS, PhaseStatus.SKIPPED] 
                 for r in self.results
-            ) else 'failed'
+            ) else 'failed',
+            # Feedback loop results
+            feedback_loop_results=feedback_loop_stats,
+            total_patches_processed=total_patches,
+            patches_successful=patches_successful,
+            patches_unpatchable=patches_unpatchable,
+            total_retry_attempts=total_retries
         )
         
         # Save summary
@@ -675,11 +1516,11 @@ class MasterPipeline:
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="AI-SSD Master Pipeline Orchestrator",
+        description="AI-SSD Master Pipeline Orchestrator with Iterative Feedback Loop",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Run complete pipeline
+  # Run complete pipeline with feedback loop
   python pipeline.py
   
   # Run for specific CVE
@@ -690,6 +1531,12 @@ Examples:
   
   # Run only phases 2-4 (skip reproduction)
   python pipeline.py --phases 2 3 4
+  
+  # Disable feedback loop (no retries)
+  python pipeline.py --no-feedback-loop
+  
+  # Custom max retries for feedback loop
+  python pipeline.py --max-retries 5
   
   # Run with cleanup and verbose output
   python pipeline.py --cleanup --verbose
@@ -770,6 +1617,20 @@ Examples:
         help='Enable verbose output'
     )
     
+    # Feedback Loop Arguments
+    parser.add_argument(
+        '--no-feedback-loop',
+        action='store_true',
+        help='Disable the iterative feedback loop (no retries for failed patches)'
+    )
+    
+    parser.add_argument(
+        '--max-retries',
+        type=int,
+        default=MAX_RETRIES,
+        help=f'Maximum retry attempts for failed patches in feedback loop (default: {MAX_RETRIES})'
+    )
+    
     return parser.parse_args()
 
 
@@ -781,7 +1642,7 @@ def main():
     global logger
     logger = setup_logging(args.verbose)
     
-    # Build configuration
+    # Build configuration with feedback loop settings
     config = PipelineConfig(
         base_dir=Path(args.base_dir),
         cves=args.cves,
@@ -792,7 +1653,9 @@ def main():
         skip_sast=args.skip_sast,
         dry_run=args.dry_run,
         build_timeout=args.build_timeout,
-        run_timeout=args.run_timeout
+        run_timeout=args.run_timeout,
+        enable_feedback_loop=not args.no_feedback_loop,
+        max_retries=args.max_retries
     )
     
     # Handle dry run
@@ -811,6 +1674,9 @@ def main():
         print(f"  Skip SAST: {config.skip_sast}")
         print(f"  Cleanup: {config.cleanup}")
         print(f"  Verbose: {config.verbose}")
+        print(f"  Feedback Loop: {'Enabled' if config.enable_feedback_loop else 'Disabled'}")
+        if config.enable_feedback_loop:
+            print(f"  Max Retries: {config.max_retries}")
         
         print("\nPhases that would be executed:")
         for phase in config.phases:
@@ -818,6 +1684,12 @@ def main():
             script_path = config.base_dir / script
             exists = "✅" if script_path.exists() else "❌"
             print(f"  Phase {phase}: {script} {exists}")
+        
+        if config.enable_feedback_loop:
+            print("\nFeedback Loop Flow:")
+            print("  Phase 3 (Validation) → Failed? → Extract Failure Context")
+            print("  → Phase 2 (Regenerate with Context) → Phase 3 (Re-validate)")
+            print(f"  → Repeat up to {config.max_retries}x → Success or 'Unpatchable'")
         
         return 0
     

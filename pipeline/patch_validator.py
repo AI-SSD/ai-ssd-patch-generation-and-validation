@@ -92,6 +92,7 @@ class ValidationStatus(Enum):
     SUCCESS = "Success"                          # Patch validated successfully
     POC_STILL_WORKS = "PoC Still Works"          # Vulnerability not fixed
     BUILD_ERROR = "Build Error"                  # Failed to build patched glibc
+    EXECUTION_ERROR = "Execution Error"          # PoC execution environment failed
     SAST_FAILED = "SAST Failed"                  # SAST found new vulnerabilities
     POC_NOT_FOUND = "PoC Not Found"              # No exploit found for CVE
     PATCH_NOT_FOUND = "Patch Not Found"          # No patch file found
@@ -190,6 +191,11 @@ class ValidationResult:
     execution_time_seconds: float = 0
     timestamp: str = ""
     patch_file: str = ""
+    # New fields for feedback loop support
+    sast_findings: List[Dict[str, Any]] = field(default_factory=list)  # Detailed SAST findings
+    build_logs: Optional[str] = None  # Build error logs for feedback
+    attempt_number: int = 1  # Track which attempt this is
+    is_retry: bool = False  # Whether this was a retry validation
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
@@ -201,12 +207,36 @@ class ValidationResult:
             "build_success": self.build_success,
             "sast_passed": self.sast_passed,
             "sast_results": self.sast_results,
+            "sast_findings": self.sast_findings,
             "poc_exit_code": self.poc_exit_code,
             "poc_output": self.poc_output[:2000] if self.poc_output else None,  # Truncate long outputs
             "error_message": self.error_message,
             "execution_time_seconds": self.execution_time_seconds,
             "timestamp": self.timestamp,
             "patch_file": self.patch_file,
+            "build_logs": self.build_logs[:2000] if self.build_logs else None,
+            "attempt_number": self.attempt_number,
+            "is_retry": self.is_retry,
+        }
+    
+    def to_failure_context(self) -> Dict[str, Any]:
+        """
+        Convert validation result to failure context for feedback loop.
+        
+        This provides the necessary context for Phase 2 to generate an improved patch.
+        """
+        return {
+            "status": self.status,
+            "poc_blocked": self.poc_blocked,
+            "poc_exit_code": self.poc_exit_code,
+            "poc_output": self.poc_output,
+            "build_success": self.build_success,
+            "build_logs": self.build_logs,
+            "sast_passed": self.sast_passed,
+            "sast_results": self.sast_results,
+            "sast_findings": self.sast_findings,
+            "error_message": self.error_message,
+            "attempt_number": self.attempt_number,
         }
 
 
@@ -244,6 +274,8 @@ def setup_logging(log_dir: Path, verbose: bool = False) -> logging.Logger:
     # Configure logger
     logger = logging.getLogger('validator')
     logger.setLevel(logging.DEBUG)
+    # Clear existing handlers to prevent duplicates when module is re-imported
+    logger.handlers.clear()
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     
@@ -480,13 +512,26 @@ COPY poc_exploit.c /poc/exploit.c
 RUN cp /build/patched_source.c /sast_results/patched_source.c
 
 # Compile the PoC against PATCHED glibc
+# Try multiple compilation strategies, but ensure we have a working binary
 WORKDIR /poc
-RUN gcc -o exploit exploit.c \\
-    -Wl,-rpath,/opt/glibc-patched/lib \\
-    -Wl,--dynamic-linker=/opt/glibc-patched/lib/ld-linux-x86-64.so.2 \\
-    -L/opt/glibc-patched/lib \\
-    -ldl -lpthread \\
-    2>&1 || gcc -o exploit exploit.c -ldl -lpthread 2>&1 || gcc -o exploit exploit.c 2>&1
+RUN DYNAMIC_LINKER=$(find /opt/glibc-patched/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
+    echo "Found dynamic linker: $DYNAMIC_LINKER" && \\
+    (if [ -n "$DYNAMIC_LINKER" ]; then \\
+        gcc -o exploit exploit.c \\
+        -Wl,-rpath,/opt/glibc-patched/lib \\
+        -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
+        -L/opt/glibc-patched/lib \\
+        -ldl -lpthread \\
+        2>&1 && echo "Compiled with patched glibc"; \\
+    else \\
+        false; \\
+    fi) || \\
+    (gcc -o exploit exploit.c -ldl -lpthread 2>&1 && echo "Compiled with system glibc + libs") || \\
+    (gcc -o exploit exploit.c 2>&1 && echo "Compiled with minimal flags") || \\
+    (echo "ERROR: Failed to compile exploit" && exit 1)
+
+# Verify the exploit binary exists and is executable
+RUN test -x /poc/exploit || (echo "ERROR: /poc/exploit not found or not executable" && exit 1)
 
 # Set environment for running with patched glibc
 ENV LD_LIBRARY_PATH=/opt/glibc-patched/lib
@@ -614,7 +659,7 @@ class ValidationDockerManager:
         self,
         patch_info: PatchInfo,
         run_timeout: int = 300
-    ) -> Tuple[bool, int, str]:
+    ) -> Tuple[bool, int, str, Optional[str]]:
         """
         Run the PoC exploit against patched code.
         
@@ -622,6 +667,7 @@ class ValidationDockerManager:
             - poc_blocked: True if the PoC was blocked (vulnerability fixed)
             - exit_code: Container exit code
             - logs: Container output logs
+            - error_message: Optional error message if execution environment failed
         """
         self.logger.info(f"Running PoC for {patch_info.cve_id}/{patch_info.model_name}...")
         
@@ -652,28 +698,29 @@ class ValidationDockerManager:
                 pass
             
             # Interpret results - for a PATCHED system, we expect the PoC to FAIL
-            poc_blocked = self._interpret_poc_result(patch_info, exit_code, logs)
+            poc_blocked, error_message = self._interpret_poc_result(patch_info, exit_code, logs)
             
             self.logger.info(
                 f"PoC result for {patch_info.cve_id}/{patch_info.model_name}: "
                 f"exit_code={exit_code}, poc_blocked={poc_blocked}"
+                + (f", error={error_message}" if error_message else "")
             )
-            return poc_blocked, exit_code, logs
+            return poc_blocked, exit_code, logs, error_message
             
         except ContainerError as e:
             self.logger.warning(f"Container error: {e}")
             # Container errors may indicate the exploit was blocked
-            return True, e.exit_status, str(e)
+            return True, e.exit_status, str(e), None
         except Exception as e:
             self.logger.error(f"Failed to run PoC: {e}")
-            return False, -1, str(e)
+            return False, -1, str(e), f"Exception during PoC execution: {e}"
     
     def _interpret_poc_result(
         self,
         patch_info: PatchInfo,
         exit_code: int,
         logs: str
-    ) -> bool:
+    ) -> Tuple[bool, Optional[str]]:
         """
         Interpret PoC results to determine if the vulnerability was fixed.
         
@@ -681,9 +728,30 @@ class ValidationDockerManager:
         - If the PoC crashes/fails differently than the vulnerability behavior = FIXED
         - If the PoC shows "safe" behavior = FIXED
         - If the PoC still shows vulnerability indicators = NOT FIXED
+        
+        Returns:
+            Tuple of (poc_blocked, error_message)
+            - poc_blocked: True if the PoC was blocked (vulnerability fixed)
+            - error_message: Set if there was an environment/execution error
         """
         cve_id = patch_info.cve_id
         logs_lower = logs.lower()
+        
+        # Check for environment/execution errors first
+        # These indicate the test itself failed, not that the vulnerability was fixed
+        if "no such file or directory" in logs_lower:
+            self.logger.warning(
+                f"PoC execution error for {cve_id}: exploit binary not found. "
+                "This indicates a build environment issue, not vulnerability mitigation."
+            )
+            return False, "PoC exploit binary not found - build/environment error"
+        
+        if "exec format error" in logs_lower:
+            self.logger.warning(
+                f"PoC execution error for {cve_id}: exec format error. "
+                "The exploit binary may be corrupted or for wrong architecture."
+            )
+            return False, "PoC exploit binary format error - build/environment error"
         
         # CVE-specific interpretation
         if cve_id == "CVE-2012-3480":
@@ -698,41 +766,41 @@ class ValidationDockerManager:
             # unless the output indicates proper error handling
             if exit_code != 0:
                 # Non-zero exit might indicate proper error handling
-                return True
+                return True, None
             if "error" in logs_lower or "overflow" in logs_lower:
                 # Error messages indicate the patch caught the issue
-                return True
+                return True, None
             if "0x" in logs and "p" in logs:
                 # Still producing hex float output - might still be vulnerable
                 # But need to check if it's the same behavior
-                return False
-            return True  # Default to assuming patch worked if behavior changed
+                return False, None
+            return True, None  # Default to assuming patch worked if behavior changed
             
         elif cve_id == "CVE-2014-5119":
             # For heap corruption, signs of crash/corruption indicate unfixed
             if "corrupted" in logs_lower or "double-linked" in logs_lower:
-                return False  # Still vulnerable
+                return False, None  # Still vulnerable
             if exit_code in [134, 139]:  # SIGABRT or SIGSEGV
-                return False  # Still crashing = still vulnerable
-            return True  # No corruption signs = likely fixed
+                return False, None  # Still crashing = still vulnerable
+            return True, None  # No corruption signs = likely fixed
             
         elif cve_id == "CVE-2015-7547":
             # For stack buffer overflow in getaddrinfo
             if exit_code == 139:  # SIGSEGV
-                return False  # Still crashing
+                return False, None  # Still crashing
             if "stack smashing" in logs_lower:
-                return False  # Stack protection triggered = still vulnerable
+                return False, None  # Stack protection triggered = still vulnerable
             if exit_code == 0 or exit_code == 1:
                 # Normal exit (with or without error) = likely fixed
-                return True
-            return True
+                return True, None
+            return True, None
         
         # Default interpretation
         # If the program crashes with SIGSEGV/SIGABRT, likely still vulnerable
         if exit_code in [134, 139]:
-            return False
+            return False, None
         
-        return True
+        return True, None
     
     def run_sast(
         self,
@@ -763,6 +831,8 @@ class ValidationDockerManager:
         tool_config: Dict[str, Any]
     ) -> SASTResult:
         """Run a single SAST tool"""
+        import time
+        sast_start_time = time.time()
         self.logger.debug(f"Running {tool_name}...")
         
         result = SASTResult(
@@ -819,13 +889,16 @@ class ValidationDockerManager:
                 else:
                     result.low_count += 1
             
+            sast_duration = time.time() - sast_start_time
             self.logger.debug(
                 f"{tool_name}: {len(result.findings)} findings "
-                f"(C:{result.critical_count} H:{result.high_count} M:{result.medium_count} L:{result.low_count})"
+                f"(C:{result.critical_count} H:{result.high_count} M:{result.medium_count} L:{result.low_count}) "
+                f"in {sast_duration:.2f}s"
             )
             
         except Exception as e:
-            self.logger.warning(f"SAST tool {tool_name} failed: {e}")
+            sast_duration = time.time() - sast_start_time
+            self.logger.warning(f"SAST tool {tool_name} failed after {sast_duration:.2f}s: {e}")
             result.error_message = str(e)
         
         return result
@@ -1040,8 +1113,8 @@ class ValidationReportGenerator:
         with open(result_file, 'w') as f:
             json.dump(result.to_dict(), f, indent=2)
     
-    def generate_summary_report(self) -> Path:
-        """Generate comprehensive summary report"""
+    def generate_summary_report(self, phase_start: datetime = None, phase_end: datetime = None) -> Path:
+        """Generate comprehensive summary report with phase timing information"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         report_path = self.results_dir / f"validation_summary_{timestamp}.json"
         
@@ -1052,19 +1125,38 @@ class ValidationReportGenerator:
         sast_passed = sum(1 for r in self.results if r.sast_passed)
         build_failures = sum(1 for r in self.results if not r.build_success)
         
-        # Group by CVE
+        # Count different failure types for better analysis
+        poc_still_works = sum(1 for r in self.results if r.status == ValidationStatus.POC_STILL_WORKS.value)
+        execution_errors = sum(1 for r in self.results if r.status == ValidationStatus.EXECUTION_ERROR.value)
+        sast_failures = sum(1 for r in self.results if r.status == ValidationStatus.SAST_FAILED.value)
+        invalid_patches = sum(1 for r in self.results if r.status == ValidationStatus.INVALID_PATCH.value)
+        patch_not_found = sum(1 for r in self.results if r.status == ValidationStatus.PATCH_NOT_FOUND.value)
+        unknown_errors = sum(1 for r in self.results if r.status == ValidationStatus.UNKNOWN_ERROR.value)
+        
+        # Calculate total execution time
+        total_execution_time = sum(r.execution_time_seconds for r in self.results)
+        
+        # Group by CVE with timing
         by_cve = {}
+        cve_timings = {}
         for r in self.results:
             if r.cve_id not in by_cve:
                 by_cve[r.cve_id] = []
+                cve_timings[r.cve_id] = {"total_duration_seconds": 0.0, "validation_count": 0}
             by_cve[r.cve_id].append(r.to_dict())
+            cve_timings[r.cve_id]["total_duration_seconds"] += r.execution_time_seconds
+            cve_timings[r.cve_id]["validation_count"] += 1
         
-        # Group by model
+        # Group by model with timing
         by_model = {}
+        model_timings = {}
         for r in self.results:
             if r.model_name not in by_model:
                 by_model[r.model_name] = []
+                model_timings[r.model_name] = {"total_duration_seconds": 0.0, "validation_count": 0}
             by_model[r.model_name].append(r.to_dict())
+            model_timings[r.model_name]["total_duration_seconds"] += r.execution_time_seconds
+            model_timings[r.model_name]["validation_count"] += 1
         
         report_data = {
             "metadata": {
@@ -1072,13 +1164,30 @@ class ValidationReportGenerator:
                 "phase": "Phase 3 - Multi-Layered Validation",
                 "total_validations": total,
             },
+            "phase_timing": {
+                "start_time": phase_start.isoformat() if phase_start else None,
+                "end_time": phase_end.isoformat() if phase_end else None,
+                "total_duration_seconds": (phase_end - phase_start).total_seconds() if phase_start and phase_end else total_execution_time,
+            },
             "summary": {
                 "successful": successful,
                 "poc_blocked": poc_blocked,
                 "sast_passed": sast_passed,
                 "build_failures": build_failures,
                 "success_rate": f"{(successful/total*100):.1f}%" if total > 0 else "N/A",
+                "total_execution_time_seconds": total_execution_time,
             },
+            "failure_breakdown": {
+                "poc_still_works": poc_still_works,
+                "execution_errors": execution_errors,
+                "sast_failures": sast_failures,
+                "invalid_patches": invalid_patches,
+                "patch_not_found": patch_not_found,
+                "unknown_errors": unknown_errors,
+                "total_failures": total - successful,
+            },
+            "timing_by_cve": cve_timings,
+            "timing_by_model": model_timings,
             "by_cve": by_cve,
             "by_model": by_model,
             "all_results": [r.to_dict() for r in self.results]
@@ -1116,8 +1225,21 @@ class ValidationReportGenerator:
                 sast_icon = "✓" if r.sast_passed else "✗"
                 print(f"  {status_icon} {r.model_name:<25} | PoC: {poc_icon} | SAST: {sast_icon} | {r.status}")
         
+        # Count different failure types
+        poc_still_works = sum(1 for r in self.results if r.status == ValidationStatus.POC_STILL_WORKS.value)
+        execution_errors = sum(1 for r in self.results if r.status == ValidationStatus.EXECUTION_ERROR.value)
+        sast_failures = sum(1 for r in self.results if r.status == ValidationStatus.SAST_FAILED.value)
+        
         print("\n" + "-" * 70)
         print(f"Total: {total} | Successful: {successful} | Failed: {total - successful}")
+        if total - successful > 0:
+            print(f"  Failure Breakdown:")
+            if poc_still_works > 0:
+                print(f"    - PoC Still Works: {poc_still_works}")
+            if execution_errors > 0:
+                print(f"    - Execution Errors: {execution_errors}")
+            if sast_failures > 0:
+                print(f"    - SAST Failures: {sast_failures}")
         print(f"Success Rate: {(successful/total*100):.1f}%" if total > 0 else "No results")
         print("=" * 70 + "\n")
 
@@ -1158,8 +1280,11 @@ class ValidationPipeline:
     
     def run(self):
         """Execute the validation pipeline"""
+        phase_start_time = datetime.now()
+        
         self.logger.info("=" * 60)
         self.logger.info("Starting Phase 3: Multi-Layered Validation Pipeline")
+        self.logger.info(f"Phase Start Time: {phase_start_time.isoformat()}")
         self.logger.info("=" * 60)
         self.logger.info(f"Base directory: {self.base_dir}")
         self.logger.info(f"Patches directory: {self.patches_dir}")
@@ -1182,9 +1307,9 @@ class ValidationPipeline:
         self.logger.info(f"Found {len(patches)} patches to validate")
         
         # Process each patch
-        for patch_info in patches:
+        for idx, patch_info in enumerate(patches, 1):
             self.logger.info(f"\n{'='*60}")
-            self.logger.info(f"Validating: {patch_info.cve_id} / {patch_info.model_name}")
+            self.logger.info(f"Validating ({idx}/{len(patches)}): {patch_info.cve_id} / {patch_info.model_name}")
             self.logger.info(f"{'='*60}")
             
             # Get vulnerability info
@@ -1195,22 +1320,44 @@ class ValidationPipeline:
             
             result = self._validate_patch(patch_info, vuln_info)
             self.report_gen.add_result(result)
+            self.logger.info(f"Validation completed for {patch_info.cve_id}/{patch_info.model_name}: "
+                           f"{result.status} (duration: {result.execution_time_seconds:.1f}s)")
         
-        # Generate final report
-        report_path = self.report_gen.generate_summary_report()
+        phase_end_time = datetime.now()
+        phase_duration = (phase_end_time - phase_start_time).total_seconds()
+        
+        # Generate final report with phase timing
+        report_path = self.report_gen.generate_summary_report(phase_start_time, phase_end_time)
         self.report_gen.print_summary()
         
-        self.logger.info(f"Validation complete. Results saved to: {report_path}")
+        self.logger.info("=" * 60)
+        self.logger.info(f"Phase 3 Complete")
+        self.logger.info(f"Phase End Time: {phase_end_time.isoformat()}")
+        self.logger.info(f"Phase Duration: {phase_duration:.1f}s ({phase_duration/60:.1f}m)")
+        self.logger.info(f"Results saved to: {report_path}")
+        self.logger.info("=" * 60)
     
     def _validate_patch(
         self,
         patch_info: PatchInfo,
-        vuln_info: VulnerabilityInfo
+        vuln_info: VulnerabilityInfo,
+        attempt_number: int = 1,
+        is_retry: bool = False
     ) -> ValidationResult:
-        """Validate a single patch"""
+        """Validate a single patch
+        
+        Args:
+            patch_info: Information about the patch to validate
+            vuln_info: Information about the vulnerability
+            attempt_number: Current attempt number (1-based)
+            is_retry: Whether this is a retry validation
+        
+        Returns:
+            ValidationResult with detailed failure information for feedback loop
+        """
         start_time = datetime.now()
         
-        # Initialize result
+        # Initialize result with feedback loop support
         result = ValidationResult(
             cve_id=patch_info.cve_id,
             model_name=patch_info.model_name,
@@ -1219,12 +1366,16 @@ class ValidationPipeline:
             build_success=False,
             sast_passed=False,
             sast_results=[],
+            sast_findings=[],
             poc_exit_code=None,
             poc_output=None,
             error_message=None,
             execution_time_seconds=0,
             timestamp=start_time.isoformat(),
-            patch_file=str(patch_info.patched_file) if patch_info.patched_file else ""
+            patch_file=str(patch_info.patched_file) if patch_info.patched_file else "",
+            build_logs=None,
+            attempt_number=attempt_number,
+            is_retry=is_retry
         )
         
         try:
@@ -1263,6 +1414,8 @@ class ValidationPipeline:
             
             # Step 5: Build Docker image with patched code
             build_success, build_logs = self.docker_mgr.build_image(patch_info, build_context)
+            result.build_logs = build_logs  # Store for feedback loop
+            
             if not build_success:
                 result.status = ValidationStatus.BUILD_ERROR.value
                 result.error_message = "Failed to build Docker image with patched code"
@@ -1271,8 +1424,8 @@ class ValidationPipeline:
             
             result.build_success = True
             
-            # Step 6: Run PoC against patched code
-            poc_blocked, exit_code, poc_logs = self.docker_mgr.run_poc(
+            # Step 6: Run PoC against patched code (Dynamic Check A)
+            poc_blocked, exit_code, poc_logs, poc_error = self.docker_mgr.run_poc(
                 patch_info, self.run_timeout
             )
             
@@ -1280,24 +1433,34 @@ class ValidationPipeline:
             result.poc_exit_code = exit_code
             result.poc_output = poc_logs
             
-            if not poc_blocked:
+            # Check for environment errors (e.g., exploit binary not found)
+            if poc_error:
+                result.status = ValidationStatus.EXECUTION_ERROR.value
+                result.error_message = poc_error
+                result.poc_blocked = False  # Ensure not counted as success
+                self.logger.error(f"✗ PoC execution error for {patch_info.cve_id}/{patch_info.model_name}: {poc_error}")
+                # Continue to collect SAST results for complete feedback
+            elif not poc_blocked:
                 # PoC still works - vulnerability not fixed
                 result.status = ValidationStatus.POC_STILL_WORKS.value
                 result.error_message = "PoC exploit still triggers the vulnerability"
-                return result
+                # Don't return early - continue to collect SAST results for complete feedback
+                self.logger.warning(f"✗ PoC still works for {patch_info.cve_id}/{patch_info.model_name}")
+            else:
+                self.logger.info(f"✓ PoC blocked for {patch_info.cve_id}/{patch_info.model_name}")
             
-            self.logger.info(f"✓ PoC blocked for {patch_info.cve_id}/{patch_info.model_name}")
-            
-            # Step 7: Run SAST tools (if PoC was blocked)
+            # Step 7: Run SAST tools (Static Check B) - ALWAYS run for complete feedback
             if not self.skip_sast:
                 sast_results = self.docker_mgr.run_sast(patch_info, patch_info.patched_file)
                 
-                # Convert SAST results to serializable format
+                # Convert SAST results to serializable format with detailed findings
                 result.sast_results = []
+                result.sast_findings = []
                 total_critical = 0
                 total_high = 0
                 
                 for sast_result in sast_results:
+                    # Summary format
                     result.sast_results.append({
                         "tool": sast_result.tool,
                         "success": sast_result.success,
@@ -1308,6 +1471,19 @@ class ValidationPipeline:
                         "findings_count": len(sast_result.findings),
                         "error": sast_result.error_message,
                     })
+                    
+                    # Detailed findings for feedback loop
+                    for finding in sast_result.findings:
+                        result.sast_findings.append({
+                            "tool": finding.tool,
+                            "severity": finding.severity,
+                            "message": finding.message,
+                            "line": finding.line,
+                            "column": finding.column,
+                            "cwe_id": finding.cwe_id,
+                            "file_path": finding.file_path,
+                        })
+                    
                     total_critical += sast_result.critical_count
                     total_high += sast_result.high_count
                 
@@ -1316,20 +1492,29 @@ class ValidationPipeline:
                 result.sast_passed = (total_critical == 0 and total_high == 0)
                 
                 if not result.sast_passed:
-                    result.status = ValidationStatus.SAST_FAILED.value
-                    result.error_message = f"SAST found {total_critical} critical and {total_high} high severity issues"
-                    return result
-                
-                self.logger.info(f"✓ SAST passed for {patch_info.cve_id}/{patch_info.model_name}")
+                    # Set status but don't return - we've already collected all data
+                    if result.status != ValidationStatus.POC_STILL_WORKS.value:
+                        result.status = ValidationStatus.SAST_FAILED.value
+                        result.error_message = f"SAST found {total_critical} critical and {total_high} high severity issues"
+                    else:
+                        # Both PoC and SAST failed
+                        result.error_message = (
+                            f"PoC still triggers vulnerability AND "
+                            f"SAST found {total_critical} critical, {total_high} high severity issues"
+                        )
+                    self.logger.warning(f"✗ SAST failed for {patch_info.cve_id}/{patch_info.model_name}")
+                else:
+                    self.logger.info(f"✓ SAST passed for {patch_info.cve_id}/{patch_info.model_name}")
             else:
                 result.sast_passed = True  # Skipped
                 result.sast_results = [{"status": "skipped"}]
             
-            # All checks passed!
-            result.status = ValidationStatus.SUCCESS.value
-            self.logger.info(
-                f"✓✓ VALIDATION SUCCESSFUL for {patch_info.cve_id}/{patch_info.model_name}"
-            )
+            # Determine final status (only success if both checks passed)
+            if result.poc_blocked and result.sast_passed:
+                result.status = ValidationStatus.SUCCESS.value
+                self.logger.info(
+                    f"✓✓ VALIDATION SUCCESSFUL for {patch_info.cve_id}/{patch_info.model_name}"
+                )
             
         except Exception as e:
             self.logger.exception(f"Error validating {patch_info.cve_id}/{patch_info.model_name}")
@@ -1347,6 +1532,53 @@ class ValidationPipeline:
             result.execution_time_seconds = (end_time - start_time).total_seconds()
         
         return result
+    
+    def validate_single_patch_file(
+        self,
+        patch_file: Path,
+        cve_id: str,
+        model_name: str,
+        vuln_info: VulnerabilityInfo,
+        attempt_number: int = 1,
+        is_retry: bool = False
+    ) -> ValidationResult:
+        """
+        Validate a single patch file directly (for feedback loop retry).
+        
+        This method is used by the iterative feedback loop to validate
+        newly generated patches without discovering from the patches directory.
+        
+        Args:
+            patch_file: Path to the patch file to validate
+            cve_id: CVE identifier
+            model_name: Model name that generated the patch
+            vuln_info: Vulnerability information
+            attempt_number: Current attempt number (1-based)
+            is_retry: Whether this is a retry validation
+        
+        Returns:
+            ValidationResult with detailed failure context
+        """
+        self.logger.info(f"[FEEDBACK LOOP] Validating retry patch #{attempt_number} for {cve_id}/{model_name}")
+        
+        # Create PatchInfo for the retry patch
+        patch_info = PatchInfo(
+            cve_id=cve_id,
+            model_name=model_name,
+            patch_dir=patch_file.parent,
+            patched_file=patch_file,
+            function_only_file=None,
+            response_json=None,
+            is_valid=True,  # Assume valid since it passed syntax check in generator
+            original_filepath=vuln_info.file_path
+        )
+        
+        return self._validate_patch(
+            patch_info=patch_info,
+            vuln_info=vuln_info,
+            attempt_number=attempt_number,
+            is_retry=is_retry
+        )
 
 
 # =============================================================================
