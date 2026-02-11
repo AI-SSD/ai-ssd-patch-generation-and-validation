@@ -23,6 +23,7 @@ Date: 2026-01-04
 import os
 import sys
 import json
+import csv
 import logging
 import argparse
 import subprocess
@@ -41,9 +42,16 @@ from enum import Enum
 BASE_DIR = Path(__file__).parent.resolve()
 LOG_DIR = BASE_DIR / "logs"
 
+# Increase CSV field size limit to handle large fields (e.g. PoC code)
+csv.field_size_limit(sys.maxsize)
+
 # Iterative Feedback Loop Configuration
 MAX_RETRIES = 3  # Maximum retry attempts for failed patches
 FEEDBACK_LOOP_ENABLED = True  # Enable/disable the feedback loop
+
+# Phase 0 Manual Verification Configuration
+MANUAL_VERIFY_TIMEOUT = 1800  # 30 minutes in seconds
+MANUAL_VERIFY_POLL_INTERVAL = 30  # Poll every 30 seconds
 
 # Default models available for patch generation
 DEFAULT_MODELS = [
@@ -55,6 +63,7 @@ DEFAULT_MODELS = [
 
 # Phase scripts
 PHASE_SCRIPTS = {
+    0: "glibc_cve_aggregator.py",
     1: "orchestrator.py",
     2: "patch_generator.py",
     3: "patch_validator.py",
@@ -136,7 +145,7 @@ class PipelineConfig:
     base_dir: Path
     cves: Optional[List[str]] = None
     models: Optional[List[str]] = None
-    phases: List[int] = field(default_factory=lambda: [1, 2, 3, 4])
+    phases: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4])
     verbose: bool = False
     cleanup: bool = False
     skip_sast: bool = False
@@ -147,6 +156,9 @@ class PipelineConfig:
     enable_feedback_loop: bool = True
     max_retries: int = MAX_RETRIES
     feedback_loop_timeout: int = 7200  # 2 hours for feedback loop process
+    # Phase 0 Manual Verification Configuration
+    manual_verify_timeout: int = MANUAL_VERIFY_TIMEOUT
+    manual_verify_poll_interval: int = MANUAL_VERIFY_POLL_INTERVAL
 
 @dataclass
 class PipelineSummary:
@@ -291,10 +303,12 @@ class PhaseExecutor:
     def __init__(self, config: PipelineConfig):
         self.config = config
         self.python_cmd = sys.executable
+        self.skipped_cves: List[str] = []  # CVEs excluded during manual verification
     
     def execute_phase(self, phase: int) -> PhaseResult:
         """Execute a specific phase."""
         phase_names = {
+            0: "Data Aggregation (Phase 0)",
             1: "Vulnerability Reproduction",
             2: "Patch Generation",
             3: "Patch Validation",
@@ -386,22 +400,31 @@ class PhaseExecutor:
         """Build command for a specific phase."""
         cmd = [self.python_cmd, str(script_path)]
         
-        # Common arguments
-        cmd.extend(['--base-dir', str(self.config.base_dir)])
-        
-        if self.config.verbose:
-            cmd.append('--verbose')
-        
         # Phase-specific arguments
-        if phase == 1:  # Orchestrator
+        if phase == 0:  # glibc_cve_aggregator
+            # Phase 0 aggregator has its own CLI; it does not accept --base-dir / --verbose
+            pass
+        
+        elif phase == 1:  # Orchestrator
+            cmd.extend(['--base-dir', str(self.config.base_dir)])
+            if self.config.verbose:
+                cmd.append('--verbose')
             if self.config.cves:
                 cmd.extend(['--cve', self.config.cves[0]])  # Single CVE for phase 1
             cmd.extend(['--build-timeout', str(self.config.build_timeout)])
             cmd.extend(['--run-timeout', str(self.config.run_timeout)])
             if self.config.cleanup:
                 cmd.append('--cleanup')
+            # Pass excluded CVEs from manual verification
+            if self.skipped_cves:
+                # Deduplicate to be safe
+                unique_skipped = sorted(set(self.skipped_cves))
+                cmd.extend(['--skip-cves', ','.join(unique_skipped)])
         
         elif phase == 2:  # Patch Generator
+            cmd.extend(['--base-dir', str(self.config.base_dir)])
+            if self.config.verbose:
+                cmd.append('--verbose')
             if self.config.cves:
                 cmd.extend(['--cve'] + self.config.cves)
             if self.config.models:
@@ -410,6 +433,9 @@ class PhaseExecutor:
                 cmd.append('--dry-run')
         
         elif phase == 3:  # Patch Validator
+            cmd.extend(['--base-dir', str(self.config.base_dir)])
+            if self.config.verbose:
+                cmd.append('--verbose')
             if self.config.cves:
                 cmd.extend(['--cve', self.config.cves[0]])
             cmd.extend(['--build-timeout', str(self.config.build_timeout)])
@@ -420,15 +446,19 @@ class PhaseExecutor:
                 cmd.append('--cleanup')
         
         elif phase == 4:  # Reporter
-            # Reporter only needs base-dir and verbose, already added
-            pass
+            cmd.extend(['--base-dir', str(self.config.base_dir)])
+            if self.config.verbose:
+                cmd.append('--verbose')
         
         return cmd
     
     def _get_timeout(self, phase: int) -> int:
         """Get timeout for a specific phase."""
+        # Phase 0 involves API calls and git operations
+        if phase == 0:
+            return 7200  # 2 hours for data aggregation
         # Phase 1 involves Docker builds for reproduction
-        if phase == 1:
+        elif phase == 1:
             return self.config.build_timeout  # ~1 hours
         # Phase 2 involves LLM API calls (16 tasks × ~10min each worst case)
         elif phase == 2:
@@ -444,7 +474,15 @@ class PhaseExecutor:
         """Detect output files generated by a phase."""
         output_files = []
         
-        if phase == 1:
+        if phase == 0:
+            csv_file = self.config.base_dir / "glibc_cve_poc_complete.csv"
+            if csv_file.exists():
+                output_files.append(str(csv_file))
+            json_file = self.config.base_dir / "glibc_cve_poc_map_filtered.json"
+            if json_file.exists():
+                output_files.append(str(json_file))
+        
+        elif phase == 1:
             results_file = self.config.base_dir / "results" / "results.json"
             if results_file.exists():
                 output_files.append(str(results_file))
@@ -873,6 +911,8 @@ class MasterPipeline:
         # Feedback loop state
         self.feedback_loop: Optional[IterativeFeedbackLoop] = None
         self.feedback_results: List[FeedbackLoopResult] = []
+        # Phase 0 state: CVEs skipped due to pending manual review
+        self.skipped_cves: set = set()
     
     def run(self) -> bool:
         """Run the complete pipeline with iterative feedback loop support."""
@@ -901,7 +941,7 @@ class MasterPipeline:
             print_phase_header(phase, PHASE_SCRIPTS.get(phase, "Unknown"))
             
             # Check if we should skip due to previous failure
-            if not success and phase > 1:
+            if not success and phase > 0:
                 logger.warning(f"Skipping phase {phase} due to previous failure")
                 self.results.append(PhaseResult(
                     phase=phase,
@@ -937,6 +977,13 @@ class MasterPipeline:
                 if result.stderr:
                     logger.debug(f"STDERR:\n{result.stderr[:1000]}")
             
+            # After Phase 0: wait for manual verification if needed
+            if phase == 0 and result.status == PhaseStatus.SUCCESS:
+                self._wait_for_manual_verification()
+                # Pass excluded CVEs to the executor for subsequent phases
+                self.executor.skipped_cves = sorted(self.skipped_cves)
+                logger.info(f"Excluded CVEs for Phase 1: {self.executor.skipped_cves}")
+            
             # Run feedback loop after Phase 3 if enabled and Phase 3 completed
             if phase == 3 and self.config.enable_feedback_loop:
                 self._run_feedback_loop()
@@ -963,6 +1010,519 @@ class MasterPipeline:
         print(f"{'='*70}\n")
         
         return success
+    
+    def _wait_for_manual_verification(self):
+        """
+        After Phase 0, check glibc_cve_poc_complete.csv for rows needing
+        manual verification. Present an interactive console menu to the user
+        so they can approve all, exclude specific CVEs, or wait.
+        
+        Also checks for marker files in pipeline/manual_supervision/{CVE}.ok
+        """
+        csv_path = self.config.base_dir / "glibc_cve_poc_complete.csv"
+        if not csv_path.exists():
+            logger.warning("Phase 0 CSV output not found, skipping manual verification wait")
+            return
+        
+        # Check for .ok marker files first
+        self._check_marker_files(csv_path)
+        
+        # Initial check for rows needing manual review
+        pending_cves = self._get_pending_manual_cves(csv_path)
+        
+        if not pending_cves:
+            logger.info("No CVEs require manual verification - proceeding immediately")
+            return
+        
+        # Show syntax reports flagged for manual supervision
+        self._generate_missing_reports(csv_path, pending_cves)
+        self._show_syntax_reports(pending_cves)
+        
+        # Interactive loop
+        while True:
+            print(f"\n{'='*70}")
+            print(f"  MANUAL VERIFICATION REQUIRED")
+            print(f"{'='*70}")
+            print(f"\n{len(pending_cves)} CVE(s) require manual verification:\n")
+            for i, cve in enumerate(pending_cves, 1):
+                report_path = self.config.base_dir / "manual_supervision" / f"{cve}_syntax_report.txt"
+                # Check if there is an exploit file in exploits/
+                exploits_dir = self.config.base_dir / "exploits"
+                has_exploit = any(
+                    f.stem == cve for f in exploits_dir.iterdir() if f.is_file()
+                ) if exploits_dir.exists() else False
+                
+                status_tags = []
+                if report_path.exists():
+                    status_tags.append("report available")
+                if not has_exploit:
+                    status_tags.append("no PoC file")
+                tag = f" [{', '.join(status_tags)}]" if status_tags else ""
+                print(f"  {i}. {cve}{tag}")
+            
+            print(f"\nOptions:")
+            print(f"  [A] Approve all and continue")
+            print(f"  [E] Exclude CVE(s) from the pipeline run and continue")
+            print(f"  [V] View syntax report for a CVE")
+            print(f"  [R] Refresh (re-check for .ok marker files)")
+            print(f"  [Q] Quit pipeline")
+            
+            try:
+                choice = input("\nSelect option: ").strip().upper()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                logger.warning("User interrupted manual verification")
+                self.skipped_cves = set(pending_cves)
+                return
+            
+            if choice == 'A':
+                # Approve all pending CVEs
+                self._approve_cves(csv_path, pending_cves)
+                logger.info(f"All {len(pending_cves)} CVE(s) approved")
+                return
+            
+            elif choice == 'E':
+                # Let user pick which CVEs to exclude
+                excluded = self._interactive_exclude(pending_cves)
+                if excluded:
+                    self.skipped_cves.update(excluded)
+                    remaining = [c for c in pending_cves if c not in excluded]
+                    logger.info(f"Excluded {len(excluded)} CVE(s): {', '.join(excluded)}")
+                    if remaining:
+                        # Ask again for the remaining ones
+                        pending_cves = remaining
+                        continue
+                    else:
+                        logger.info("All pending CVEs excluded - proceeding")
+                        return
+                else:
+                    print("No CVEs excluded.")
+                    continue
+            
+            elif choice == 'V':
+                # View a syntax report
+                self._interactive_view_report(pending_cves)
+                continue
+            
+            elif choice == 'R':
+                # Refresh: re-check marker files and CSV
+                self._check_marker_files(csv_path)
+                pending_cves = self._get_pending_manual_cves(csv_path)
+                if not pending_cves:
+                    logger.info("All manual verifications completed")
+                    return
+                print(f"Refreshed - {len(pending_cves)} CVE(s) still pending")
+                continue
+            
+            elif choice == 'Q':
+                logger.warning("User chose to quit pipeline during manual verification")
+                self.skipped_cves = set(pending_cves)
+                return
+            
+            else:
+                print(f"Invalid option '{choice}'. Please try again.")
+                continue
+    
+    def _show_syntax_reports(self, pending_cves: List[str]):
+        """Show available syntax reports for CVEs needing manual review."""
+        supervision_dir = self.config.base_dir / "manual_supervision"
+        if not supervision_dir.exists():
+            return
+        
+        reports = []
+        for cve in pending_cves:
+            report_path = supervision_dir / f"{cve}_syntax_report.txt"
+            if report_path.exists():
+                reports.append((cve, report_path))
+        
+        # Also show reports for CVEs not in the pending list (already in the dir)
+        for report_file in sorted(supervision_dir.glob("*_syntax_report.txt")):
+            cve_id = report_file.name.replace("_syntax_report.txt", "")
+            if cve_id not in [r[0] for r in reports]:
+                reports.append((cve_id, report_file))
+        
+        if reports:
+            print(f"\n{'='*70}")
+            print(f"  SYNTAX REPORTS FLAGGED FOR MANUAL REVIEW")
+            print(f"{'='*70}")
+            for cve_id, path in reports:
+                # Read first few lines to show status
+                try:
+                    with open(path, 'r') as f:
+                        lines = f.readlines()
+                    status_line = next((l.strip() for l in lines if 'Validation Status:' in l), 'Unknown')
+                    print(f"  - {cve_id}: {status_line}")
+                    print(f"    Report: {path}")
+                except Exception:
+                    print(f"  - {cve_id}: {path}")
+            print()
+    
+    def _interactive_exclude(self, pending_cves: List[str]) -> List[str]:
+        """Let the user choose which CVEs to exclude."""
+        print(f"\nSelect CVE(s) to exclude (comma-separated numbers, or 'all'):")
+        for i, cve in enumerate(pending_cves, 1):
+            print(f"  {i}. {cve}")
+        
+        try:
+            selection = input("\nExclude: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return []
+        
+        if not selection:
+            return []
+        
+        if selection.lower() == 'all':
+            return list(pending_cves)
+        
+        excluded = []
+        for part in selection.split(','):
+            part = part.strip()
+            try:
+                idx = int(part) - 1
+                if 0 <= idx < len(pending_cves):
+                    excluded.append(pending_cves[idx])
+                else:
+                    print(f"  Invalid number: {part}")
+            except ValueError:
+                # Maybe they typed the CVE ID directly
+                if part in pending_cves:
+                    excluded.append(part)
+                else:
+                    print(f"  Invalid input: {part}")
+        return excluded
+    
+    def _interactive_view_report(self, pending_cves: List[str]):
+        """Let the user view a syntax report for a specific CVE."""
+        supervision_dir = self.config.base_dir / "manual_supervision"
+        
+        print(f"\nSelect CVE to view syntax report:")
+        for i, cve in enumerate(pending_cves, 1):
+            report_path = supervision_dir / f"{cve}_syntax_report.txt"
+            exists = " [available]" if report_path.exists() else " [no report]"
+            print(f"  {i}. {cve}{exists}")
+        
+        try:
+            selection = input("\nView report for: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        
+        try:
+            idx = int(selection) - 1
+            if 0 <= idx < len(pending_cves):
+                cve = pending_cves[idx]
+            else:
+                print(f"Invalid number: {selection}")
+                return
+        except ValueError:
+            cve = selection if selection in pending_cves else None
+            if not cve:
+                print(f"Invalid input: {selection}")
+                return
+        
+        report_path = supervision_dir / f"{cve}_syntax_report.txt"
+        if report_path.exists():
+            print(f"\n{'─'*70}")
+            print(f"Syntax Report: {cve}")
+            print(f"{'─'*70}")
+            try:
+                print(report_path.read_text())
+            except Exception as e:
+                print(f"Error reading report: {e}")
+            print(f"{'─'*70}")
+        else:
+            print(f"No syntax report found for {cve}")
+    
+    def _approve_cves(self, csv_path: Path, cves: List[str]):
+        """Mark the given CVEs as manually verified in the CSV."""
+        try:
+            rows = []
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames
+                for row in reader:
+                    if row.get('CVE', '').strip() in cves:
+                        row['manual_verified'] = 'done'
+                        row['manual_verified_at'] = datetime.now().isoformat()
+                    rows.append(row)
+            
+            temp_path = csv_path.parent / f".{csv_path.name}.tmp"
+            with open(temp_path, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+                writer.writeheader()
+                writer.writerows(rows)
+            temp_path.replace(csv_path)
+        except Exception as e:
+            logger.error(f"Error approving CVEs in CSV: {e}")
+    
+    def _get_pending_manual_cves(self, csv_path: Path) -> List[str]:
+        """Read CSV and return CVE IDs where manual_review_required=True and manual_verified!=done."""
+        pending = []
+        try:
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    manual_required = str(row.get('manual_review_required', '')).strip().lower()
+                    manual_verified = str(row.get('manual_verified', '')).strip().lower()
+                    cve_id = row.get('CVE', '').strip()
+                    
+                    if manual_required in ('true', '1', 'yes') and manual_verified != 'done':
+                        # If specific CVEs are requested, only track those
+                        if self.config.cves and cve_id not in self.config.cves:
+                            continue
+                        pending.append(cve_id)
+        except Exception as e:
+            logger.error(f"Error reading CSV for manual verification check: {e}")
+        return pending
+    
+    def _get_pending_cve_details(self, csv_path: Path) -> Dict[str, Dict[str, str]]:
+        """Read CSV and return details for CVEs needing manual review."""
+        details = {}
+        try:
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    manual_required = str(row.get('manual_review_required', '')).strip().lower()
+                    manual_verified = str(row.get('manual_verified', '')).strip().lower()
+                    cve_id = row.get('CVE', '').strip()
+                    
+                    if manual_required in ('true', '1', 'yes') and manual_verified != 'done':
+                        if self.config.cves and cve_id not in self.config.cves:
+                            continue
+                        details[cve_id] = {
+                            'poc_path': row.get('poc_path', '').strip(),
+                            'poc_language': row.get('poc_language', '').strip(),
+                            'description': row.get('CVE_Description', '').strip(),
+                            'cwe': row.get('CWE', '').strip(),
+                            'v_file': row.get('V_FILE', '').strip(),
+                            'v_function': row.get('V_FUNCTION', '').strip(),
+                        }
+        except Exception as e:
+            logger.error(f"Error reading CSV for CVE details: {e}")
+        return details
+    
+    def _generate_missing_reports(self, csv_path: Path, pending_cves: List[str]):
+        """
+        Generate syntax/manual-review reports for any pending CVE that
+        does not yet have a report in manual_supervision/.
+        
+        Two cases:
+          - CVE has an exploit file in exploits/ but no report -> run syntax check, generate report
+          - CVE has NO exploit file -> generate a report indicating missing/invalid PoC content
+        """
+        supervision_dir = self.config.base_dir / "manual_supervision"
+        supervision_dir.mkdir(parents=True, exist_ok=True)
+        exploits_dir = self.config.base_dir / "exploits"
+        
+        # Get details for all pending CVEs
+        cve_details = self._get_pending_cve_details(csv_path)
+        
+        generated = 0
+        for cve_id in pending_cves:
+            report_path = supervision_dir / f"{cve_id}_syntax_report.txt"
+            if report_path.exists():
+                continue  # Already has a report
+            
+            details = cve_details.get(cve_id, {})
+            poc_path_str = details.get('poc_path', '')
+            description = details.get('description', 'N/A')
+            cwe = details.get('cwe', 'N/A')
+            v_file = details.get('v_file', 'N/A')
+            v_function = details.get('v_function', 'N/A')
+            poc_language = details.get('poc_language', 'unknown')
+            
+            # Check if exploit file exists
+            exploit_file = None
+            if poc_path_str:
+                candidate = Path(poc_path_str)
+                if candidate.exists():
+                    exploit_file = candidate
+            
+            # Also check exploits/ directory for any file matching this CVE
+            if not exploit_file and exploits_dir.exists():
+                for f in exploits_dir.iterdir():
+                    if f.is_file() and f.stem == cve_id:
+                        exploit_file = f
+                        poc_language = f.suffix.lstrip('.') or 'unknown'
+                        break
+            
+            if exploit_file:
+                # Exploit file exists but no report — generate syntax report
+                self._generate_syntax_report(
+                    cve_id, exploit_file, poc_language, supervision_dir,
+                    description=description, cwe=cwe, v_file=v_file, v_function=v_function
+                )
+            else:
+                # No exploit file — generate missing-PoC report
+                self._generate_missing_poc_report(
+                    cve_id, supervision_dir,
+                    description=description, cwe=cwe, v_file=v_file, v_function=v_function
+                )
+            
+            generated += 1
+        
+        if generated:
+            logger.info(f"Generated {generated} missing report(s) in {supervision_dir}")
+    
+    def _generate_syntax_report(self, cve_id: str, exploit_file: Path, language: str,
+                                 supervision_dir: Path, **kwargs):
+        """Generate a syntax validation report for an existing exploit file."""
+        import shutil as _shutil
+        
+        # Copy exploit to supervision dir if not already there
+        flagged_path = supervision_dir / exploit_file.name
+        if not flagged_path.exists():
+            _shutil.copy2(exploit_file, flagged_path)
+        
+        # Basic syntax checks
+        errors = []
+        warnings = []
+        try:
+            content = exploit_file.read_text(encoding='utf-8')
+            lines = content.splitlines()
+            
+            if not content.strip():
+                errors.append("File is empty")
+            elif len(content.strip()) < 20:
+                warnings.append(f"File is very short ({len(content.strip())} chars)")
+            
+            # Language-specific checks
+            ext = exploit_file.suffix.lower()
+            if ext == '.c':
+                if '#include' not in content and 'int main' not in content:
+                    warnings.append("No #include directives or main() function found")
+            elif ext == '.py':
+                try:
+                    compile(content, exploit_file.name, 'exec')
+                except SyntaxError as se:
+                    errors.append(f"Python syntax error at line {se.lineno}: {se.msg}")
+            elif ext == '.sh':
+                if not lines[0].startswith('#!') if lines else True:
+                    warnings.append("Missing shebang line")
+            elif ext == '.txt':
+                warnings.append("File has .txt extension — may not be directly executable")
+                if any(kw in content.lower() for kw in ['proof of concept', 'advisory', 'description']):
+                    warnings.append("Content appears to be an advisory/description rather than executable code")
+        except Exception as e:
+            errors.append(f"Error reading file: {e}")
+        
+        status = "FAILED - NEEDS MANUAL REVIEW" if errors else "WARNINGS - NEEDS MANUAL REVIEW"
+        
+        report = f"""SYNTAX VALIDATION REPORT
+========================
+CVE ID: {cve_id}
+File: {exploit_file.name}
+Language: {language}
+Validation Status: {status}
+Generated: {datetime.now().isoformat()}
+
+VULNERABILITY CONTEXT:
+---------------------
+Description: {kwargs.get('description', 'N/A')}
+CWE: {kwargs.get('cwe', 'N/A')}
+Vulnerable File: {kwargs.get('v_file', 'N/A')}
+Vulnerable Function: {kwargs.get('v_function', 'N/A')}
+"""
+        if errors:
+            report += "\nERRORS:\n-------\n"
+            for i, err in enumerate(errors, 1):
+                report += f"{i}. {err}\n"
+        
+        if warnings:
+            report += "\nWARNINGS:\n---------\n"
+            for i, warn in enumerate(warnings, 1):
+                report += f"{i}. {warn}\n"
+        
+        report += f"""
+RECOMMENDED ACTIONS:
+-------------------
+1. Review the exploit file for correctness
+2. Fix any syntax errors identified above
+3. Verify the PoC targets the correct vulnerability
+4. Once validated, approve via the pipeline menu or create a .ok marker file
+
+EXPLOIT FILE: {exploit_file}
+FLAGGED COPY: {flagged_path}
+"""
+        
+        report_path = supervision_dir / f"{cve_id}_syntax_report.txt"
+        report_path.write_text(report, encoding='utf-8')
+    
+    def _generate_missing_poc_report(self, cve_id: str, supervision_dir: Path, **kwargs):
+        """Generate a report for a CVE that has no exploit/PoC file."""
+        report = f"""MANUAL REVIEW REPORT
+========================
+CVE ID: {cve_id}
+File: NONE — No valid PoC file was generated
+Validation Status: MISSING POC - NEEDS MANUAL REVIEW
+Generated: {datetime.now().isoformat()}
+
+VULNERABILITY CONTEXT:
+---------------------
+Description: {kwargs.get('description', 'N/A')}
+CWE: {kwargs.get('cwe', 'N/A')}
+Vulnerable File: {kwargs.get('v_file', 'N/A')}
+Vulnerable Function: {kwargs.get('v_function', 'N/A')}
+
+ISSUE:
+------
+The Phase 0 aggregator could not produce a valid PoC/exploit file for this CVE.
+Possible reasons:
+  - The PoC content from ExploitDB or advisories was empty or too short
+  - The content failed basic validity checks (e.g., only text, no code)
+  - The source exploit data did not contain extractable code blocks
+  - An I/O error occurred during file generation
+
+RECOMMENDED ACTIONS:
+-------------------
+1. Search ExploitDB manually for a PoC: https://www.exploit-db.com/search?cve={cve_id}
+2. Check NVD for references: https://nvd.nist.gov/vuln/detail/{cve_id}
+3. Search GitHub for existing exploits or PoCs
+4. If a PoC is found, save it to exploits/{cve_id}.<ext>
+5. Once a valid PoC is in place, approve via the pipeline menu or create a .ok marker file
+6. If no PoC exists, exclude this CVE from the pipeline run
+"""
+        
+        report_path = supervision_dir / f"{cve_id}_syntax_report.txt"
+        report_path.write_text(report, encoding='utf-8')
+    
+    def _check_marker_files(self, csv_path: Path):
+        """Check for .ok marker files in manual_supervision/ and update CSV."""
+        marker_dir = self.config.base_dir / "manual_supervision"
+        if not marker_dir.exists():
+            return
+        
+        updated_cves = []
+        for marker in marker_dir.glob("*.ok"):
+            cve_id = marker.stem  # e.g., CVE-2015-7547.ok -> CVE-2015-7547
+            updated_cves.append(cve_id)
+        
+        if not updated_cves:
+            return
+        
+        # Update CSV to mark these CVEs as verified
+        try:
+            rows = []
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames
+                for row in reader:
+                    if row.get('CVE', '').strip() in updated_cves:
+                        row['manual_verified'] = 'done'
+                        row['manual_verified_at'] = datetime.now().isoformat()
+                        logger.info(f"Marker file found - marking {row['CVE']} as verified")
+                    rows.append(row)
+            
+            # Atomic write back
+            temp_path = csv_path.parent / f".{csv_path.name}.tmp"
+            with open(temp_path, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+                writer.writeheader()
+                writer.writerows(rows)
+            temp_path.replace(csv_path)
+        except Exception as e:
+            logger.error(f"Error updating CSV from marker files: {e}")
     
     def _run_feedback_loop(self):
         """
@@ -1242,6 +1802,8 @@ class MasterPipeline:
         logger.info(f"  Feedback Loop: {'Enabled' if self.config.enable_feedback_loop else 'Disabled'}")
         if self.config.enable_feedback_loop:
             logger.info(f"  Max Retries: {self.config.max_retries}")
+        logger.info(f"  Manual Verify Timeout: {self.config.manual_verify_timeout}s")
+        logger.info(f"  Manual Verify Poll: {self.config.manual_verify_poll_interval}s")
     
     def _validate_prerequisites(self) -> bool:
         """Validate prerequisites before running pipeline."""
@@ -1340,8 +1902,17 @@ class MasterPipeline:
     def _check_phase_dependencies(self, phase: int) -> bool:
         """Check if dependencies for a phase are met."""
         
-        if phase == 1:
-            # Phase 1 has no dependencies
+        if phase == 0:
+            # Phase 0 has no dependencies (it produces data)
+            return True
+        
+        elif phase == 1:
+            # Phase 1 needs Phase 0 CSV output if Phase 0 was run
+            if 0 in self.config.phases:
+                csv_file = self.config.base_dir / "glibc_cve_poc_complete.csv"
+                if not csv_file.exists():
+                    logger.error(f"Phase 0 CSV output not found: {csv_file}")
+                    return False
             return True
         
         elif phase == 2:
@@ -1434,6 +2005,7 @@ class MasterPipeline:
     def _get_phase_name(self, phase: int) -> str:
         """Get human-readable phase name."""
         names = {
+            0: "Data Aggregation",
             1: "Vulnerability Reproduction",
             2: "Patch Generation",
             3: "Patch Validation",
@@ -1574,9 +2146,9 @@ Examples:
         '--phases',
         type=int,
         nargs='+',
-        default=[1, 2, 3, 4],
-        choices=[1, 2, 3, 4],
-        help='Phases to execute (1=Reproduction, 2=Generation, 3=Validation, 4=Reporting)'
+        default=[0, 1, 2, 3, 4],
+        choices=[0, 1, 2, 3, 4],
+        help='Phases to execute (0=Aggregation, 1=Reproduction, 2=Generation, 3=Validation, 4=Reporting)'
     )
     
     parser.add_argument(
@@ -1631,6 +2203,21 @@ Examples:
         help=f'Maximum retry attempts for failed patches in feedback loop (default: {MAX_RETRIES})'
     )
     
+    # Phase 0 Manual Verification Arguments
+    parser.add_argument(
+        '--manual-verify-timeout',
+        type=int,
+        default=MANUAL_VERIFY_TIMEOUT,
+        help=f'Timeout in seconds for manual verification wait (default: {MANUAL_VERIFY_TIMEOUT})'
+    )
+    
+    parser.add_argument(
+        '--manual-verify-poll',
+        type=int,
+        default=MANUAL_VERIFY_POLL_INTERVAL,
+        help=f'Poll interval in seconds for manual verification (default: {MANUAL_VERIFY_POLL_INTERVAL})'
+    )
+    
     return parser.parse_args()
 
 
@@ -1655,7 +2242,9 @@ def main():
         build_timeout=args.build_timeout,
         run_timeout=args.run_timeout,
         enable_feedback_loop=not args.no_feedback_loop,
-        max_retries=args.max_retries
+        max_retries=args.max_retries,
+        manual_verify_timeout=args.manual_verify_timeout,
+        manual_verify_poll_interval=args.manual_verify_poll,
     )
     
     # Handle dry run
@@ -1677,6 +2266,8 @@ def main():
         print(f"  Feedback Loop: {'Enabled' if config.enable_feedback_loop else 'Disabled'}")
         if config.enable_feedback_loop:
             print(f"  Max Retries: {config.max_retries}")
+        print(f"  Manual Verify Timeout: {config.manual_verify_timeout}s")
+        print(f"  Manual Verify Poll: {config.manual_verify_poll_interval}s")
         
         print("\nPhases that would be executed:")
         for phase in config.phases:
@@ -1684,6 +2275,12 @@ def main():
             script_path = config.base_dir / script
             exists = "✅" if script_path.exists() else "❌"
             print(f"  Phase {phase}: {script} {exists}")
+        
+        if 0 in config.phases:
+            print("\nPhase 0 Flow:")
+            print("  glibc_cve_aggregator.py → glibc_cve_poc_complete.csv")
+            print(f"  → Wait up to {config.manual_verify_timeout}s for manual verification")
+            print("  → Proceed to Phase 1 (exclude pending CVEs)")
         
         if config.enable_feedback_loop:
             print("\nFeedback Loop Flow:")

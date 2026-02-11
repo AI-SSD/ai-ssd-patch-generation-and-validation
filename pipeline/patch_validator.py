@@ -18,6 +18,9 @@ import logging
 import argparse
 import subprocess
 import tempfile
+
+# Increase CSV field size limit to handle large PoC content fields
+csv.field_size_limit(sys.maxsize)
 import re
 from datetime import datetime
 from pathlib import Path

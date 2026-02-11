@@ -46,6 +46,11 @@ pipeline/QUICKSTART.md
 pipeline/p.txt
 pipeline/docker-debug.txt
 pipeline/random.txt
+pipeline/glibc_cve_poc_complete.csv
+pipeline/glibc_cve_poc_map_filtered.json
+pipeline/glibc_cve_poc_map.json
+pipeline/image_manifest.json
+pipeline/syntax_validation_report.json
 pipeline/dashboard/.env
 pipeline/dashboard/node_modules/
 pipeline/dashboard/package-lock.json
