@@ -51,6 +51,8 @@ pipeline/glibc_cve_poc_map_filtered.json
 pipeline/glibc_cve_poc_map.json
 pipeline/image_manifest.json
 pipeline/syntax_validation_report.json
+pipeline/exploit-database
+pipeline/glibc
 pipeline/dashboard/.env
 pipeline/dashboard/node_modules/
 pipeline/dashboard/package-lock.json
