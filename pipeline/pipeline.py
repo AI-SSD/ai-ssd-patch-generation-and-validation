@@ -150,7 +150,7 @@ class PipelineConfig:
     cleanup: bool = False
     skip_sast: bool = False
     dry_run: bool = False
-    build_timeout: int = 3600
+    build_timeout: int = 7200
     run_timeout: int = 300
     # Feedback Loop Configuration
     enable_feedback_loop: bool = True
@@ -369,6 +369,17 @@ class PhaseExecutor:
                 result.status = PhaseStatus.SUCCESS
                 result.output_files = self._detect_output_files(phase)
                 logger.info(f"Phase {phase} completed successfully in {format_duration(result.duration_seconds)}")
+                
+                # Check if output files are missing even on success
+                if not result.output_files and phase in [0, 2]:  # Phase 0 and 2 are critical for files
+                    logger.warning(f"Phase {phase} completed but no output files were detected!")
+                    logger.warning(f"STDOUT:\n{process.stdout}")
+                    logger.warning(f"STDERR:\n{process.stderr}")
+
+                if self.config.verbose:
+                    logger.info(f"Phase {phase} Output:\n{process.stdout}")
+                    if process.stderr:
+                        logger.warning(f"Phase {phase} Stderr:\n{process.stderr}")
             else:
                 result.status = PhaseStatus.FAILED
                 result.error_message = f"Exit code {process.returncode}"
@@ -1912,6 +1923,23 @@ RECOMMENDED ACTIONS:
                 csv_file = self.config.base_dir / "glibc_cve_poc_complete.csv"
                 if not csv_file.exists():
                     logger.error(f"Phase 0 CSV output not found: {csv_file}")
+                    logger.error("Phase 0 likely failed to find any PoC exploits.")
+                    logger.error("Ensure the ExploitDB repository is cloned under: %s",
+                                 self.config.base_dir / "exploit-database")
+                    return False
+                # Check if CSV has actual data rows (not just headers)
+                try:
+                    with open(csv_file, 'r') as f:
+                        reader = csv.reader(f)
+                        header = next(reader, None)
+                        first_row = next(reader, None)
+                        if header and not first_row:
+                            logger.error(f"Phase 0 CSV is empty (headers only): {csv_file}")
+                            logger.error("No CVEs with both git commits AND PoC exploits were found.")
+                            logger.error("Check Phase 0 logs for ExploitDB loading issues.")
+                            return False
+                except Exception as e:
+                    logger.error(f"Error reading Phase 0 CSV: {e}")
                     return False
             return True
         
@@ -2154,8 +2182,8 @@ Examples:
     parser.add_argument(
         '--build-timeout',
         type=int,
-        default=3600,
-        help='Docker build timeout in seconds (default: 3600)'
+        default=7200,
+        help='Docker build timeout in seconds (default: 7200)'
     )
     
     parser.add_argument(

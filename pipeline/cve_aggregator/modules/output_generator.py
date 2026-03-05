@@ -1,0 +1,344 @@
+"""
+Output Generation module.
+
+Produces all final artefacts:
+  1. **Global JSON** – full dataset (``cve_poc_map.json``)
+  2. **Filtered JSON** – only CVEs with commits + PoC (``cve_poc_map_filtered.json``)
+  3. **Complete CSV** – tabular view for pipeline consumption
+  4. **PoC files** – individual exploit files saved to disk (``exploits/``)
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import logging
+import shutil
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from ..models import CVEEntry, Dataset
+from ..utils.cwe_lookup import get_cwe_descriptions
+from ..utils.file_utils import (
+    clean_poc_content,
+    detect_language_from_content,
+    get_file_extension_for_language,
+    is_valid_poc_content,
+)
+from ..utils.version_mapping import (
+    extract_project_version_from_cpe,
+    get_ubuntu_version,
+)
+from .base import PipelineModule
+
+logger = logging.getLogger(__name__)
+
+
+class OutputGenerator(PipelineModule):
+    """Pipeline module: *Output Generation*.
+
+    Reads ``context["dataset"]`` (and optionally ``context["syntax_results"]``)
+    and writes all output files.
+    """
+
+    # ----- main entry point -----
+
+    def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        cfg = self.config.get("output", {})
+        dataset: Dataset = context.get("dataset", Dataset())
+
+        # 1. Save global JSON
+        global_path = Path(cfg.get("global_json_path", "cve_poc_map.json"))
+        self._save_json(dataset, global_path, "global")
+
+        # 2. Create & save filtered dataset
+        filtered_path = Path(cfg.get("filtered_json_path", "cve_poc_map_filtered.json"))
+        filtered = self._create_filtered(dataset, cfg)
+        self._save_json(filtered, filtered_path, "filtered")
+
+        # 3. Export CSV + PoC files
+        csv_path = Path(cfg.get("csv_path", "cve_poc_complete.csv"))
+        poc_dir = Path(cfg.get("poc_dir", "exploits"))
+        syntax_results = context.get("syntax_results", {})
+        total, complete, saved = self._export_csv_and_pocs(
+            filtered, csv_path, poc_dir, syntax_results, cfg,
+        )
+
+        # Summary
+        context["output_summary"] = {
+            "global_json": str(global_path),
+            "filtered_json": str(filtered_path),
+            "csv": str(csv_path),
+            "poc_dir": str(poc_dir),
+            "total_processed": total,
+            "complete_entries": complete,
+            "poc_files_saved": saved,
+        }
+        return context
+
+    # ------------------------------------------------------------------
+    # JSON persistence
+    # ------------------------------------------------------------------
+
+    def _save_json(self, dataset: Dataset, path: Path, label: str) -> bool:
+        dataset.compute_statistics()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.parent / f".{path.name}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(dataset.to_dict(), fh, indent=2, ensure_ascii=False)
+            tmp.replace(path)
+            self.logger.info("Saved %s dataset (%d CVEs) → %s",
+                             label, len(dataset.cves), path)
+            return True
+        except IOError as exc:
+            self.logger.error("Failed to save %s dataset: %s", label, exc)
+            return False
+
+    # ------------------------------------------------------------------
+    # Filtered dataset
+    # ------------------------------------------------------------------
+
+    def _create_filtered(self, full: Dataset, cfg: Dict) -> Dataset:
+        """Only keep CVEs that have both commits AND at least one PoC."""
+        project_name = self.config.get("project", {}).get("name", "custom")
+        filtered_cves = {
+            cid: entry for cid, entry in full.cves.items()
+            if entry.has_commits and entry.has_poc
+        }
+        ds = Dataset(
+            dataset_info={
+                "name": f"{project_name}-cve-poc-dataset-filtered",
+                "version": "1.0.0",
+                "purpose": "Filtered Code-Ready dataset (commits + PoC only)",
+                "filter_criteria": "CVEs with both git commits AND at least one PoC",
+                "created_at": full.dataset_info.get("created_at", datetime.now().isoformat()),
+                "last_updated": datetime.now().isoformat(),
+            },
+            cves=filtered_cves,
+        )
+        ds.compute_statistics()
+        self.logger.info("Filtered dataset: %d / %d CVEs", len(filtered_cves), len(full.cves))
+        return ds
+
+    # ------------------------------------------------------------------
+    # CSV export & PoC file writing
+    # ------------------------------------------------------------------
+
+    def _export_csv_and_pocs(
+        self,
+        dataset: Dataset,
+        csv_path: Path,
+        poc_dir: Path,
+        syntax_results: Dict,
+        cfg: Dict,
+    ) -> Tuple[int, int, int]:
+        poc_dir.mkdir(parents=True, exist_ok=True)
+
+        # Column names (customisable via config)
+        default_fields = [
+            "CVE", "V_COMMIT", "FilePath", "F_NAME", "UNIT_TYPE",
+            "V_FILE", "V_FUNCTION",
+            "CVE_Description", "CWE", "CWE_Description",
+            "project_version", "ubuntu_version",
+            "poc_path", "poc_language",
+            "manual_review_required", "manual_verified",
+        ]
+        fieldnames = cfg.get("csv_fields", default_fields)
+
+        rows: List[Dict[str, Any]] = []
+        total = 0
+        poc_saved = 0
+
+        for cve_id, entry in dataset.cves.items():
+            total += 1
+            result = self._build_csv_row(cve_id, entry, poc_dir, syntax_results, cfg)
+            if result is None:
+                continue
+
+            # result is now a list of row dicts (one per changed unit)
+            for row in result:
+                rows.append(row)
+
+            # Count PoC as saved once per CVE (not per row)
+            if result and result[0].get("_poc_saved"):
+                poc_saved += 1
+
+        # Write CSV
+        try:
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = csv_path.parent / f".{csv_path.name}.tmp"
+            with open(tmp, "w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(
+                    fh, fieldnames=fieldnames,
+                    quoting=csv.QUOTE_ALL, extrasaction="ignore",
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            tmp.replace(csv_path)
+            self.logger.info("CSV saved: %d rows → %s", len(rows), csv_path)
+        except IOError as exc:
+            self.logger.error("CSV write failed: %s", exc)
+
+        self.logger.info(
+            "Export: %d processed, %d complete rows, %d PoC files saved",
+            total, len(rows), poc_saved,
+        )
+        return total, len(rows), poc_saved
+
+    # ------------------------------------------------------------------
+    # Single-row builder
+    # ------------------------------------------------------------------
+
+    def _build_csv_row(
+        self,
+        cve_id: str,
+        entry: CVEEntry,
+        poc_dir: Path,
+        syntax_results: Dict,
+        cfg: Dict,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Build one CSV row **per changed code unit** (function / macro).
+
+        Returns a list of row dicts (one per changed unit across all changed
+        files).  If no changed units are detected, falls back to one row per
+        changed source file.  Returns ``None`` when the entry cannot produce
+        any usable row (e.g. no fix commit or no PoC).
+        """
+        ps = entry.project_state
+        meta = entry.metadata
+
+        # Require fix commit
+        if not ps.fix_commit_hash:
+            return None
+
+        # Require at least a PoC
+        if not entry.exploits:
+            return None
+
+        # ---- PoC handling (shared across all rows of this CVE) ----
+        poc_saved = False
+        poc_path_str = ""
+        poc_lang = "unknown"
+        needs_manual = False
+
+        best_exploit = entry.exploits[0]
+        content = best_exploit.source_code_content
+        if content:
+            valid, reason = is_valid_poc_content(content)
+            if valid:
+                poc_lang = best_exploit.language
+                if poc_lang == "unknown":
+                    poc_lang = detect_language_from_content(content)
+
+                content, _ = clean_poc_content(content)
+                ext = get_file_extension_for_language(poc_lang)
+                poc_filename = f"{cve_id}{ext}"
+                poc_path = poc_dir / poc_filename
+                try:
+                    poc_path.write_text(content, encoding="utf-8")
+                    poc_saved = True
+                    poc_path_str = str(poc_path)
+                except IOError as exc:
+                    self.logger.warning("Failed to save PoC for %s: %s", cve_id, exc)
+
+                # Check syntax results
+                key = f"{cve_id}:0"
+                sr = syntax_results.get(key, {})
+                if sr.get("needs_manual_review"):
+                    needs_manual = True
+
+        # ---- Version info (shared) ----
+        project_name = self.config.get("project", {}).get("name", "")
+        project_version = extract_project_version_from_cpe(
+            meta.affected_products, project_name,
+        )
+        ubuntu_version = get_ubuntu_version(
+            project_version.split(",")[-1].strip() if project_version else ""
+        )
+
+        # ---- Build per-unit rows ----
+        rows: List[Dict[str, Any]] = []
+        changed_units_map = ps.changed_code_units or {}
+        vuln_files = ps.vulnerable_files_content or {}
+
+        for fpath, units in changed_units_map.items():
+            vuln_file_content = vuln_files.get(fpath, "")
+            for unit in units:
+                rows.append({
+                    "CVE": cve_id,
+                    "V_COMMIT": ps.vulnerable_commit_hash or "",
+                    "FilePath": fpath,
+                    "F_NAME": unit["name"],
+                    "UNIT_TYPE": unit["unit_type"],
+                    "V_FILE": vuln_file_content,
+                    "V_FUNCTION": unit["vuln_body"],
+                    "CVE_Description": meta.description or "",
+                    "CWE": ",".join(meta.cwe_ids or []),
+                    "CWE_Description": get_cwe_descriptions(meta.cwe_ids),
+                    "project_version": project_version,
+                    "ubuntu_version": ubuntu_version,
+                    "poc_path": poc_path_str,
+                    "poc_language": poc_lang,
+                    "manual_review_required": needs_manual,
+                    "manual_verified": "pending" if needs_manual else "done",
+                    "_poc_saved": poc_saved,
+                })
+
+        # Fallback: if no changed units were found but we still have changed
+        # source files, emit one row per file so the CVE is not silently dropped.
+        if not rows:
+            for cf in (ps.changed_files or []):
+                ftype = cf.get("file_type", "")
+                if ftype not in ("source", "header"):
+                    continue
+                fpath = cf["file_path"]
+                vuln_file_content = vuln_files.get(fpath, "")
+                rows.append({
+                    "CVE": cve_id,
+                    "V_COMMIT": ps.vulnerable_commit_hash or "",
+                    "FilePath": fpath,
+                    "F_NAME": "",
+                    "UNIT_TYPE": "",
+                    "V_FILE": vuln_file_content,
+                    "V_FUNCTION": "",
+                    "CVE_Description": meta.description or "",
+                    "CWE": ",".join(meta.cwe_ids or []),
+                    "CWE_Description": get_cwe_descriptions(meta.cwe_ids),
+                    "project_version": project_version,
+                    "ubuntu_version": ubuntu_version,
+                    "poc_path": poc_path_str,
+                    "poc_language": poc_lang,
+                    "manual_review_required": needs_manual,
+                    "manual_verified": "pending" if needs_manual else "done",
+                    "_poc_saved": poc_saved,
+                })
+
+        # If still nothing (e.g. no source files at all), emit a single
+        # bare row so the CVE appears in the CSV.
+        if not rows:
+            first_file = ""
+            if ps.changed_files:
+                first_file = ps.changed_files[0]["file_path"]
+            rows.append({
+                "CVE": cve_id,
+                "V_COMMIT": ps.vulnerable_commit_hash or "",
+                "FilePath": first_file,
+                "F_NAME": "",
+                "UNIT_TYPE": "",
+                "V_FILE": "",
+                "V_FUNCTION": "",
+                "CVE_Description": meta.description or "",
+                "CWE": ",".join(meta.cwe_ids or []),
+                "CWE_Description": get_cwe_descriptions(meta.cwe_ids),
+                "project_version": project_version,
+                "ubuntu_version": ubuntu_version,
+                "poc_path": poc_path_str,
+                "poc_language": poc_lang,
+                "manual_review_required": needs_manual,
+                "manual_verified": "pending" if needs_manual else "done",
+                "_poc_saved": poc_saved,
+            })
+
+        return rows

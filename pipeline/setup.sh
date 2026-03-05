@@ -360,6 +360,30 @@ setup_project_structure() {
     # Create necessary directories for Phase 4
     mkdir -p "$SCRIPT_DIR/reports"
     
+    # Clone ExploitDB repository if not present (required for Phase 0 PoC matching)
+    if [ ! -d "$SCRIPT_DIR/exploit-database" ]; then
+        log_info "Cloning ExploitDB repository (required for Phase 0)..."
+        git clone --depth=1 https://gitlab.com/exploit-database/exploitdb.git "$SCRIPT_DIR/exploit-database" || {
+            log_warn "ExploitDB clone failed. Phase 0 will attempt to clone it at runtime."
+        }
+    else
+        log_info "ExploitDB repository already present"
+    fi
+    
+    # Clone glibc repository if not present (required for commit discovery)
+    if [ ! -d "$SCRIPT_DIR/glibc" ]; then
+        log_info "Cloning glibc repository (required for commit discovery)..."
+        git clone --depth=1000 https://github.com/bminor/glibc.git "$SCRIPT_DIR/glibc" && {
+            log_info "Fetching full git history for glibc..."
+            cd "$SCRIPT_DIR/glibc" && git fetch --unshallow || true
+            cd "$SCRIPT_DIR"
+        } || {
+            log_warn "glibc clone failed. Phase 0 will attempt to clone it at runtime."
+        }
+    else
+        log_info "glibc repository already present"
+    fi
+    
     log_info "Project structure created at $SCRIPT_DIR"
 }
 

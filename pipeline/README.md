@@ -6,7 +6,7 @@ Automated vulnerability reproduction pipeline for glibc CVEs. The pipeline is co
 
 | Phase | Script | Description |
 |-------|--------|-------------|
-| **0 – Data Aggregation** | `glibc_cve_aggregator.py` | Scrape NVD/CVE.org, cross-reference ExploitDB, extract PoCs. Produces `glibc_cve_poc_complete.csv` for manual review. |
+| **0 – Data Aggregation** | `glibc_cve_aggregator.py` | Scrape NVD/CVE.org, cross-reference ExploitDB, extract PoCs, validate syntax, attempt LLM-based repair of invalid PoCs, and export datasets. Produces `glibc_cve_poc_complete.csv` for manual review. |
 | **1 – Docker Env Build** | `orchestrator.py` | Build Docker images per CVE and execute PoC exploits to reproduce vulnerabilities. |
 | **2 – Patch Generation** | `patch_generator.py` | Generate candidate patches using LLM. |
 | **3 – Patch Validation** | `patch_validator.py` | Apply patches inside Docker and validate via test execution. |

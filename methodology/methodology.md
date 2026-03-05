@@ -4,6 +4,22 @@ The overall methodology is a cyclical, multi-stage process that systematically l
 
 ---
 
+### **Phase 0: CVE Aggregator Pipeline**
+
+Before patch generation begins, this automated pipeline collects, enriches and validates all the vulnerability data needed by subsequent phases.
+
+1. **CVE Fetching & Enrichment (Module 1):** Query the NVD 2.0 API for CVEs matching the target project, parse metadata (CVSS, CWE, CPE, references), de-duplicate, filter by relevance, and optionally enrich with CVE.org data.
+2. **Commit Discovery (Module 2):** Clone or update the source repository, git-grep for fix commits by CVE-ID, identify the vulnerable parent commit, and extract the vulnerable source files and changed functions.
+3. **PoC Mapping & Extraction (Module 3):** Clone the ExploitDB repository, load the CSV mapping, perform a reverse search for additional CVEs, cross-reference with ExploitDB entries, and extract PoC source code content.
+4. **Data Aggregation (Module 4):** Load any existing dataset, transform raw CVEs into the `CVEEntry` model, merge new and existing data (dedup exploits, enrich), and compute coverage statistics.
+5. **Syntax Validation (Module 5):** For each PoC, detect the language and run a syntax check (GCC for C/C++, `py_compile` for Python, `bash -n` for shell). Valid PoCs proceed to output; invalid PoCs are forwarded to Module 6.
+6. **LLM PoC Repair (Module 6):** Receive invalid PoCs with their syntax error context, prompt the LLM (Ollama endpoint) to generate a fix, re-validate the result, and retry if necessary. If the fix still fails after retries, the PoC is flagged for manual supervision.
+7. **Output Generation (Module 7):** Export the final datasets (global JSON, filtered JSON, CSV) and save individual PoC files to the `exploits/` directory.
+
+**Configuration:** All module behaviour is driven by `config.yaml`, which is loaded at pipeline start and passed through the shared context dictionary.
+
+---
+
 ### **Phase 1: Vulnerability Identification and Environment Setup**
 
 This phase mirrors the initial steps of the project's general methodology to establish a foundational test environment.

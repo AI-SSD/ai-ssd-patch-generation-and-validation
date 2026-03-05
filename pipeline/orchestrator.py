@@ -608,7 +608,7 @@ RUN sed -i -re 's/([a-z]{{2}}\\.)?archive\\.ubuntu\\.com|security\\.ubuntu\\.com
 '''
 
     def __init__(self, docker_client, glibc_repo_path: Path, logger: logging.Logger,
-                 build_timeout: int = 3600):
+                 build_timeout: int = 7200):
         self.client = docker_client
         self.glibc_repo_path = glibc_repo_path
         self.logger = logger
@@ -1029,7 +1029,7 @@ CMD ["php", "/poc/exploit.php"]
         'php': CVE_DOCKERFILE_PHP,
     }
 
-    def __init__(self, docker_client, logger: logging.Logger, build_timeout: int = 3600):
+    def __init__(self, docker_client, logger: logging.Logger, build_timeout: int = 7200):
         self.client = docker_client
         self.logger = logger
         self.build_timeout = build_timeout
@@ -2539,8 +2539,8 @@ Examples:
     parser.add_argument(
         '--build-timeout',
         type=int,
-        default=3600,
-        help='Docker build timeout in seconds (default: 3600)'
+        default=7200,
+        help='Docker build timeout in seconds (default: 7200)'
     )
     
     parser.add_argument(
