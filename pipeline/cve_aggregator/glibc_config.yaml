@@ -61,6 +61,21 @@ cve_fetcher:
     - "libcrypt"
     - "libcurl"
     - "libcap"
+    # Non-glibc GNU project false positives
+    - "binutils"
+    - "libbfd"
+    - "libcdio"
+    - "vmware"
+    - "mupdf"
+    - "jboss"
+
+  # Hardening: require explicit glibc match in description and CPE metadata
+  strict_target_matching: true
+  require_project_cpe_match: false
+  project_cpe_aliases:
+    - "glibc"
+    - "gnu:glibc"
+    - "eglibc"
 
   enrich_with_cve_org: false
   cve_org_delay: 1.0
@@ -72,9 +87,9 @@ commit_discovery:
   repo_url: "https://github.com/bminor/glibc.git"
   repo_local_path: "./glibc"
   auto_update: true
-  extra_grep_patterns:
-    - "BZ#"
-    - "Bug "
+  extra_grep_patterns: []
+  enable_bz_fallback: true
+  allow_unscoped_extra_patterns: false
   source_extensions:
     - ".c"
     - ".h"
@@ -89,6 +104,7 @@ poc_mapper:
   deep_search: false
   extract_content: true
   reverse_search: true
+  enable_reverse_content_grep: false
   require_verified: true
   non_target_indicators:
     - "NetBSD"
@@ -100,6 +116,7 @@ poc_mapper:
 # ---------------------------------------------------------------------------
 data_aggregator:
   global_json_path: "glibc_cve_poc_map.json"
+  prune_missing_cves: true
 
 # ---------------------------------------------------------------------------
 # Syntax Validation
@@ -116,6 +133,9 @@ output:
   filtered_json_path: "glibc_cve_poc_map_filtered.json"
   csv_path: "glibc_cve_poc_complete.csv"
   poc_dir: "exploits"
+  filtered_require_commit: false
+  filtered_require_poc: true
+  allow_poc_without_commit: true
   csv_fields:
     - "CVE"
     - "V_COMMIT"

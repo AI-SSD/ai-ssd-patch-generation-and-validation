@@ -55,6 +55,15 @@ cve_fetcher:
   #   - "SomeOtherProject"
   #   - "NotMyLibrary"
 
+  # Optional hardening knobs (recommended for projects with common/generic names):
+  # - strict_target_matching: require at least one strong keyword in CVE description
+  # - require_project_cpe_match: require a project alias to appear in a CVE CPE entry
+  strict_target_matching: false
+  require_project_cpe_match: false
+  project_cpe_aliases: []
+  #   - "my-project"
+  #   - "my_project"
+
   # Optionally enrich each CVE with CVE.org data (slower).
   enrich_with_cve_org: false
   cve_org_delay: 1.0                     # Seconds between CVE.org requests
@@ -73,11 +82,20 @@ commit_discovery:
   auto_update: true
 
   # Additional git-grep patterns to try when searching for fix commits.
-  # The pipeline always searches for the CVE-ID, CVE-ID-without-dashes,
-  # and BZ#<number>.  Add project-specific patterns here.
+  # The pipeline always searches for CVE-ID and CVE-ID-without-dashes.
+  # BZ fallback and unscoped extra patterns are configurable below.
   extra_grep_patterns: []
+  # Use placeholders to scope a pattern to the current CVE:
+  #   - "Bug: {cve}"
+  #   - "BZ#\s*{cve_num}"
   #   - "Fixes #"
   #   - "Bug:"
+
+  # Optional safety knobs for commit matching:
+  # - enable_bz_fallback: tries bug-tracker numeric matching (can create false positives)
+  # - allow_unscoped_extra_patterns: if false, plain patterns without {cve}/{cve_num} are ignored
+  enable_bz_fallback: true
+  allow_unscoped_extra_patterns: false
 
   # File extensions considered as "source code" for content extraction
   source_extensions:
@@ -106,6 +124,7 @@ poc_mapper:
   # Reverse search: scan ExploitDB titles/contents for your project's
   # keywords to discover CVEs not returned by NVD keyword search.
   reverse_search: true
+  enable_reverse_content_grep: true
 
   # Keywords for the reverse search (defaults to cve_fetcher.strong_keywords)
   # strong_keywords: []
@@ -126,6 +145,10 @@ poc_mapper:
 data_aggregator:
   # Path to the global (all-CVEs) JSON dataset
   global_json_path: "cve_poc_map.json"
+
+  # When true, remove CVEs from the persisted dataset that are not present
+  # in the current run's raw_cves set.
+  prune_missing_cves: false
 
 # ---------------------------------------------------------------------------
 # Module 5: Syntax Validation
@@ -150,6 +173,16 @@ output:
 
   # Directory for saving individual PoC exploit files
   poc_dir: "exploits"
+
+  # Filter controls for the "filtered" dataset:
+  # - filtered_require_commit: keep only CVEs with discovered fix commits
+  # - filtered_require_poc: keep only CVEs with at least one mapped PoC
+  filtered_require_commit: true
+  filtered_require_poc: true
+
+  # Export PoC rows/files even when commit discovery failed.
+  # Useful for PoC inventory workflows; disable for strict patch-pipeline-only mode.
+  allow_poc_without_commit: false
 
   # CSV column names (order matters)
   csv_fields:

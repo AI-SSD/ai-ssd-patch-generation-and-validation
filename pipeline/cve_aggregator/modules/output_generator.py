@@ -101,18 +101,35 @@ class OutputGenerator(PipelineModule):
     # ------------------------------------------------------------------
 
     def _create_filtered(self, full: Dataset, cfg: Dict) -> Dataset:
-        """Only keep CVEs that have both commits AND at least one PoC."""
+        """Create filtered dataset according to configurable criteria."""
         project_name = self.config.get("project", {}).get("name", "custom")
+        require_commit = cfg.get("filtered_require_commit", True)
+        require_poc = cfg.get("filtered_require_poc", True)
+
+        def include_entry(entry: CVEEntry) -> bool:
+            if require_commit and not entry.has_commits:
+                return False
+            if require_poc and not entry.has_poc:
+                return False
+            return True
+
         filtered_cves = {
             cid: entry for cid, entry in full.cves.items()
-            if entry.has_commits and entry.has_poc
+            if include_entry(entry)
         }
+        criteria_parts: List[str] = []
+        if require_commit:
+            criteria_parts.append("git commits")
+        if require_poc:
+            criteria_parts.append("PoC")
+        criteria = " and ".join(criteria_parts) if criteria_parts else "no filters"
+
         ds = Dataset(
             dataset_info={
                 "name": f"{project_name}-cve-poc-dataset-filtered",
                 "version": "1.0.0",
                 "purpose": "Filtered Code-Ready dataset (commits + PoC only)",
-                "filter_criteria": "CVEs with both git commits AND at least one PoC",
+                "filter_criteria": f"CVEs with {criteria}",
                 "created_at": full.dataset_info.get("created_at", datetime.now().isoformat()),
                 "last_updated": datetime.now().isoformat(),
             },
@@ -212,8 +229,12 @@ class OutputGenerator(PipelineModule):
         ps = entry.project_state
         meta = entry.metadata
 
-        # Require fix commit
-        if not ps.fix_commit_hash:
+        allow_without_commit = cfg.get("allow_poc_without_commit", False)
+
+        # By default, require fix commit for pipeline-ready rows.
+        # When allow_poc_without_commit is enabled, keep placeholder rows so
+        # PoC inventory can still be exported and reviewed.
+        if not ps.fix_commit_hash and not allow_without_commit:
             return None
 
         # Require at least a PoC

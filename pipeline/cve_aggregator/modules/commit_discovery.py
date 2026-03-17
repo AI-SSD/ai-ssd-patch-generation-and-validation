@@ -100,7 +100,13 @@ class CommitDiscovery(PipelineModule):
             return ps
 
         # Find fix commit
-        fix = find_cve_fix_commit(repo_path, cve_id, extra_grep_patterns=extra_patterns)
+        fix = find_cve_fix_commit(
+            repo_path,
+            cve_id,
+            extra_grep_patterns=extra_patterns,
+            enable_bz_fallback=cfg.get("enable_bz_fallback", True),
+            allow_unscoped_extra_patterns=cfg.get("allow_unscoped_extra_patterns", False),
+        )
         if not fix:
             return ps
 

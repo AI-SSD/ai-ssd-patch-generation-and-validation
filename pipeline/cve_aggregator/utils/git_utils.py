@@ -131,6 +131,8 @@ def find_cve_fix_commit(
     cve_id: str,
     *,
     extra_grep_patterns: Optional[List[str]] = None,
+    enable_bz_fallback: bool = True,
+    allow_unscoped_extra_patterns: bool = False,
     timeout: int = 60,
 ) -> Optional[str]:
     """Multi-strategy search for a fix commit associated with *cve_id*.
@@ -155,17 +157,30 @@ def find_cve_fix_commit(
     if commit:
         return commit
 
-    # Strategy 3 – bug-tracker reference
+    # Strategy 3 – bug-tracker reference (optional)
     m = re.match(r"CVE-(\d{4})-(\d+)", cve_id)
-    if m:
-        cve_number = m.group(2)
-        commit = find_commit_by_message(repo_path, f"BZ.*{cve_number}", timeout=timeout)
+    cve_number = m.group(2) if m else ""
+    if enable_bz_fallback and cve_number:
+        commit = find_commit_by_message(repo_path, f"BZ[^0-9]*{cve_number}([^0-9]|$)", timeout=timeout)
         if commit:
             return commit
 
     # Strategy 4 – extra patterns
     for pattern in (extra_grep_patterns or []):
-        commit = find_commit_by_message(repo_path, pattern, timeout=timeout)
+        scoped = pattern
+        if "{cve}" in pattern:
+            scoped = pattern.replace("{cve}", cve_id)
+        elif "{cve_num}" in pattern and cve_number:
+            scoped = pattern.replace("{cve_num}", cve_number)
+        elif not allow_unscoped_extra_patterns:
+            logger.debug(
+                "Skipping unscoped extra pattern '%s' for %s; use {cve}/{cve_num} or allow_unscoped_extra_patterns=true",
+                pattern,
+                cve_id,
+            )
+            continue
+
+        commit = find_commit_by_message(repo_path, scoped, timeout=timeout)
         if commit:
             return commit
 

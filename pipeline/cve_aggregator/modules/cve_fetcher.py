@@ -219,6 +219,17 @@ class CVEFetcher(PipelineModule):
         """Remove duplicate CVE-IDs and optionally apply keyword relevance filter."""
         strong_keywords: List[str] = cfg.get("strong_keywords", [])
         non_target_indicators: List[str] = cfg.get("non_target_indicators", [])
+        strict_target_matching: bool = cfg.get("strict_target_matching", False)
+        require_project_cpe_match: bool = cfg.get("require_project_cpe_match", False)
+        project_cpe_aliases: List[str] = cfg.get("project_cpe_aliases", [])
+
+        if not project_cpe_aliases:
+            project = self.config.get("project", {})
+            project_cpe_aliases = [
+                project.get("name", ""),
+                project.get("display_name", ""),
+            ]
+        project_cpe_aliases = [a for a in project_cpe_aliases if a]
 
         seen: set[str] = set()
         unique: List[Dict] = []
@@ -229,8 +240,18 @@ class CVEFetcher(PipelineModule):
             seen.add(cid)
 
             desc = cve.get("description", "")
-            if strong_keywords and desc:
-                if not self._is_target_related(desc, strong_keywords, non_target_indicators):
+            apply_relevance_filter = bool(
+                strong_keywords or non_target_indicators or strict_target_matching or require_project_cpe_match
+            )
+            if apply_relevance_filter:
+                if not self._is_target_related(
+                    cve,
+                    strong_keywords,
+                    non_target_indicators,
+                    strict_target_matching,
+                    require_project_cpe_match,
+                    project_cpe_aliases,
+                ):
                     self.logger.debug("Filtering %s: not target-related", cid)
                     continue
 
@@ -241,15 +262,39 @@ class CVEFetcher(PipelineModule):
 
     @staticmethod
     def _is_target_related(
-        text: str,
+        cve: Dict[str, Any],
         strong_keywords: List[str],
         non_target_indicators: List[str],
+        strict_target_matching: bool,
+        require_project_cpe_match: bool,
+        project_cpe_aliases: List[str],
     ) -> bool:
+        text = cve.get("description", "")
         text_lower = text.lower()
-        if any(kw.lower() in text_lower for kw in strong_keywords):
-            return True
+
         if any(ind.lower() in text_lower for ind in non_target_indicators):
             return False
+
+        strong_match = any(kw.lower() in text_lower for kw in strong_keywords)
+
+        cpe_match = False
+        if project_cpe_aliases:
+            for product in cve.get("affected_products", []):
+                cpe = (product.get("cpe") or "").lower()
+                if cpe and any(alias.lower() in cpe for alias in project_cpe_aliases):
+                    cpe_match = True
+                    break
+
+        if require_project_cpe_match and not cpe_match:
+            return False
+
+        if strict_target_matching:
+            # In strict mode, require explicit strong keyword evidence.
+            return strong_match
+
+        if strong_match:
+            return True
+
         return True  # permissive by default
 
     # ------------------------------------------------------------------

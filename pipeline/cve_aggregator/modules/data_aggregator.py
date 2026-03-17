@@ -37,6 +37,18 @@ class DataAggregator(PipelineModule):
 
         # Transform raw CVE dicts → CVEEntry objects & merge
         raw_cves: List[Dict] = context.get("raw_cves", [])
+        current_ids = {r.get("cve_id", "") for r in raw_cves if r.get("cve_id")}
+
+        if cfg.get("prune_missing_cves", False):
+            before = len(existing.cves)
+            existing.cves = {
+                cid: entry for cid, entry in existing.cves.items()
+                if cid in current_ids
+            }
+            pruned = before - len(existing.cves)
+            if pruned > 0:
+                self.logger.info("Pruned %d stale CVEs not present in current run", pruned)
+
         new_count = updated_count = 0
 
         for raw in raw_cves:

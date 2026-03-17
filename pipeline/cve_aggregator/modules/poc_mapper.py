@@ -233,6 +233,7 @@ class PoCMapper(PipelineModule):
         content_kws: List[str] = cfg.get("content_search_keywords", strong_kws)
         non_target: List[str] = cfg.get("non_target_indicators", self.config.get("cve_fetcher", {}).get("non_target_indicators", []))
         require_verified: bool = cfg.get("require_verified", True)
+        enable_reverse_content_grep: bool = cfg.get("enable_reverse_content_grep", True)
         extras: List[Dict] = []
 
         # Check CVE-to-exploit mapping for entries whose description matches keywords
@@ -258,7 +259,7 @@ class PoCMapper(PipelineModule):
                     break
 
         # Optionally grep exploit contents for strong keywords
-        if content_kws:
+        if enable_reverse_content_grep and content_kws:
             exploits_dir = edb_path / "exploits"
             if exploits_dir.exists():
                 for kw in content_kws:
