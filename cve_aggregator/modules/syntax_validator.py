@@ -59,20 +59,11 @@ class SyntaxValidator(PipelineModule):
                     continue
 
                 lang = exploit.language
-                if lang in ("unknown", "text"):
-                    detected = detect_language_from_content(content)
-                    if detected != "unknown":
-                        lang = detected
+                if lang == "unknown":
+                    lang = detect_language_from_content(content)
 
                 key = f"{cve_id}:{idx}"
                 vr = self._validate(content, lang, cfg)
-
-                # Persist successful auto-commenting so downstream output writes cleaned PoCs.
-                if vr.is_valid and any(w.startswith("auto_commented_prose_lines:") for w in vr.warnings):
-                    fixed_content, changed = self._auto_comment_uncommented_prose_for_language(content, lang)
-                    if changed > 0 and fixed_content != content:
-                        exploit.source_code_content = fixed_content
-                        content = fixed_content
 
                 results[key] = vr.to_dict()
                 results[key]["cve_id"] = cve_id
@@ -102,109 +93,6 @@ class SyntaxValidator(PipelineModule):
     # Dispatch to per-language validators
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _comment_prefix_for_language(language: str) -> str:
-        prefixes = {
-            "c": "// ",
-            "python": "# ",
-            "shell": "# ",
-            "ruby": "# ",
-            "perl": "# ",
-            "php": "// ",
-        }
-        return prefixes.get(language, "# ")
-
-    def _is_code_anchor_for_language(self, line: str, language: str) -> bool:
-        """Return True when a line strongly indicates source code for *language*."""
-        if language == "c":
-            return self._is_c_code_anchor(line)
-
-        s = line.strip()
-        if not s:
-            return False
-
-        patterns = {
-            "python": [
-                r"^(from|import)\b",
-                r"^(def|class)\b",
-                r"^if\s+__name__\s*==",
-                r"^[A-Za-z_]\w*\s*=",
-                r"^@\w+",
-            ],
-            "shell": [
-                r"^#!",
-                r"^[A-Za-z_]\w*=",
-                r"^(if|for|while|case|function)\b",
-                r"^(echo|printf|exec|export|test|\.|source)\b",
-            ],
-            "ruby": [
-                r"^(require|class|module|def|begin|end|if|unless)\b",
-                r"^(puts|print|p)\b",
-                r"^[A-Za-z_]\w*\s*=",
-            ],
-            "perl": [
-                r"^#!",
-                r"^(use|my|sub|package)\b",
-                r"^print\b",
-                r"^[\$@%][A-Za-z_]",
-            ],
-            "php": [
-                r"^<\?php",
-                r"^(function|class|if|require|include|echo)\b",
-                r"^\$[A-Za-z_]",
-            ],
-        }
-        return any(re.search(p, s) for p in patterns.get(language, []))
-
-    @staticmethod
-    def _is_uncommented_prose_line_generic(line: str) -> bool:
-        """Heuristic for plain-English prose accidentally embedded in source files."""
-        s = line.strip()
-        if not s:
-            return False
-        if s.startswith(("//", "/*", "*/", "*", "#", "--", "<!--", "<?")):
-            return False
-        if any(ch in s for ch in (";", "{", "}", "=", "$", "`", "|", "&", "\t", "\"", "'")):
-            return False
-
-        words = re.findall(r"[A-Za-z]+", s)
-        if len(words) < 6:
-            return False
-
-        lowered = s.lower()
-        prose_hints = [
-            "vulnerab", "exploit", "attacker", "application", "library", "overflow",
-            "denial", "successful", "failed", "execute arbitrary", "context of",
-        ]
-        return any(h in lowered for h in prose_hints)
-
-    def _auto_comment_uncommented_prose_for_language(self, content: str, language: str) -> Tuple[str, int]:
-        """Comment prose-like lines anywhere in the file for a given language."""
-        lines = content.splitlines()
-        has_anchor = any(self._is_code_anchor_for_language(line, language) for line in lines)
-        if not has_anchor:
-            return content, 0
-
-        prefix = self._comment_prefix_for_language(language)
-        changed = 0
-        out_lines = list(lines)
-        for idx, line in enumerate(out_lines):
-            line = out_lines[idx]
-            if self._is_code_anchor_for_language(line, language):
-                continue
-            if self._is_uncommented_prose_line_generic(line):
-                indent = re.match(r"^\s*", line).group(0)
-                out_lines[idx] = f"{indent}{prefix}{line[len(indent):]}"
-                changed += 1
-
-        if changed == 0:
-            return content, 0
-
-        out = "\n".join(out_lines)
-        if content.endswith("\n"):
-            out += "\n"
-        return out, changed
-
     def _validate(self, content: str, language: str, cfg: Dict) -> SyntaxValidationResult:
         validators = {
             "c": self._validate_c,
@@ -216,23 +104,7 @@ class SyntaxValidator(PipelineModule):
         }
         fn = validators.get(language)
         if fn:
-            result = fn(content, cfg)
-            if result.is_valid or not result.needs_manual_review:
-                return result
-
-            fixed_content, commented_lines = self._auto_comment_uncommented_prose_for_language(
-                content, language
-            )
-            if commented_lines == 0:
-                return result
-
-            retry = fn(fixed_content, cfg)
-            if retry.is_valid:
-                retry.warnings.append(f"auto_commented_prose_lines:{commented_lines}")
-                return retry
-
-            result.warnings.append(f"auto_commented_prose_attempted:{commented_lines}")
-            return result
+            return fn(content, cfg)
         # Unrecognised / text language – flag for manual review
         return SyntaxValidationResult(
             is_valid=False, language=language,
@@ -244,88 +116,26 @@ class SyntaxValidator(PipelineModule):
     # C validation
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _run_c_syntax_check(content: str) -> Tuple[int, str]:
-        """Run C syntax-only compilation and return ``(returncode, message)``."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".c", delete=False) as f:
-            f.write(content)
-            tmp = f.name
-
-        try:
-            result = subprocess.run(
-                [
-                    "gcc", "-fsyntax-only", "-c", "-w",
-                    "-Wno-implicit-function-declaration", "-Wno-implicit-int", tmp,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            err_msg = (result.stderr or result.stdout).strip()
-            err_msg = re.sub(r"/tmp/tmp\w+\.c:", "line ", err_msg)
-            return result.returncode, err_msg
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-
-    @staticmethod
-    def _is_c_code_anchor(line: str) -> bool:
-        """Return True when a line strongly indicates real C source code."""
-        s = line.strip()
-        if not s:
-            return False
-        if re.match(r"^#\s*(include|define|if|ifdef|ifndef|elif|else|endif|pragma)\b", s):
-            return True
-        if re.match(
-            r"^(typedef|struct|union|enum|static|extern|const|volatile|unsigned|signed|void|char|short|int|long|float|double)\b",
-            s,
-        ):
-            return True
-        if re.match(r"^[A-Za-z_]\w*\s*\(", s):
-            return True
-        return False
-
-    @staticmethod
-    def _is_uncommented_prose_line(line: str) -> bool:
-        """Heuristic for plain-English prose accidentally embedded in C files."""
-        s = line.strip()
-        if not s:
-            return False
-        if s.startswith(("//", "/*", "*/", "*", "#")):
-            return False
-        if any(ch in s for ch in (";", "{", "}", "(")):
-            return False
-        words = re.findall(r"[A-Za-z]+", s)
-        if len(words) < 5:
-            return False
-        lowered = s.lower()
-        prose_hints = ["vulnerab", "exploit", "attacker", "application", "library", "overflow", "denial"]
-        return any(h in lowered for h in prose_hints)
-
-    def _auto_comment_uncommented_prose(self, content: str) -> Tuple[str, int]:
-        """Backward-compatible C-specific wrapper over generic auto-commenting."""
-        return self._auto_comment_uncommented_prose_for_language(content, "c")
-
     def _validate_c(self, content: str, cfg: Dict) -> SyntaxValidationResult:
         errors: List[str] = []
         warnings: List[str] = []
 
         try:
-            code, err_msg = self._run_c_syntax_check(content)
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".c", delete=False) as f:
+                f.write(content)
+                tmp = f.name
 
-            if code == 0:
+            result = subprocess.run(
+                ["gcc", "-fsyntax-only", "-c", "-w", "-Wno-implicit-function-declaration", tmp],
+                capture_output=True, text=True, timeout=30,
+            )
+            os.unlink(tmp)
+
+            if result.returncode == 0:
                 return SyntaxValidationResult(True, "c")
 
-            # Auto-fix common scraped PoCs where prose is left uncommented.
-            fixed_content, commented_lines = self._auto_comment_uncommented_prose(content)
-            if commented_lines > 0:
-                fixed_code, fixed_err = self._run_c_syntax_check(fixed_content)
-                if fixed_code == 0:
-                    warnings.append(f"auto_commented_prose_lines:{commented_lines}")
-                    return SyntaxValidationResult(True, "c", warnings=warnings)
-                # Keep the most informative error from the retried content.
-                err_msg = fixed_err or err_msg
-                warnings.append(f"auto_commented_prose_lines:{commented_lines}")
+            err_msg = (result.stderr or result.stdout).strip()
+            err_msg = re.sub(r"/tmp/tmp\w+\.c:", "line ", err_msg)
 
             # Environment errors (Xcode license, missing SDK…)
             env_patterns = [r"Xcode license", r"xcrun: error", r"developer tools"]
@@ -338,11 +148,7 @@ class SyntaxValidator(PipelineModule):
                 return SyntaxValidationResult(True, "c", warnings=warnings)
 
             # Missing-header errors (expected for library code)
-            header_patterns = [
-                r"fatal error:.*\.h.*No such file",
-                r"fatal error:.*\.h.*not found",
-                r"#include.*not found",
-            ]
+            header_patterns = [r"fatal error:.*\.h.*No such file", r"#include.*not found"]
             if any(re.search(p, err_msg, re.I) for p in header_patterns):
                 warnings.append(f"missing_headers:{err_msg[:200]}")
                 return SyntaxValidationResult(True, "c", warnings=warnings)
@@ -351,6 +157,8 @@ class SyntaxValidator(PipelineModule):
             return SyntaxValidationResult(False, "c", errors, needs_manual_review=True)
 
         except subprocess.TimeoutExpired:
+            if "tmp" in dir() and os.path.exists(tmp):
+                os.unlink(tmp)
             return SyntaxValidationResult(False, "c", ["gcc_timeout"], needs_manual_review=True)
         except FileNotFoundError:
             # GCC not installed – structural fallback
@@ -386,31 +194,11 @@ class SyntaxValidator(PipelineModule):
             ast.parse(content)
             return SyntaxValidationResult(True, "python")
         except SyntaxError as exc:
-            # Detect Python 2 code and tolerate known Py2-only syntax
-            if self._is_python2_syntax_error(content, exc):
-                return SyntaxValidationResult(
-                    True, "python",
-                    warnings=[f"python2_syntax:line {exc.lineno}: {exc.msg}"],
-                )
             return SyntaxValidationResult(
                 False, "python", [f"line {exc.lineno}: {exc.msg}"], needs_manual_review=True
             )
         except Exception as exc:
             return SyntaxValidationResult(False, "python", [str(exc)], needs_manual_review=True)
-
-    @staticmethod
-    def _is_python2_syntax_error(content: str, exc: SyntaxError) -> bool:
-        """Return True if the syntax error is due to Python 2 constructs."""
-        py2_indicators = [
-            r"\bprint\s+[\"\']|\bprint\s+[^(]",  # print "x" or print x
-            r"\bexcept\s+\w+\s*,\s*\w+",           # except Error, e:
-            r"\braise\s+\w+\s*,",                   # raise Error, msg
-        ]
-        has_py2 = any(re.search(p, content) for p in py2_indicators)
-        py2_msgs = ["Missing parentheses in call to 'print'",
-                    "leading zeros in decimal integer literals"]
-        msg_match = any(m in (exc.msg or "") for m in py2_msgs)
-        return has_py2 or msg_match
 
     # ------------------------------------------------------------------
     # Shell validation

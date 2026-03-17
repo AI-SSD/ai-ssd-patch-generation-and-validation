@@ -1,0 +1,204 @@
+# =============================================================================
+# CVE Aggregator Pipeline – Configuration
+# =============================================================================
+# This is a PROJECT-AGNOSTIC configuration template.
+# Customise the values below for your target software project.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Project identity (used in dataset names, logging, etc.)
+# ---------------------------------------------------------------------------
+project:
+  name: "my-project"                     # Short slug (no spaces)
+  display_name: "My Project"             # Human-readable name
+  description: "CVE dataset for My Project"
+
+# ---------------------------------------------------------------------------
+# Pipeline behaviour
+# ---------------------------------------------------------------------------
+pipeline:
+  abort_on_error: true                   # Stop on first module failure?
+  # Modules to skip entirely (class names):
+  #   CVEFetcher, CommitDiscovery, PoCMapper, DataAggregator,
+  #   SyntaxValidator, OutputGenerator
+  skip_modules: []
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  level: "INFO"                          # DEBUG | INFO | WARNING | ERROR
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  file: "logs/cve_aggregator.log"        # Set to null to disable file logging
+
+# ---------------------------------------------------------------------------
+# Module 1: CVE Fetching & Enrichment
+# ---------------------------------------------------------------------------
+cve_fetcher:
+  # NVD API key – get one at https://nvd.nist.gov/developers/request-an-api-key
+  nvd_api_key: ""                        # Leave empty for unauthenticated (slow)
+
+  # Keywords used for NVD keyword search.
+  # These are sent as ``keywordSearch`` to the NVD 2.0 API.
+  keywords:
+    - "my-project"                       # <-- Replace with your project keywords
+
+  # Strong keywords that MUST appear in a CVE description for it to be
+  # considered relevant.  Used for deduplication filtering.
+  strong_keywords:
+    - "my-project"
+
+  # If the description contains ONLY a weak match (e.g. a generic library
+  # name), the presence of any of these strings causes the entry to be
+  # rejected.  Useful to exclude look-alike projects.
+  non_target_indicators: []
+  #   - "SomeOtherProject"
+  #   - "NotMyLibrary"
+
+  # Optionally enrich each CVE with CVE.org data (slower).
+  enrich_with_cve_org: false
+  cve_org_delay: 1.0                     # Seconds between CVE.org requests
+
+# ---------------------------------------------------------------------------
+# Module 2: Commit Discovery
+# ---------------------------------------------------------------------------
+commit_discovery:
+  # Remote URL of the source repository (will be cloned if not present)
+  repo_url: "https://github.com/example/my-project.git"
+
+  # Local path to the cloned repository (relative to CWD or absolute)
+  repo_local_path: "./source_repo"
+
+  # Pull latest changes before searching?
+  auto_update: true
+
+  # Additional git-grep patterns to try when searching for fix commits.
+  # The pipeline always searches for the CVE-ID, CVE-ID-without-dashes,
+  # and BZ#<number>.  Add project-specific patterns here.
+  extra_grep_patterns: []
+  #   - "Fixes #"
+  #   - "Bug:"
+
+  # File extensions considered as "source code" for content extraction
+  source_extensions:
+    - ".c"
+    - ".h"
+
+# ---------------------------------------------------------------------------
+# Module 3: PoC Mapping & Extraction (ExploitDB)
+# ---------------------------------------------------------------------------
+poc_mapper:
+  # Local path to the ExploitDB git repository
+  exploitdb_path: "./exploit-database"
+
+  # Remote URL (for auto-clone)
+  exploitdb_remote_url: "https://gitlab.com/exploit-database/exploitdb.git"
+
+  # Pull latest ExploitDB data before mapping?
+  auto_update: true
+
+  # Deep search: grep exploit file *contents* for CVE IDs (slower but thorough)
+  deep_search: false
+
+  # Extract full source code from matched exploit files?
+  extract_content: true
+
+  # Reverse search: scan ExploitDB titles/contents for your project's
+  # keywords to discover CVEs not returned by NVD keyword search.
+  reverse_search: true
+
+  # Keywords for the reverse search (defaults to cve_fetcher.strong_keywords)
+  # strong_keywords: []
+
+  # Only include verified exploits from ExploitDB?
+  require_verified: true
+
+  # Indicators that an exploit mentioning your project is actually about
+  # something else (same idea as cve_fetcher.non_target_indicators).
+  non_target_indicators: []
+
+  # Keywords to grep inside exploit file contents
+  # content_search_keywords: []
+
+# ---------------------------------------------------------------------------
+# Module 4: Data Aggregator
+# ---------------------------------------------------------------------------
+data_aggregator:
+  # Path to the global (all-CVEs) JSON dataset
+  global_json_path: "cve_poc_map.json"
+
+# ---------------------------------------------------------------------------
+# Module 5: Syntax Validation
+# ---------------------------------------------------------------------------
+syntax_validator:
+  # Directory where invalid PoC files are copied for manual review
+  manual_supervision_dir: "manual_supervision"
+
+  # Path for the JSON validation report
+  report_path: "syntax_validation_report.json"
+
+# ---------------------------------------------------------------------------
+# Module 6: Output Generation
+# ---------------------------------------------------------------------------
+output:
+  # JSON output paths
+  global_json_path: "cve_poc_map.json"
+  filtered_json_path: "cve_poc_map_filtered.json"
+
+  # CSV output
+  csv_path: "cve_poc_complete.csv"
+
+  # Directory for saving individual PoC exploit files
+  poc_dir: "exploits"
+
+  # CSV column names (order matters)
+  csv_fields:
+    - "CVE"
+    - "V_COMMIT"
+    - "FilePath"
+    - "F_NAME"
+    - "UNIT_TYPE"
+    - "V_FILE"
+    - "V_FUNCTION"
+    - "CVE_Description"
+    - "CWE"
+    - "CWE_Description"
+    - "project_version"
+    - "ubuntu_version"
+    - "poc_path"
+    - "poc_language"
+    - "manual_review_required"
+    - "manual_verified"
+
+
+# =============================================================================
+# EXAMPLE: glibc-specific configuration
+# =============================================================================
+# To use this pipeline for glibc, replace the sections above with:
+#
+# project:
+#   name: "glibc"
+#   display_name: "GNU C Library"
+#
+# cve_fetcher:
+#   nvd_api_key: "YOUR_KEY"
+#   keywords: ["glibc", "GNU C Library", "eglibc"]
+#   strong_keywords: ["glibc", "GNU C Library", "GNU libc", "eglibc"]
+#   non_target_indicators:
+#     - "NetBSD"
+#     - "FreeBSD"
+#     - "musl"
+#     - "dietlibc"
+#     - "uClibc"
+#     - "Bionic"
+#
+# commit_discovery:
+#   repo_url: "https://github.com/bminor/glibc.git"
+#   repo_local_path: "./glibc"
+#   source_extensions: [".c", ".h"]
+#
+# poc_mapper:
+#   exploitdb_path: "./exploit-database"
+#   reverse_search: true
+#   require_verified: true
+# =============================================================================

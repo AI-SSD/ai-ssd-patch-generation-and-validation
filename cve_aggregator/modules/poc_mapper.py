@@ -54,7 +54,6 @@ class PoCMapper(PipelineModule):
         deep_search: bool = cfg.get("deep_search", False)
         extract_content: bool = cfg.get("extract_content", True)
         reverse_search: bool = cfg.get("reverse_search", True)
-        require_verified: bool = cfg.get("require_verified", True)
 
         # Step 1 – Update ExploitDB
         if cfg.get("auto_update", True):
@@ -63,7 +62,7 @@ class PoCMapper(PipelineModule):
 
         # Step 2 – Load CSV mapping
         self.logger.info("Loading ExploitDB CSV mappings …")
-        cve_to_exploits = self._load_csv_mapping(edb_path, require_verified)
+        cve_to_exploits = self._load_csv_mapping(edb_path)
         self.logger.info("  Mapped %d CVE IDs from ExploitDB CSVs", len(cve_to_exploits))
 
         # Step 3 – (Optional) Reverse search for additional CVEs
@@ -108,7 +107,7 @@ class PoCMapper(PipelineModule):
     # CSV-based exploit mapping
     # ------------------------------------------------------------------
 
-    def _load_csv_mapping(self, edb_path: Path, require_verified: bool = True) -> Dict[str, List[Dict]]:
+    def _load_csv_mapping(self, edb_path: Path) -> Dict[str, List[Dict]]:
         """Parse ExploitDB CSV files and build a {CVE-ID → [exploit_info]} map."""
         mapping: Dict[str, List[Dict]] = {}
 
@@ -117,19 +116,17 @@ class PoCMapper(PipelineModule):
             if not csv_path.exists():
                 self.logger.debug("CSV not found: %s", csv_path)
                 continue
-            self._parse_csv(csv_path, mapping, edb_path, require_verified)
+            self._parse_csv(csv_path, mapping, edb_path)
 
         return mapping
 
-    def _parse_csv(self, csv_path: Path, mapping: Dict[str, List[Dict]], edb_path: Path, require_verified: bool = True) -> int:
+    def _parse_csv(self, csv_path: Path, mapping: Dict[str, List[Dict]], edb_path: Path) -> int:
         """Parse a single ExploitDB CSV and add entries to *mapping*."""
         count = 0
         try:
             with open(csv_path, "r", encoding="utf-8", errors="replace") as fh:
                 reader = csv.DictReader(fh)
                 for row in reader:
-                    if require_verified and row.get("verified", "0") != "1":
-                        continue
                     codes_str = row.get("codes", "")
                     for code in codes_str.split(";"):
                         code = code.strip()

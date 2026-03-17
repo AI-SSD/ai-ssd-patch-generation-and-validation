@@ -547,17 +547,27 @@ def main():
             v_file = row.get('V_FILE') if has_v_file else None
             file_path_col = str(row.get('FilePath', 'unknown.c')).strip()
 
-            # Load PoC
+            # Load PoC – prefer the poc_path column written by the aggregator
             poc_code = None
-            cve_str = str(original_cve)
-            for filename in [cve_str, f"{cve_str}.c", f"{cve_str}.txt"]:
-                poc_path = os.path.join(EXPLOITS_DIR, filename)
-                if os.path.exists(poc_path):
-                    try:
-                        with open(poc_path, 'r', encoding='utf-8', errors='ignore') as f:
-                            poc_code = f.read()
-                        break
-                    except: pass
+            poc_path_col = str(row.get('poc_path', '')).strip()
+            if poc_path_col and poc_path_col != 'nan' and os.path.exists(poc_path_col):
+                try:
+                    with open(poc_path_col, 'r', encoding='utf-8', errors='ignore') as f:
+                        poc_code = f.read()
+                except Exception:
+                    pass
+
+            # Fallback: search exploits dir by CVE name (legacy behaviour)
+            if poc_code is None:
+                cve_str = str(original_cve)
+                for filename in [cve_str, f"{cve_str}.c", f"{cve_str}.txt"]:
+                    poc_path = os.path.join(EXPLOITS_DIR, filename)
+                    if os.path.exists(poc_path):
+                        try:
+                            with open(poc_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                poc_code = f.read()
+                            break
+                        except: pass
 
             if pd.isna(v_function) or not v_function.strip():
                 continue
