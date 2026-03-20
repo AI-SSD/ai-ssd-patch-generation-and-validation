@@ -222,6 +222,7 @@ class CVEFetcher(PipelineModule):
         strict_target_matching: bool = cfg.get("strict_target_matching", False)
         require_project_cpe_match: bool = cfg.get("require_project_cpe_match", False)
         project_cpe_aliases: List[str] = cfg.get("project_cpe_aliases", [])
+        min_published_year: Optional[int] = cfg.get("min_published_year")
 
         if not project_cpe_aliases:
             project = self.config.get("project", {})
@@ -233,11 +234,28 @@ class CVEFetcher(PipelineModule):
 
         seen: set[str] = set()
         unique: List[Dict] = []
+        year_filtered = 0
         for cve in cves:
             cid = cve["cve_id"]
             if cid in seen:
                 continue
             seen.add(cid)
+
+            # Filter by published year (exclude pre-git-era CVEs)
+            if min_published_year:
+                pub_date = cve.get("published_date", "")
+                if pub_date:
+                    try:
+                        pub_year = int(pub_date[:4])
+                        if pub_year < min_published_year:
+                            self.logger.debug(
+                                "Filtering %s: published %d < min_published_year %d",
+                                cid, pub_year, min_published_year,
+                            )
+                            year_filtered += 1
+                            continue
+                    except (ValueError, IndexError):
+                        pass  # keep CVEs with unparseable dates
 
             desc = cve.get("description", "")
             apply_relevance_filter = bool(
@@ -257,6 +275,8 @@ class CVEFetcher(PipelineModule):
 
             unique.append(cve)
 
+        if year_filtered:
+            self.logger.info("Excluded %d CVEs published before %d", year_filtered, min_published_year)
         self.logger.info("After de-dup + filter: %d CVEs", len(unique))
         return unique
 

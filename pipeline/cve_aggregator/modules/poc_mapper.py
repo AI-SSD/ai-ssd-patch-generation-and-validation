@@ -229,27 +229,49 @@ class PoCMapper(PipelineModule):
         cve_to_exploits: Dict[str, List[Dict]],
     ) -> List[Dict]:
         """Find CVEs in ExploitDB that weren't fetched from NVD."""
-        strong_kws: List[str] = cfg.get("strong_keywords", self.config.get("cve_fetcher", {}).get("strong_keywords", []))
+        cve_fetcher_cfg = self.config.get("cve_fetcher", {})
+        strong_kws: List[str] = cfg.get("strong_keywords", cve_fetcher_cfg.get("strong_keywords", []))
         content_kws: List[str] = cfg.get("content_search_keywords", strong_kws)
-        non_target: List[str] = cfg.get("non_target_indicators", self.config.get("cve_fetcher", {}).get("non_target_indicators", []))
+        
+        # Merge non_target_indicators instead of overriding
+        non_target = list(set(
+            cfg.get("non_target_indicators", []) + 
+            cve_fetcher_cfg.get("non_target_indicators", [])
+        ))
+        min_published_year: Optional[int] = cve_fetcher_cfg.get("min_published_year")
+        
         require_verified: bool = cfg.get("require_verified", True)
         enable_reverse_content_grep: bool = cfg.get("enable_reverse_content_grep", True)
         extras: List[Dict] = []
+
+        def _is_allowed(cid: str, desc: str) -> bool:
+            if min_published_year is not None:
+                try:
+                    # e.g., "CVE-2015-1234" -> 2015
+                    year = int(cid.split("-")[1])
+                    if year < min_published_year:
+                        return False
+                except (IndexError, ValueError):
+                    pass
+            desc_lower = desc.lower()
+            if any(ind.lower() in desc_lower for ind in non_target):
+                return False
+            return True
 
         # Check CVE-to-exploit mapping for entries whose description matches keywords
         for cve_id, exploits in cve_to_exploits.items():
             if cve_id in existing_ids:
                 continue
             for exp in exploits:
-                desc = exp.get("description", "").lower()
-                if any(kw.lower() in desc for kw in strong_kws):
+                desc = exp.get("description", "")
+                if any(kw.lower() in desc.lower() for kw in strong_kws):
                     if require_verified and not exp.get("verified", False):
                         continue
-                    if any(ind.lower() in desc for ind in non_target):
+                    if not _is_allowed(cve_id, desc):
                         continue
                     extras.append({
                         "cve_id": cve_id,
-                        "description": exp.get("description", ""),
+                        "description": desc,
                         "source": "ExploitDB_reverse",
                         "exploits": [exp],
                         "has_poc": True,
@@ -278,7 +300,7 @@ class PoCMapper(PipelineModule):
                                     text = fpath.read_text(encoding="utf-8", errors="replace")[:4096]
                                     for m in re.finditer(r"CVE-\d{4}-\d+", text):
                                         cid = m.group(0)
-                                        if cid not in existing_ids:
+                                        if cid not in existing_ids and _is_allowed(cid, ""):
                                             extras.append({
                                                 "cve_id": cid,
                                                 "description": "",

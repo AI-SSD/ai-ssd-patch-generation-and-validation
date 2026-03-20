@@ -105,12 +105,21 @@ class OutputGenerator(PipelineModule):
         project_name = self.config.get("project", {}).get("name", "custom")
         require_commit = cfg.get("filtered_require_commit", True)
         require_poc = cfg.get("filtered_require_poc", True)
+        require_verified_poc = cfg.get("filtered_require_verified_poc", True)
 
         def include_entry(entry: CVEEntry) -> bool:
             if require_commit and not entry.has_commits:
                 return False
             if require_poc and not entry.has_poc:
                 return False
+            if require_verified_poc:
+                # Require at least one *verified* PoC with extractable content
+                has_verified_poc = any(
+                    e.verified and e.source_code_content
+                    for e in entry.exploits
+                )
+                if not has_verified_poc:
+                    return False
             return True
 
         filtered_cves = {

@@ -68,6 +68,10 @@ cve_fetcher:
     - "vmware"
     - "mupdf"
     - "jboss"
+    # Non-glibc software that may reference glibc in CVE descriptions
+    - "GoAhead"
+    - "Embedthis"
+    - "sudo"
 
   # Hardening: require explicit glibc match in description and CPE metadata
   strict_target_matching: true
@@ -80,11 +84,15 @@ cve_fetcher:
   enrich_with_cve_org: false
   cve_org_delay: 1.0
 
+  # Exclude CVEs published before this year (fixes predate git history).
+  # Set to null or remove to include all years.
+  min_published_year: 1990
+
 # ---------------------------------------------------------------------------
 # Commit Discovery (glibc mirror)
 # ---------------------------------------------------------------------------
 commit_discovery:
-  repo_url: "https://github.com/bminor/glibc.git"
+  repo_url: "https://sourceware.org/git/glibc.git"
   repo_local_path: "./glibc"
   auto_update: true
   extra_grep_patterns: []
@@ -135,6 +143,7 @@ output:
   poc_dir: "exploits"
   filtered_require_commit: false
   filtered_require_poc: true
+  filtered_require_verified_poc: true
   allow_poc_without_commit: true
   csv_fields:
     - "CVE"

@@ -72,7 +72,8 @@ class CommitDiscovery(PipelineModule):
             if idx % 25 == 0:
                 self.logger.info("  Commit discovery: %d / %d …", idx, len(raw_cves))
 
-            ps = self._discover(cve_id, repo_path, repo_url, extra_patterns, cfg)
+            ps = self._discover(cve_id, repo_path, repo_url, extra_patterns, cfg,
+                               reference_urls=cve.get("references", []))
             cve["project_state"] = ps.to_dict()
 
             if ps.fix_commit_hash:
@@ -93,6 +94,8 @@ class CommitDiscovery(PipelineModule):
         repo_url: str,
         extra_patterns: List[str],
         cfg: Dict,
+        *,
+        reference_urls: Optional[List[str]] = None,
     ) -> ProjectState:
         ps = ProjectState(repository_url=repo_url)
 
@@ -103,6 +106,7 @@ class CommitDiscovery(PipelineModule):
         fix = find_cve_fix_commit(
             repo_path,
             cve_id,
+            reference_urls=reference_urls,
             extra_grep_patterns=extra_patterns,
             enable_bz_fallback=cfg.get("enable_bz_fallback", True),
             allow_unscoped_extra_patterns=cfg.get("allow_unscoped_extra_patterns", False),
@@ -137,12 +141,18 @@ class CommitDiscovery(PipelineModule):
             ps.changed_code_units = {}
 
             for finfo in (ps.changed_files or []):
-                fpath = finfo["file_path"]
-                if not any(fpath.endswith(ext) for ext in source_exts):
-                    continue
+                fpath = finfo["file_path"]              # new (patched) path
+                old_path = finfo.get("old_file_path", fpath)  # old (vulnerable) path
 
-                # Get full file content at BOTH commits
-                vuln_content = get_file_content_at_commit(repo_path, fpath, vuln)
+                if not any(fpath.endswith(ext) for ext in source_exts):
+                    # Also check old path for renames (.c → .c is typical,
+                    # but the extension filter should still be applied)
+                    if not any(old_path.endswith(ext) for ext in source_exts):
+                        continue
+
+                # Get full file content at BOTH commits, using the
+                # correct path for each version (handles renames).
+                vuln_content = get_file_content_at_commit(repo_path, old_path, vuln)
                 patched_content = get_file_content_at_commit(repo_path, fpath, fix)
 
                 # Handle new / deleted files
