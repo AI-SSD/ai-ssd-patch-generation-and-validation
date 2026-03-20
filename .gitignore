@@ -53,8 +53,5 @@ pipeline/image_manifest.json
 pipeline/syntax_validation_report.json
 pipeline/exploit-database
 pipeline/glibc
-pipeline/dashboard/.env
-pipeline/dashboard/node_modules/
-pipeline/dashboard/package-lock.json
-pipeline/dashboard/client/node_modules/
-pipeline/dashboard/client/package-lock.json
+pipeline/exploits
+pipeline/manual_supervision
