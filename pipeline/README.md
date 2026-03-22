@@ -6,7 +6,7 @@ Automated vulnerability reproduction pipeline for glibc CVEs. The pipeline is co
 
 | Phase | Script | Description |
 |-------|--------|-------------|
-| **0 – Data Aggregation** | `glibc_cve_aggregator.py` | Scrape NVD/CVE.org, cross-reference ExploitDB, extract PoCs, validate syntax, attempt LLM-based repair of invalid PoCs, and export datasets. Produces `glibc_cve_poc_complete.csv` for manual review. |
+| **0 – Data Aggregation** | `cve_aggregator/` | Scrape NVD/CVE.org, cross-reference ExploitDB, extract PoCs, validate syntax, attempt LLM-based repair of invalid PoCs, and export datasets. Produces `glibc_cve_poc_complete.csv` for manual review. |
 | **1 – Docker Env Build** | `orchestrator.py` | Build Docker images per CVE and execute PoC exploits to reproduce vulnerabilities. |
 | **2 – Patch Generation** | `patch_generator.py` | Generate candidate patches using LLM. |
 | **3 – Patch Validation** | `patch_validator.py` | Apply patches inside Docker and validate via test execution. |
@@ -94,9 +94,10 @@ python3 -m pytest tests/ -v
 
 ```
 pipeline/
-├── pipeline.py                  # Master pipeline orchestrator
+├── pipeline.py                  # Master pipeline orchestrator wrapper
+├── master_pipeline/             # Core modular orchestrator package
+├── cve_aggregator/              # Phase 0: Data aggregation package
 ├── orchestrator.py              # Phase 1: Docker env build + PoC execution
-├── glibc_cve_aggregator.py      # Phase 0: Data aggregation
 ├── patch_generator.py           # Phase 2: LLM patch generation
 ├── patch_validator.py           # Phase 3: Patch validation
 ├── reporter.py                  # Phase 4: Reporting

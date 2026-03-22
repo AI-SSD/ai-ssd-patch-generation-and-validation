@@ -132,6 +132,7 @@ data_aggregator:
 syntax_validator:
   manual_supervision_dir: "manual_supervision"
   report_path: "syntax_validation_report.json"
+  allow_manual_without_commit: false
 
 # ---------------------------------------------------------------------------
 # Output Generation
@@ -144,7 +145,7 @@ output:
   filtered_require_commit: false
   filtered_require_poc: true
   filtered_require_verified_poc: true
-  allow_poc_without_commit: true
+  allow_poc_without_commit: false
   csv_fields:
     - "CVE"
     - "V_COMMIT"

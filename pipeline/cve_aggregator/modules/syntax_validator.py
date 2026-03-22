@@ -45,6 +45,7 @@ class SyntaxValidator(PipelineModule):
         cfg = self.config.get("syntax_validator", {})
         manual_dir = Path(cfg.get("manual_supervision_dir", "manual_supervision"))
         report_path = Path(cfg.get("report_path", "syntax_validation_report.json"))
+        allow_manual_without_commit = cfg.get("allow_manual_without_commit", True)
 
         manual_dir.mkdir(parents=True, exist_ok=True)
 
@@ -84,8 +85,11 @@ class SyntaxValidator(PipelineModule):
                     invalid_count += 1
 
                 if vr.needs_manual_review:
-                    flagged_count += 1
-                    self._flag_for_manual(cve_id, idx, content, lang, vr, manual_dir)
+                    if not entry.has_commits and not allow_manual_without_commit:
+                        self.logger.debug("Skipping manual flagged items for %s because it has no commits.", cve_id)
+                    else:
+                        flagged_count += 1
+                        self._flag_for_manual(cve_id, idx, content, lang, vr, manual_dir)
 
         self.logger.info(
             "Syntax Validation: %d valid, %d invalid, %d flagged for review",
