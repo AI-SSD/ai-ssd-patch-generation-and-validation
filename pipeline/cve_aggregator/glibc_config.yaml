@@ -135,6 +135,18 @@ syntax_validator:
   allow_manual_without_commit: false
 
 # ---------------------------------------------------------------------------
+# LLM PoC Repair (Module 6)
+# ---------------------------------------------------------------------------
+poc_repair:
+  api_endpoint: "http://10.3.2.171:80/api/chat"
+  model: "devstral:latest"          # faster than qwen3-coder:30b; code-repair specialized
+  max_repair_attempts: 3             # was 3; more attempts since each is now faster
+  api_timeout: 120                   # was 300; fail fast → retry sooner with varied temperature
+  temperature: 0.4                   # was 0.2; base temp – staggered upward on retries in code
+  report_path: "poc_repair_report.json"
+  manual_review_queue_path: "manual_review_queue.json"
+
+# ---------------------------------------------------------------------------
 # Output Generation
 # ---------------------------------------------------------------------------
 output:

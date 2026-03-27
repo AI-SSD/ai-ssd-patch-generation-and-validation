@@ -196,6 +196,23 @@ class SyntaxValidator(PipelineModule):
             line = out_lines[idx]
             if self._is_code_anchor_for_language(line, language):
                 continue
+
+            if language == "c":
+                stripped = line.strip()
+                indent = re.match(r"^\s*", line).group(0)
+
+                # Scraped PoCs occasionally lose the leading '#' in directives.
+                if re.match(r"^(include|define|if|ifdef|ifndef|elif|else|endif|pragma)\b", stripped):
+                    out_lines[idx] = f"{indent}#{stripped}"
+                    changed += 1
+                    continue
+
+                # Standalone numeric tokens are almost always OCR/scrape noise in C files.
+                if re.match(r"^\d+$", stripped):
+                    out_lines[idx] = f"{indent}{prefix}{stripped}"
+                    changed += 1
+                    continue
+
             if self._is_uncommented_prose_line_generic(line):
                 indent = re.match(r"^\s*", line).group(0)
                 out_lines[idx] = f"{indent}{prefix}{line[len(indent):]}"

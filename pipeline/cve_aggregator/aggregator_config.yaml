@@ -161,7 +161,32 @@ syntax_validator:
   report_path: "syntax_validation_report.json"
 
 # ---------------------------------------------------------------------------
-# Module 6: Output Generation
+# Module 6: LLM PoC Repair
+# ---------------------------------------------------------------------------
+# Attempts to auto-fix invalid PoCs using an LLM before flagging for manual
+# review.  Requires an Ollama-compatible API endpoint.
+poc_repair:
+  # Ollama-compatible chat API endpoint
+  api_endpoint: "http://10.3.2.171:80/api/chat"
+
+  # LLM model to use for repairs (must be available on the Ollama server)
+  model: "qwen2.5-coder:7b"
+
+  # Maximum number of repair attempts per PoC before flagging for manual review
+  max_repair_attempts: 3
+
+  # Timeout for each LLM API call (seconds)
+  api_timeout: 300
+
+  # Sampling temperature for the LLM
+  temperature: 0.2
+
+  # Output paths
+  report_path: "poc_repair_report.json"
+  manual_review_queue_path: "manual_review_queue.json"
+
+# ---------------------------------------------------------------------------
+# Module 7: Output Generation
 # ---------------------------------------------------------------------------
 output:
   # JSON output paths
