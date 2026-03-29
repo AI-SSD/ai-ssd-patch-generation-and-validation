@@ -239,6 +239,7 @@ class OutputGenerator(PipelineModule):
         meta = entry.metadata
 
         allow_without_commit = cfg.get("allow_poc_without_commit", False)
+        require_verified_poc = cfg.get("filtered_require_verified_poc", True)
 
         # By default, require fix commit for pipeline-ready rows.
         # When allow_poc_without_commit is enabled, keep placeholder rows so
@@ -256,8 +257,8 @@ class OutputGenerator(PipelineModule):
 
         saved_idx = 0  # sequential index for saved PoC files
         for orig_idx, exploit in enumerate(entry.exploits):
-            # Disregard unverified PoCs entirely
-            if not exploit.verified:
+            # Skip unverified PoCs when require_verified_poc is set
+            if require_verified_poc and not exploit.verified:
                 self.logger.debug("Skipping unverified PoC %d for %s", orig_idx, cve_id)
                 continue
 

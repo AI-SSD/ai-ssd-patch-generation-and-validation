@@ -1,0 +1,239 @@
+CVE AGGREGATOR – MODULE DESCRIPTIONS
+=====================================
+(Phase 0: Dataset Construction)
+
+
+--- PIPELINE ORCHESTRATOR (pipeline.py) ---
+
+The Pipeline Orchestrator is the central coordinator of the CVE Aggregator. It
+loads the YAML configuration file, initialises each pipeline module in its
+prescribed order and drives execution by passing a shared context dictionary
+sequentially through every stage. Each module reads the data it needs from the
+context, performs its transformation and writes its results back before the
+next module is invoked. The orchestrator also handles per-module timing,
+validates each module's configuration before running it and provides a
+configurable abort-on-error policy. A summary of key output statistics is
+printed upon completion. This design keeps all modules fully decoupled from
+one another: modules communicate exclusively through the context object rather
+than through direct dependencies.
+
+
+--- DATA MODELS (models.py) ---
+
+The data models file defines the shared data structures that flow between all
+pipeline stages. The central unit is CVEEntry, which aggregates a CVE's
+metadata (via CVEMetadata), its git repository state (via ProjectState) and
+its associated Proof-of-Concept exploits (via ExploitInfo). CVEMetadata
+captures CVSS scores, CWE identifiers, affected product CPE strings and NVD
+references. ProjectState holds the fix commit hash, the parent (vulnerable)
+commit hash, the list of changed source files and the full content of both
+the vulnerable and patched versions of those files, along with the extracted
+changed code units (functions and macros). ExploitInfo encapsulates all
+metadata and source code content associated with a single PoC. All models
+support serialisation to and from plain Python dictionaries, enabling
+persistence as JSON throughout the pipeline. The top-level Dataset object
+wraps the complete CVE map together with dataset metadata and aggregate
+statistics.
+
+
+--- MODULE 1: CVE FETCHER (modules/cve_fetcher.py) ---
+
+The CVE Fetcher is the first pipeline module and is responsible for retrieving
+vulnerability records from external public databases. It queries the NIST
+National Vulnerability Database (NVD) REST API using a configurable set of
+keywords, paginating through results and respecting rate-limit constraints.
+For each retrieved entry, it extracts the CVE identifier, English description,
+CVSS score and vector (preferring v3.1 over older versions), CWE weakness
+identifiers, affected product CPE strings and all NVD reference URLs. After
+fetching, the module deduplicates results and applies a relevance filter based
+on strong keywords, non-target indicators, CPE alias matching and a minimum
+publication year. Optionally, entries can be further enriched with additional
+data from the CVE.org API. The module populates the context with a list of raw
+CVE dictionaries that serve as the input for all subsequent stages.
+
+
+--- MODULE 2: COMMIT DISCOVERY (modules/commit_discovery.py) ---
+
+The Commit Discovery module searches the target project's local Git repository
+to find the fix commit associated with each CVE. It employs a multi-strategy
+search: first attempting to extract a commit hash directly from NVD reference
+URLs (e.g. GitHub or Sourceware commit links), then performing git-log searches
+for the exact CVE ID in commit messages, followed by a variant without dashes,
+a bug-tracker reference pattern (BZ#<number>) and finally any additional
+user-configured grep patterns. Once a fix commit is identified, the module
+derives the parent (pre-fix, vulnerable) commit, lists all changed files with
+their change type and retrieves the full source content of each modified
+file at both the vulnerable and patched commit. Changed code units (functions
+and macros) are then extracted and compared between the two versions using the
+code parser utility, yielding a structured, function-level diff for each
+affected file. This information is stored in the ProjectState data structure
+attached to each CVE entry.
+
+
+--- MODULE 3: PoC MAPPER (modules/poc_mapper.py) ---
+
+The PoC Mapper cross-references the collected CVEs against a local clone of the
+Exploit Database (ExploitDB) to identify existing Proof-of-Concept exploit
+scripts. It parses the ExploitDB CSV metadata files (files_exploits.csv and
+files_shellcodes.csv) to build a mapping from CVE identifiers to exploit
+entries. Whether only verified exploits or all exploits are considered is
+governed by the poc_mapper.require_verified key in the configuration file
+(default: true); setting it to false allows unverified community-contributed
+PoCs to be included as well, which can increase recall at the cost of lower
+quality assurance. For each CVE, any matching exploits are found via this
+mapping; a slower deep-search mode can additionally grep the content of all
+exploit files directly. For each matched exploit, the module reads and attaches
+the full source code. A reverse-search mode is also available: it scans the
+ExploitDB metadata and file contents for project-relevant keywords to discover
+additional CVEs not originally returned by the NVD keyword search. All PoC
+data, including language detection, ExploitDB URL and extraction status, is
+attached to each CVE entry in the shared context.
+
+
+--- MODULE 4: DATA AGGREGATOR (modules/data_aggregator.py) ---
+
+The Data Aggregator transforms the list of raw CVE dictionaries produced by
+the earlier stages into the structured Dataset/CVEEntry object model. It casts
+each raw dictionary into a typed CVEEntry (with CVEMetadata, ProjectState and
+ExploitInfo objects) and merges the result with any pre-existing dataset
+persisted from a prior pipeline run. The merging strategy is additive and
+non-destructive: richer values (e.g. a newly found fix commit) always replace
+weaker ones, CWE identifier lists are unioned and newly discovered PoCs are
+appended without removing previous ones. A configurable pruning option allows
+CVEs no longer returned by the current NVD search to be removed from the
+dataset. After merging, aggregate dataset statistics are recomputed and the
+updated Dataset object is written back into the context for downstream modules.
+
+
+--- MODULE 5: SYNTAX VALIDATOR (modules/syntax_validator.py) ---
+
+The Syntax Validator checks the source code of every PoC exploit in the
+dataset for syntactic correctness using language-native tools. C files are
+compiled in syntax-only mode with GCC; Python files are parsed with the
+standard ast module; Shell scripts are checked with bash -n; Ruby, Perl and
+PHP files are validated with their respective interpreters. The module handles
+common scraping artefacts automatically: prose-like English lines embedded in
+code are detected and commented out before re-attempting validation, missing
+preprocessor # characters are restored in C files and Python 2 syntax is
+tolerated with a warning rather than flagged as invalid. When a PoC fails
+validation and cannot be auto-corrected, it is copied to a manual_supervision/
+directory alongside a JSON report of the specific errors and flagged in the
+context for the LLM repair module. A full validation report is written to disk
+at the end of the module's run.
+
+
+--- MODULE 6: LLM PoC REPAIR (modules/poc_repair.py) ---
+
+The LLM PoC Repair module attempts to automatically fix the PoC scripts that
+failed syntax validation in Module 5, using a Large Language Model accessed
+through an Ollama-compatible API. For each invalid PoC, the module constructs
+a structured prompt that includes the programming language, a description of
+common ExploitDB scraping corruption patterns specific to that language, the
+exact error messages reported by the validator and the full PoC source code.
+The LLM is instructed to repair only the syntax errors while preserving all
+exploit logic and to output solely the corrected code without any markdown
+formatting. The repaired code is immediately re-validated using the same Module
+5 logic; if it still fails, a retry prompt is sent that additionally includes
+the failed repair attempt and the new errors, with a progressively increased
+temperature to encourage different outputs. Up to a configurable maximum number
+of attempts is made per PoC. Successfully repaired PoCs are saved to the
+exploits/ directory and the dataset and syntax results are updated in-place so
+that the downstream Output Generator treats them as valid. PoCs that cannot be
+repaired within the attempt budget are added to a manual review queue for
+human inspection.
+
+
+--- MODULE 7: OUTPUT GENERATOR (modules/output_generator.py) ---
+
+The Output Generator is the final module of the pipeline and is responsible
+for materialising all output artefacts. It produces four categories of output:
+a global JSON file containing the complete dataset for all collected CVEs; a
+filtered JSON file restricted to CVEs that have both a git fix commit and at
+least one verified, content-bearing PoC; a CSV file where each row represents
+a single (changed code unit, PoC) pair, containing the vulnerable commit hash,
+the full vulnerable file content, the vulnerable function or macro body, CWE
+descriptions, affected version and PoC metadata; and the individual PoC
+source files saved to an exploits/ directory with language-appropriate file
+extensions. PoCs that are flagged for manual review by the Syntax Validator or
+the LLM Repair module are deliberately excluded from the exploits/ directory
+until manually approved. The CSV format is designed to be directly consumable
+by the downstream AI patch generation and validation phases of the pipeline.
+
+
+=============================================================================
+UTILITY MODULES
+=============================================================================
+
+
+--- UTILITY: git_utils.py ---
+
+The git_utils module provides all low-level Git operations required by the
+Commit Discovery module. It implements repository management (cloning a remote
+repository or pulling the latest changes to an existing local clone), a
+multi-pattern commit search strategy (scanning commit messages for CVE IDs,
+bug tracker references, or custom grep patterns, as well as extracting commit
+hashes directly from NVD reference URLs), commit metadata retrieval (author,
+date, subject line), changed-file listing with rename detection, retrieval of
+file content at an arbitrary commit and identification of function names
+touched in a commit by parsing git unified diff hunk headers. All functions
+accept the repository path as an explicit argument, making them fully
+project-agnostic and independently testable.
+
+
+--- UTILITY: code_parser.py ---
+
+The code_parser module provides static analysis utilities for C source code.
+It extracts function definitions from a source file using a regular expression
+that matches common C return-type qualifiers and function signatures, followed
+by brace-depth tracking to capture the full function body. It also extracts
+non-trivial #define macros (those spanning multiple lines or containing control
+structures). A comparison utility strips C comments and normalises whitespace
+before comparing two versions of a code unit, so that purely cosmetic changes
+are ignored when determining whether a function or macro was genuinely
+modified. The primary consumer-facing function, find_changed_units, accepts the
+full content of the vulnerable and patched versions of a file and returns a
+list of code units (functions or macros) whose normalised bodies differ between
+the two versions, along with their vulnerable and patched source text.
+
+
+--- UTILITY: file_utils.py ---
+
+The file_utils module provides general-purpose file handling helpers used
+across several pipeline stages. It includes language detection from file
+extensions and from source code content heuristics (shebang lines and
+structural code patterns), file-type classification (source, header, test,
+build, documentation), binary-vs-text file detection by examining MIME type
+and byte content, safe text extraction from exploit files with size guards,
+PoC content cleaning (normalising line endings, stripping trailing whitespace),
+and a quick sanity check to reject empty or HTML-page content. These utilities
+abstract away cross-cutting concerns so that individual pipeline modules remain
+focused on their primary responsibilities.
+
+
+--- UTILITY: cwe_lookup.py ---
+
+The cwe_lookup module provides a static lookup table mapping CWE identifiers
+to their human-readable descriptions, covering the most common weakness
+categories found in C and system-level software CVEs (memory safety, integer
+errors, use-after-free, input validation, resource management, access control,
+information disclosure, cryptographic issues and denial-of-service). Two
+convenience functions are exposed: one that returns the description for a
+single CWE ID, and one that accepts a list of CWE IDs and returns a combined
+description string (separated by " | "), appending an "(unknown)" label for
+any CWE not present in the static table. This module is used by the Output
+Generator when populating the CWE_Description field of the output CSV.
+
+
+--- UTILITY: version_mapping.py ---
+
+The version_mapping module provides two mapping utilities specific to the
+glibc use case. The first maps a glibc version string to the Ubuntu Long-Term
+Support release that ships it as the default C library; when an exact match is
+not found, it falls back to the closest older Ubuntu release (i.e. the release
+on which the vulnerable glibc version would have been present). The second
+utility parses NVD CPE 2.3 strings from the affected_products metadata of a
+CVE to extract the version number(s) of the target project, optionally
+filtered by a project name prefix. Both functions are used by the Output
+Generator to populate the project_version and ubuntu_version columns of the
+output CSV, providing the downstream patch generation phase with the context
+needed to configure the correct build environment.

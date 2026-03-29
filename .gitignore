@@ -55,3 +55,5 @@ pipeline/exploit-database
 pipeline/glibc
 pipeline/exploits
 pipeline/manual_supervision
+pipeline/manual_review_queue.json
+pipeline/poc_repair_report.json

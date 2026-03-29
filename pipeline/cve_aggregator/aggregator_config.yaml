@@ -202,8 +202,11 @@ output:
   # Filter controls for the "filtered" dataset:
   # - filtered_require_commit: keep only CVEs with discovered fix commits
   # - filtered_require_poc: keep only CVEs with at least one mapped PoC
+  # - filtered_require_verified_poc: require at least one PoC flagged as
+  #   verified in ExploitDB (mirrors poc_mapper.require_verified for output)
   filtered_require_commit: true
   filtered_require_poc: true
+  filtered_require_verified_poc: true
 
   # Export PoC rows/files even when commit discovery failed.
   # Useful for PoC inventory workflows; disable for strict patch-pipeline-only mode.

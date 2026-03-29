@@ -1,37 +1,60 @@
 # =============================================================================
 # CVE Aggregator Pipeline – glibc Configuration
 # =============================================================================
+# Production configuration for the GNU C Library (glibc) project.
+# Pass to the pipeline with:
+#   python3 pipeline.py --phases 0 --phase0-config cve_aggregator/glibc_config.yaml
+# (this is also the default Phase 0 config when no --phase0-config is given)
+# =============================================================================
 
+# ---------------------------------------------------------------------------
+# Project identity (used in dataset names, logging, etc.)
+# ---------------------------------------------------------------------------
 project:
   name: "glibc"
   display_name: "GNU C Library"
   description: "CVE and PoC dataset for GNU C Library (glibc)"
 
+# ---------------------------------------------------------------------------
+# Pipeline behaviour
+# ---------------------------------------------------------------------------
 pipeline:
-  abort_on_error: false    # Continue even if one module fails
+  abort_on_error: false          # Continue even if one module fails
+  skip_modules: []
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging:
-  level: "INFO"
+  level: "INFO"                  # DEBUG | INFO | WARNING | ERROR
   format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
   file: "logs/glibc_cve_aggregator.log"
 
 # ---------------------------------------------------------------------------
-# CVE Fetching & Enrichment
+# Module 1: CVE Fetching & Enrichment
 # ---------------------------------------------------------------------------
 cve_fetcher:
+  # NVD API key – get one at https://nvd.nist.gov/developers/request-an-api-key
   nvd_api_key: "043bad81-616b-445a-8e79-96e87cc96c66"
 
+  # Keywords used for NVD keyword search.
+  # These are sent as ``keywordSearch`` to the NVD 2.0 API.
   keywords:
     - "glibc"
     - "GNU C Library"
     - "eglibc"
 
+  # Strong keywords that MUST appear in a CVE description for it to be
+  # considered relevant.  Used for deduplication filtering.
   strong_keywords:
     - "glibc"
     - "GNU C Library"
     - "GNU libc"
     - "eglibc"
 
+  # If the description contains ONLY a weak match (e.g. a generic library
+  # name), the presence of any of these strings causes the entry to be
+  # rejected.  Useful to exclude look-alike projects.
   non_target_indicators:
     # BSD variants
     - "NetBSD"
@@ -73,7 +96,9 @@ cve_fetcher:
     - "Embedthis"
     - "sudo"
 
-  # Hardening: require explicit glibc match in description and CPE metadata
+  # Hardening knobs – require explicit glibc match in description and CPE.
+  # strict_target_matching: require at least one strong keyword in description.
+  # require_project_cpe_match: require a project alias in a CPE entry.
   strict_target_matching: true
   require_project_cpe_match: false
   project_cpe_aliases:
@@ -81,83 +106,160 @@ cve_fetcher:
     - "gnu:glibc"
     - "eglibc"
 
+  # Optionally enrich each CVE with CVE.org data (slower).
   enrich_with_cve_org: false
-  cve_org_delay: 1.0
+  cve_org_delay: 1.0             # Seconds between CVE.org requests
 
-  # Exclude CVEs published before this year (fixes predate git history).
+  # Exclude CVEs published before this year (commits predate git history).
   # Set to null or remove to include all years.
   min_published_year: 1990
 
 # ---------------------------------------------------------------------------
-# Commit Discovery (glibc mirror)
+# Module 2: Commit Discovery
 # ---------------------------------------------------------------------------
 commit_discovery:
+  # Remote URL of the source repository (will be cloned if not present)
   repo_url: "https://sourceware.org/git/glibc.git"
+
+  # Local path to the cloned repository (relative to CWD or absolute)
   repo_local_path: "./glibc"
+
+  # Pull latest changes before searching?
   auto_update: true
+
+  # Additional git-grep patterns to try when searching for fix commits.
+  # The pipeline always searches for CVE-ID and CVE-ID-without-dashes.
+  # Use {cve} or {cve_num} placeholders to scope a pattern to the current CVE.
   extra_grep_patterns: []
+
+  # Optional safety knobs for commit matching:
+  # - enable_bz_fallback: tries bug-tracker numeric matching (can create false positives)
+  # - allow_unscoped_extra_patterns: if false, plain patterns without {cve}/{cve_num} are ignored
   enable_bz_fallback: true
   allow_unscoped_extra_patterns: false
+
+  # File extensions considered as "source code" for content extraction
   source_extensions:
     - ".c"
     - ".h"
 
 # ---------------------------------------------------------------------------
-# PoC Mapping & Extraction (ExploitDB)
+# Module 3: PoC Mapping & Extraction (ExploitDB)
 # ---------------------------------------------------------------------------
 poc_mapper:
+  # Local path to the ExploitDB git repository
   exploitdb_path: "./exploit-database"
+
+  # Remote URL (for auto-clone)
   exploitdb_remote_url: "https://gitlab.com/exploit-database/exploitdb.git"
+
+  # Pull latest ExploitDB data before mapping?
   auto_update: true
+
+  # Deep search: grep exploit file *contents* for CVE IDs (slower but thorough)
   deep_search: false
+
+  # Extract full source code from matched exploit files?
   extract_content: true
+
+  # Reverse search: scan ExploitDB titles/contents for your project's
+  # keywords to discover CVEs not returned by NVD keyword search.
   reverse_search: true
   enable_reverse_content_grep: false
+
+  # Only include verified exploits from ExploitDB?
+  # Set to false to also include unverified community-contributed PoCs
+  # (increases recall at the cost of lower quality assurance).
   require_verified: true
+
+  # Indicators that an exploit mentioning glibc is actually about
+  # something else (same idea as cve_fetcher.non_target_indicators).
   non_target_indicators:
     - "NetBSD"
     - "FreeBSD"
     - "musl"
 
 # ---------------------------------------------------------------------------
-# Data Aggregator
+# Module 4: Data Aggregator
 # ---------------------------------------------------------------------------
 data_aggregator:
+  # Path to the global (all-CVEs) JSON dataset
   global_json_path: "glibc_cve_poc_map.json"
+
+  # When true, remove CVEs from the persisted dataset that are not present
+  # in the current run's raw_cves set.
   prune_missing_cves: true
 
 # ---------------------------------------------------------------------------
-# Syntax Validation
+# Module 5: Syntax Validation
 # ---------------------------------------------------------------------------
 syntax_validator:
+  # Directory where invalid PoC files are copied for manual review
   manual_supervision_dir: "manual_supervision"
+
+  # Path for the JSON validation report
   report_path: "syntax_validation_report.json"
+
+  # When false, only PoCs belonging to CVEs that have an associated fix
+  # commit are flagged for manual review (avoids reviewing unreachable PoCs).
   allow_manual_without_commit: false
 
 # ---------------------------------------------------------------------------
-# LLM PoC Repair (Module 6)
+# Module 6: LLM PoC Repair
 # ---------------------------------------------------------------------------
+# Attempts to auto-fix invalid PoCs using an LLM before flagging for manual
+# review.  Requires an Ollama-compatible API endpoint.
 poc_repair:
+  # Ollama-compatible chat API endpoint
   api_endpoint: "http://10.3.2.171:80/api/chat"
-  model: "devstral:latest"          # faster than qwen3-coder:30b; code-repair specialized
-  max_repair_attempts: 3             # was 3; more attempts since each is now faster
-  api_timeout: 120                   # was 300; fail fast → retry sooner with varied temperature
-  temperature: 0.4                   # was 0.2; base temp – staggered upward on retries in code
+
+  # LLM model to use for repairs (must be available on the Ollama server).
+  # devstral is faster than qwen3-coder:30b and code-repair specialised.
+  model: "devstral:latest"
+
+  # Maximum number of repair attempts per PoC before flagging for manual review
+  max_repair_attempts: 3
+
+  # Timeout for each LLM API call (seconds).
+  # Keep low to fail fast and retry sooner with a varied temperature.
+  api_timeout: 120
+
+  # Sampling temperature for the LLM.
+  # Base temperature – the code staggers it upward on each retry.
+  temperature: 0.4
+
+  # Output paths
   report_path: "poc_repair_report.json"
   manual_review_queue_path: "manual_review_queue.json"
 
 # ---------------------------------------------------------------------------
-# Output Generation
+# Module 7: Output Generation
 # ---------------------------------------------------------------------------
 output:
+  # JSON output paths
   global_json_path: "glibc_cve_poc_map.json"
   filtered_json_path: "glibc_cve_poc_map_filtered.json"
+
+  # CSV output
   csv_path: "glibc_cve_poc_complete.csv"
+
+  # Directory for saving individual PoC exploit files
   poc_dir: "exploits"
+
+  # Filter controls for the "filtered" dataset:
+  # - filtered_require_commit: keep only CVEs with discovered fix commits
+  # - filtered_require_poc: keep only CVEs with at least one mapped PoC
+  # - filtered_require_verified_poc: require at least one PoC flagged as
+  #   verified in ExploitDB (mirrors poc_mapper.require_verified for output)
   filtered_require_commit: false
   filtered_require_poc: true
   filtered_require_verified_poc: true
+
+  # Export PoC rows/files even when commit discovery failed.
+  # Useful for PoC inventory workflows; disable for strict patch-pipeline-only mode.
   allow_poc_without_commit: false
+
+  # CSV column names (order matters)
   csv_fields:
     - "CVE"
     - "V_COMMIT"
