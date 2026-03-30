@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net" agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Safari/605.1.15" version="29.1.1">
+  <diagram name="Patch Generation Methodology v2" id="VDduRxKrPn93o8MxcdJN-v2">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1700" pageHeight="850" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Phase 0: CVE Aggregator -->
+        <mxCell id="phase0-lane" value="Phase 0: CVE Aggregator" style="swimlane;whiteSpace=wrap;html=1;startSize=30;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="40" y="40" width="260" height="340" as="geometry" />
+        </mxCell>
+        <mxCell id="phase0-step1" value="1. Fetch &amp; Enrich CVEs&#xa;(NVD + Metadata)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" parent="phase0-lane" vertex="1">
+          <mxGeometry x="30" y="50" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="phase0-step2" value="2. Discover Commits&#xa;(Fix + Vulnerable Parent)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" parent="phase0-lane" vertex="1">
+          <mxGeometry x="30" y="140" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="phase0-step3" value="3. Map PoCs &amp; Build Dataset&#xa;(JSON/CSV Outputs)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" parent="phase0-lane" vertex="1">
+          <mxGeometry x="30" y="230" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="phase0-edge1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="phase0-lane" source="phase0-step1" target="phase0-step2" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="phase0-edge2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="phase0-lane" source="phase0-step2" target="phase0-step3" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Phase 1: Vulnerability ID & Setup -->
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-98" value="Phase 1: Vulnerability ID &amp; Setup" style="swimlane;whiteSpace=wrap;html=1;startSize=30;fillColor=#dae8fc;strokeColor=#6c8ebf;" parent="1" vertex="1">
+          <mxGeometry x="340" y="40" width="260" height="340" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-99" value="1. Select Target" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" parent="m3My-Ryt-m6f_KtUKwaw-98" vertex="1">
+          <mxGeometry x="30" y="50" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-100" value="2. Establish Environments&lt;br&gt;(Test &amp; Control)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" parent="m3My-Ryt-m6f_KtUKwaw-98" vertex="1">
+          <mxGeometry x="30" y="140" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-101" value="3. Replicate Vulnerability&#xa;(Run PoC in Test Env)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" parent="m3My-Ryt-m6f_KtUKwaw-98" vertex="1">
+          <mxGeometry x="30" y="230" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-102" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="m3My-Ryt-m6f_KtUKwaw-98" source="m3My-Ryt-m6f_KtUKwaw-99" target="m3My-Ryt-m6f_KtUKwaw-100" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-103" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="m3My-Ryt-m6f_KtUKwaw-98" source="m3My-Ryt-m6f_KtUKwaw-100" target="m3My-Ryt-m6f_KtUKwaw-101" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Phase 2: Automated Patch Gen (GenAI) -->
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-104" value="Phase 2: Automated Patch Gen (GenAI)" style="swimlane;whiteSpace=wrap;html=1;startSize=30;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="640" y="40" width="260" height="340" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-105" value="1. Code Analysis &amp; Prompting&#xa;(Vuln Code + Context + PoC)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" parent="m3My-Ryt-m6f_KtUKwaw-104" vertex="1">
+          <mxGeometry x="30" y="50" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-106" value="2. Generate Patch&#xa;(LLM Inference)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" parent="m3My-Ryt-m6f_KtUKwaw-104" vertex="1">
+          <mxGeometry x="30" y="140" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-107" value="3. Extract Artifacts&#xa;(Patched Func + Helpers)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" parent="m3My-Ryt-m6f_KtUKwaw-104" vertex="1">
+          <mxGeometry x="30" y="230" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-108" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="m3My-Ryt-m6f_KtUKwaw-104" source="m3My-Ryt-m6f_KtUKwaw-105" target="m3My-Ryt-m6f_KtUKwaw-106" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-109" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="m3My-Ryt-m6f_KtUKwaw-104" source="m3My-Ryt-m6f_KtUKwaw-106" target="m3My-Ryt-m6f_KtUKwaw-107" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Phase 3: Multi-Layered Validation -->
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-110" value="Phase 3: Multi-Layered Validation" style="swimlane;whiteSpace=wrap;html=1;startSize=30;fillColor=#ffe6cc;strokeColor=#d79b00;" parent="1" vertex="1">
+          <mxGeometry x="940" y="40" width="280" height="620" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-111" value="1. Apply Patch to&#xa;Test Environment" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" parent="m3My-Ryt-m6f_KtUKwaw-110" vertex="1">
+          <mxGeometry x="40" y="50" width="200" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-112" value="Dynamic Check:&#xa;Re-run PoC/Exploit" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" parent="m3My-Ryt-m6f_KtUKwaw-110" vertex="1">
+          <mxGeometry x="40" y="130" width="200" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-113" value="PoC Fails?&lt;br&gt;(Patched)" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1" parent="m3My-Ryt-m6f_KtUKwaw-110" vertex="1">
+          <mxGeometry x="80" y="210" width="120" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-114" value="Static Check (SAST):&#xa;Scan for New Vulns" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" parent="m3My-Ryt-m6f_KtUKwaw-110" vertex="1">
+          <mxGeometry x="40" y="330" width="200" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-115" value="New Vulns?&#xa;(SAST Pass)" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1" parent="m3My-Ryt-m6f_KtUKwaw-110" vertex="1">
+          <mxGeometry x="80" y="410" width="120" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-116" value="Quality Check&#xa;(Metrics/Maintainability)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" parent="m3My-Ryt-m6f_KtUKwaw-110" vertex="1">
+          <mxGeometry x="40" y="530" width="200" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-117" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="m3My-Ryt-m6f_KtUKwaw-110" source="m3My-Ryt-m6f_KtUKwaw-111" target="m3My-Ryt-m6f_KtUKwaw-112" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-118" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="m3My-Ryt-m6f_KtUKwaw-110" source="m3My-Ryt-m6f_KtUKwaw-112" target="m3My-Ryt-m6f_KtUKwaw-113" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-119" value="Yes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="m3My-Ryt-m6f_KtUKwaw-110" source="m3My-Ryt-m6f_KtUKwaw-113" target="m3My-Ryt-m6f_KtUKwaw-114" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-120" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="m3My-Ryt-m6f_KtUKwaw-110" source="m3My-Ryt-m6f_KtUKwaw-114" target="m3My-Ryt-m6f_KtUKwaw-115" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-121" value="No" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" parent="m3My-Ryt-m6f_KtUKwaw-110" source="m3My-Ryt-m6f_KtUKwaw-115" target="m3My-Ryt-m6f_KtUKwaw-116" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Phase 4: Documentation -->
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-122" value="Phase 4: Documentation" style="swimlane;whiteSpace=wrap;html=1;startSize=30;fillColor=#e1d5e7;strokeColor=#9673a6;" parent="1" vertex="1">
+          <mxGeometry x="1260" y="40" width="260" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-123" value="Document Results&#xa;(Diffs, Rationale, Metrics)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" parent="m3My-Ryt-m6f_KtUKwaw-122" vertex="1">
+          <mxGeometry x="30" y="50" width="200" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- Inter-Phase Edges -->
+        <mxCell id="phase0-to-phase1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="phase0-step3" target="m3My-Ryt-m6f_KtUKwaw-99" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="320" y="300" />
+              <mxPoint x="320" y="120" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-124" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="m3My-Ryt-m6f_KtUKwaw-101" target="m3My-Ryt-m6f_KtUKwaw-105" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="620" y="300" />
+              <mxPoint x="620" y="120" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-125" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="m3My-Ryt-m6f_KtUKwaw-107" target="m3My-Ryt-m6f_KtUKwaw-111" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="920" y="300" />
+              <mxPoint x="920" y="115" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-126" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" parent="1" source="m3My-Ryt-m6f_KtUKwaw-116" target="m3My-Ryt-m6f_KtUKwaw-123" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1240" y="590" />
+              <mxPoint x="1240" y="115" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Feedback Loops -->
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-128" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0.5;entryY=0;dashed=1;strokeColor=#FF0000;strokeWidth=3;fontStyle=1" parent="1" source="m3My-Ryt-m6f_KtUKwaw-115" target="m3My-Ryt-m6f_KtUKwaw-105" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1230" y="490" />
+              <mxPoint x="1230" y="20" />
+              <mxPoint x="770" y="20" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-164" value="&lt;span style=&quot;font-weight: 700;&quot;&gt;Refine Prompt&lt;/span&gt;" connectable="0" vertex="1" parent="m3My-Ryt-m6f_KtUKwaw-128">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-10" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="m3My-Ryt-m6f_KtUKwaw-165" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0.5;entryY=0;dashed=1;strokeColor=#FF0000;strokeWidth=3;" parent="1" source="m3My-Ryt-m6f_KtUKwaw-113" target="m3My-Ryt-m6f_KtUKwaw-105" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1230" y="290" />
+              <mxPoint x="1230" y="20" />
+              <mxPoint x="770" y="20" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
