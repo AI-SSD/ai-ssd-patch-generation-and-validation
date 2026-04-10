@@ -6,9 +6,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dataclasses import asdict
-from .config import PipelineConfig, PHASE_SCRIPTS, DEFAULT_MODELS, MAX_RETRIES
+from .config import PipelineConfig, PHASE_SCRIPTS, DEFAULT_MODELS, MAX_RETRIES, cfg_section
 from .models import PhaseResult, PhaseStatus, PatchStatus, FeedbackLoopResult, PipelineSummary
-from .utils import print_banner, print_phase_header, print_summary_table, format_duration
+from .utils import (print_banner, print_phase_header, print_summary_table,
+                     format_duration, check_gpu_availability, prompt_gpu_action,
+                     wait_for_gpu)
 from .executor import PhaseExecutor
 from .feedback import IterativeFeedbackLoop
 
@@ -28,6 +30,8 @@ class MasterPipeline:
         self.feedback_results: List[FeedbackLoopResult] = []
         # Phase 0 state: CVEs skipped due to pending manual review
         self.skipped_cves: set = set()
+        # Resolve Phase 0 output paths from its config (project-agnostic)
+        self._phase0_outputs = config.resolve_phase0_outputs()
     
     def run(self) -> bool:
         """Run the complete pipeline with iterative feedback loop support."""
@@ -77,6 +81,19 @@ class MasterPipeline:
                 ))
                 success = False
                 continue
+
+            # GPU availability check for LLM-dependent phases (0 and 2)
+            if phase in (0, 2) and not self.config.dry_run:
+                gpu_action = self._check_gpu_before_phase(phase)
+                if gpu_action == "skip":
+                    logger.info(f"Phase {phase} skipped by user (GPU unavailable).")
+                    self.results.append(PhaseResult(
+                        phase=phase,
+                        name=self._get_phase_name(phase),
+                        status=PhaseStatus.SKIPPED,
+                        error_message="Skipped by user — GPU unavailable"
+                    ))
+                    continue
             
             # Execute phase
             result = self.executor.execute_phase(phase)
@@ -128,13 +145,13 @@ class MasterPipeline:
     
     def _wait_for_manual_verification(self):
         """
-        After Phase 0, check glibc_cve_poc_complete.csv for rows needing
+        After Phase 0, check the Phase 0 CSV output for rows needing
         manual verification. Present an interactive console menu to the user
         so they can approve all, exclude specific CVEs, or wait.
-        
+
         Also checks for marker files in pipeline/manual_supervision/{CVE}.ok
         """
-        csv_path = self.config.base_dir / "glibc_cve_poc_complete.csv"
+        csv_path = self._phase0_outputs["csv_path"]
         if not csv_path.exists():
             logger.warning("Phase 0 CSV output not found, skipping manual verification wait")
             return
@@ -389,7 +406,16 @@ class MasterPipeline:
             print(f"No syntax report found for {cve}")
     
     def _approve_cves(self, csv_path: Path, cves: List[str]):
-        """Mark the given CVEs as manually verified in the CSV."""
+        """Mark the given CVEs as manually verified in the CSV,
+        copy their PoC files from manual_supervision/ into exploits/,
+        and clean up the manual_supervision/ directory."""
+        import shutil as _shutil
+
+        supervision_dir = self.config.base_dir / "manual_supervision"
+        exploits_dir = self.config.base_dir / "exploits"
+        exploits_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Update CSV
         try:
             rows = []
             with open(csv_path, 'r', encoding='utf-8') as f:
@@ -403,12 +429,37 @@ class MasterPipeline:
             
             temp_path = csv_path.parent / f".{csv_path.name}.tmp"
             with open(temp_path, 'w', encoding='utf-8', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+                writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL,
+                                        extrasaction='ignore')
                 writer.writeheader()
                 writer.writerows(rows)
             temp_path.replace(csv_path)
         except Exception as e:
             logger.error(f"Error approving CVEs in CSV: {e}")
+
+        # 2. Copy PoC files from manual_supervision/ → exploits/ and clean up
+        if supervision_dir.exists():
+            for cve_id in cves:
+                # Find PoC source files (not .json, not .txt reports, not .ok markers)
+                for src_file in sorted(supervision_dir.glob(f"{cve_id}_*")):
+                    if src_file.suffix in ('.json', '.txt', '.ok'):
+                        continue  # skip metadata / reports / markers
+                    # Copy to exploits/ using the CVE name (strip the _N index)
+                    dest = exploits_dir / src_file.name
+                    if not dest.exists():
+                        try:
+                            _shutil.copy2(src_file, dest)
+                            logger.info(f"Copied approved PoC to exploits: {dest.name}")
+                        except OSError as exc:
+                            logger.warning(f"Failed to copy {src_file.name} to exploits/: {exc}")
+
+                # Remove ALL files for this CVE from manual_supervision/
+                for stale in supervision_dir.glob(f"{cve_id}*"):
+                    try:
+                        stale.unlink()
+                        logger.debug(f"Cleaned up manual_supervision/{stale.name}")
+                    except OSError as exc:
+                        logger.warning(f"Could not remove {stale.name}: {exc}")
     
     def _get_pending_manual_cves(self, csv_path: Path) -> List[str]:
         """Read CSV and return CVE IDs where manual_review_required=True and manual_verified!=done."""
@@ -647,7 +698,10 @@ RECOMMENDED ACTIONS:
         report_path.write_text(report, encoding='utf-8')
     
     def _check_marker_files(self, csv_path: Path):
-        """Check for .ok marker files in manual_supervision/ and update CSV."""
+        """Check for .ok marker files in manual_supervision/ and update CSV.
+        Also copies PoC files to exploits/ and cleans up manual_supervision/."""
+        import shutil as _shutil
+
         marker_dir = self.config.base_dir / "manual_supervision"
         if not marker_dir.exists():
             return
@@ -659,6 +713,9 @@ RECOMMENDED ACTIONS:
         
         if not updated_cves:
             return
+
+        exploits_dir = self.config.base_dir / "exploits"
+        exploits_dir.mkdir(parents=True, exist_ok=True)
         
         # Update CSV to mark these CVEs as verified
         try:
@@ -676,12 +733,34 @@ RECOMMENDED ACTIONS:
             # Atomic write back
             temp_path = csv_path.parent / f".{csv_path.name}.tmp"
             with open(temp_path, 'w', encoding='utf-8', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+                writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL,
+                                        extrasaction='ignore')
                 writer.writeheader()
                 writer.writerows(rows)
             temp_path.replace(csv_path)
         except Exception as e:
             logger.error(f"Error updating CSV from marker files: {e}")
+
+        # Copy PoC files to exploits/ and clean up manual_supervision/
+        for cve_id in updated_cves:
+            for src_file in sorted(marker_dir.glob(f"{cve_id}_*")):
+                if src_file.suffix in ('.json', '.txt', '.ok'):
+                    continue
+                dest = exploits_dir / src_file.name
+                if not dest.exists():
+                    try:
+                        _shutil.copy2(src_file, dest)
+                        logger.info(f"Copied marker-approved PoC to exploits: {dest.name}")
+                    except OSError as exc:
+                        logger.warning(f"Failed to copy {src_file.name} to exploits/: {exc}")
+
+            # Remove ALL files for this CVE from manual_supervision/
+            for stale in marker_dir.glob(f"{cve_id}*"):
+                try:
+                    stale.unlink()
+                    logger.debug(f"Cleaned up manual_supervision/{stale.name}")
+                except OSError as exc:
+                    logger.warning(f"Could not remove {stale.name}: {exc}")
     
     def _run_feedback_loop(self):
         """
@@ -1014,34 +1093,40 @@ RECOMMENDED ACTIONS:
     def _check_llm_api_health(self) -> bool:
         """Check if the LLM API is accessible before starting Phase 2."""
         import requests
-        
-        # Get API endpoint from config or use default
-        api_endpoint = "http://10.3.2.171:80/api/chat"
+
+        llm_cfg = cfg_section("llm", self.config.base_dir)
+        hc_cfg = llm_cfg.get("health_check", {}) if isinstance(llm_cfg.get("health_check"), dict) else {}
+
+        api_endpoint = str(llm_cfg.get("endpoint", "http://localhost:11434/api/chat"))
+        hc_timeout = int(hc_cfg.get("timeout", 60))
+        hc_num_predict = int(hc_cfg.get("num_predict", 5))
+
+        # Use the first configured model for the health check probe
+        models = llm_cfg.get("models", [])
+        test_model = str(models[0]) if models else "qwen2.5-coder:1.5b"
         
         try:
-            # Test with a minimal request
             test_payload = {
-                "model": "qwen2.5-coder:1.5b",
+                "model": test_model,
                 "messages": [{"role": "user", "content": "Hello"}],
                 "stream": False,
-                "options": {"num_predict": 5}  # Minimal response
+                "options": {"num_predict": hc_num_predict}
             }
             
             logger.info(f"Testing connection to {api_endpoint}...")
             response = requests.post(
                 api_endpoint,
                 json=test_payload,
-                timeout=60  # 60 second timeout for health check
+                timeout=hc_timeout
             )
             
             if response.status_code == 200:
-                # Verify we got a valid response
                 data = response.json()
                 if "message" in data or "response" in data:
                     return True
                 else:
                     logger.warning(f"API returned unexpected format: {data.keys()}")
-                    return True  # Still accessible, might work
+                    return True
             else:
                 logger.error(f"API returned status {response.status_code}: {response.text[:200]}")
                 return False
@@ -1068,7 +1153,7 @@ RECOMMENDED ACTIONS:
         elif phase == 1:
             # Phase 1 needs Phase 0 CSV output if Phase 0 was run
             if 0 in self.config.phases:
-                csv_file = self.config.base_dir / "glibc_cve_poc_complete.csv"
+                csv_file = self._phase0_outputs["csv_path"]
                 if not csv_file.exists():
                     logger.error(f"Phase 0 CSV output not found: {csv_file}")
                     logger.error("Phase 0 likely failed to find any PoC exploits.")
@@ -1177,7 +1262,46 @@ RECOMMENDED ACTIONS:
             return True
         
         return True
-    
+
+    # ------------------------------------------------------------------
+    # GPU availability gate for LLM-dependent phases
+    # ------------------------------------------------------------------
+
+    def _resolve_llm_endpoint(self) -> str:
+        """Return the LLM API endpoint from config.yaml."""
+        llm_cfg = cfg_section("llm", self.config.base_dir)
+        return str(llm_cfg.get("endpoint", "http://localhost:11434/api/chat"))
+
+    def _check_gpu_before_phase(self, phase: int) -> str:
+        """Check GPU availability before an LLM-dependent phase.
+
+        Returns ``"proceed"`` (GPU is free or user chose to continue),
+        or ``"skip"`` (user chose to skip the phase).
+        """
+        endpoint = self._resolve_llm_endpoint()
+        free, detail = check_gpu_availability(endpoint)
+
+        if free:
+            return "proceed"
+
+        phase_name = self._get_phase_name(phase)
+        action = prompt_gpu_action(phase_name, detail)
+
+        if action == "wait":
+            logger.info("Waiting for GPU to become available …")
+            gpu_ready = wait_for_gpu(endpoint, poll_interval=30, timeout=0)
+            if gpu_ready:
+                return "proceed"
+            # Should not reach here (timeout=0 means infinite), but just in case
+            return "skip"
+        elif action == "skip":
+            return "skip"
+        else:  # "continue"
+            logger.warning(
+                "Proceeding with Phase %d on CPU — inference will be slow.", phase
+            )
+            return "proceed"
+
     def _get_phase_name(self, phase: int) -> str:
         """Get human-readable phase name."""
         names = {

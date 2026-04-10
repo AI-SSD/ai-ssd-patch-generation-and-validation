@@ -2,7 +2,9 @@ import sys
 import argparse
 import logging
 from pathlib import Path
-from .config import BASE_DIR, DEFAULT_MODELS, MAX_RETRIES, MANUAL_VERIFY_TIMEOUT, MANUAL_VERIFY_POLL_INTERVAL, PHASE_SCRIPTS, PipelineConfig
+from .config import (BASE_DIR, DEFAULT_MODELS, MAX_RETRIES,
+                     MANUAL_VERIFY_TIMEOUT, MANUAL_VERIFY_POLL_INTERVAL,
+                     PHASE_SCRIPTS, PipelineConfig, get_config)
 from .utils import setup_logging, print_banner
 from .orchestrator import MasterPipeline
 
@@ -74,25 +76,26 @@ Examples:
         help='Phases to execute (0=Aggregation, 1=Reproduction, 2=Generation, 3=Validation, 4=Reporting)'
     )
     
+    _cfg = get_config()
     parser.add_argument(
         '--phase0-config',
         type=str,
-        default="cve_aggregator/glibc_config.yaml",
-        help='Path to Phase 0 config file (relative to base-dir or absolute) (default: cve_aggregator/glibc_config.yaml)'
+        default=str(_cfg.get('phase0_config', 'cve_aggregator/glibc_config.yaml')),
+        help='Path to Phase 0 config file (relative to base-dir or absolute)'
     )
     
     parser.add_argument(
         '--build-timeout',
         type=int,
-        default=7200,
-        help='Docker build timeout in seconds (default: 7200)'
+        default=int(_cfg.get('build_timeout', 3600)),
+        help='Docker build timeout in seconds (default: from config.yaml)'
     )
     
     parser.add_argument(
         '--run-timeout',
         type=int,
-        default=300,
-        help='Container run timeout in seconds (default: 300)'
+        default=int(_cfg.get('run_timeout', 300)),
+        help='Container run timeout in seconds (default: from config.yaml)'
     )
     
     parser.add_argument(

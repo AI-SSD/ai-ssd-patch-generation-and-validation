@@ -36,20 +36,73 @@ except ImportError:
 # =============================================================================
 # Configuration and Constants
 # =============================================================================
+# All project-specific values are loaded from the Phase 0 YAML config file at
+# runtime (via --phase0-config).  The constants below are safe defaults used
+# only when the config file is absent or a key is missing.
+# =============================================================================
 
-# Local path to the glibc git repository
-GLIBC_LOCAL_PATH = Path(__file__).parent / "glibc"
-GLIBC_REMOTE_URL = "https://github.com/bminor/glibc.git"
+# Safe fallback defaults – overridden by _load_phase0_config() at startup
+_DEFAULT_PROJECT_REPO_LOCAL_PATH = "project_repo"
+_DEFAULT_PROJECT_REPO_REMOTE_URL = ""
+_DEFAULT_IMAGE_MANIFEST_PATH = "results/image_manifest.json"
+_DEFAULT_BASE_IMAGE_PREFIX = "ai-ssd/project-base"
+_DEFAULT_CVE_IMAGE_PREFIX = "ai-ssd/project-cve"
+_DEFAULT_SOURCE_DIR_NAME = "project-src"
+_DEFAULT_BUILD_DIR_NAME = "project-build"
+_DEFAULT_INSTALL_PREFIX = "/opt/project-build"
+_DEFAULT_DOCKER_PLATFORM = "linux/amd64"
+_DEFAULT_COMMIT_ERA_MAP: dict = {}
 
-# Phase 0 CSV output path
-PHASE0_CSV_PATH = Path(__file__).parent / "glibc_cve_poc_complete.csv"
 
-# Image manifest output path
-IMAGE_MANIFEST_PATH = Path(__file__).parent / "image_manifest.json"
+def _load_phase0_config(config_path: Optional[Path]) -> dict:
+    """Load a Phase 0 YAML config file and return its contents as a dict.
 
-# Docker image tag prefixes
-BASE_IMAGE_PREFIX = "ai-ssd/glibc-base"
-CVE_IMAGE_PREFIX = "ai-ssd/glibc-cve"
+    Returns an empty dict when the file is absent or unparseable.
+    """
+    if config_path is None or not config_path.exists():
+        return {}
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh) or {}
+    except Exception:
+        return {}
+
+
+def _resolve_phase1_settings(cfg: dict, base_dir: Path) -> dict:
+    """Extract Phase 1 settings from the loaded Phase 0 config dict.
+
+    Always returns a complete dict—missing keys fall back to safe defaults so
+    that orchestrator.py works even without a ``phase1:`` section in the YAML.
+    """
+    p1 = cfg.get("phase1", {}) or {}
+    output = cfg.get("output", {}) or {}
+
+    # CSV path: prefer output.csv_path from the same config the executor uses
+    csv_rel = output.get("csv_path", "cve_poc_complete.csv")
+    csv_path = base_dir / csv_rel if not Path(csv_rel).is_absolute() else Path(csv_rel)
+
+    repo_rel = p1.get("project_repo_local_path", _DEFAULT_PROJECT_REPO_LOCAL_PATH)
+    repo_path = base_dir / repo_rel if not Path(repo_rel).is_absolute() else Path(repo_rel)
+
+    manifest_rel = p1.get("image_manifest_path", _DEFAULT_IMAGE_MANIFEST_PATH)
+    manifest_path = (
+        base_dir / manifest_rel if not Path(manifest_rel).is_absolute() else Path(manifest_rel)
+    )
+
+    return {
+        "project_repo_path": repo_path,
+        "project_repo_remote_url": p1.get("project_repo_remote_url", _DEFAULT_PROJECT_REPO_REMOTE_URL),
+        "base_image_prefix": p1.get("docker_base_image_prefix", _DEFAULT_BASE_IMAGE_PREFIX),
+        "cve_image_prefix": p1.get("docker_cve_image_prefix", _DEFAULT_CVE_IMAGE_PREFIX),
+        "image_manifest_path": manifest_path,
+        "source_dir_name": p1.get("source_dir_name", _DEFAULT_SOURCE_DIR_NAME),
+        "build_dir_name": p1.get("build_dir_name", _DEFAULT_BUILD_DIR_NAME),
+        "install_prefix": p1.get("install_prefix", _DEFAULT_INSTALL_PREFIX),
+        "commit_era_map": p1.get("commit_era_map", _DEFAULT_COMMIT_ERA_MAP) or {},
+        "docker_platform": p1.get("docker_platform", _DEFAULT_DOCKER_PLATFORM) or None,
+        "csv_path": csv_path,
+    }
 
 # Ubuntu codename to version mapping (reverse lookup)
 UBUNTU_CODENAME_TO_VERSION = {
@@ -61,19 +114,6 @@ UBUNTU_CODENAME_TO_VERSION = {
     "xenial": "16.04", "wily": "15.10", "vivid": "15.04",
     "utopic": "14.10", "trusty": "14.04", "saucy": "13.10",
     "raring": "13.04", "quantal": "12.10", "precise": "12.04",
-}
-
-# glibc version to ubuntu version mapping (for fallback)
-GLIBC_TO_UBUNTU_MAP = {
-    "2.39": "24.04", "2.38": "23.10", "2.37": "23.04",
-    "2.35": "22.04", "2.34": "21.10", "2.33": "21.04",
-    "2.32": "20.10", "2.31": "20.04", "2.30": "19.10",
-    "2.29": "19.04", "2.28": "18.10", "2.27": "18.04",
-    "2.26": "17.10", "2.24": "17.04", "2.23": "16.04",
-    "2.21": "15.04", "2.19": "14.04", "2.17": "13.04",
-    "2.15": "12.04", "2.13": "11.04", "2.12": "10.10",
-    "2.11": "10.04", "2.10": "9.10", "2.9": "9.04",
-    "2.8": "8.10", "2.7": "8.04",
 }
 
 # Fallback for Ubuntu versions no longer available on Docker Hub
@@ -121,30 +161,12 @@ UBUNTU_FALLBACK_MAP = {
     "23.10": "24.04",
 }
 
-# Maps commit year ranges to the most compatible Ubuntu version for building glibc.
-# Key insight: old glibc code MUST be built with an era-appropriate GCC.
-# The Ubuntu version determines the GCC version available.
-GLIBC_COMMIT_ERA_MAP = {
-    # commit_year -> (ubuntu_version, gcc_version_approx, notes)
-    # glibc commits from 2000-2006: need GCC 4.x, Ubuntu 12.04 has GCC 4.6
-    2000: "14.04", 2001: "14.04", 2002: "14.04", 2003: "14.04",
-    2004: "14.04", 2005: "14.04", 2006: "14.04",
-    # glibc commits from 2007-2011: GCC 4.6-4.8 era
-    2007: "14.04", 2008: "14.04", 2009: "14.04",
-    2010: "14.04", 2011: "14.04",
-    # glibc commits from 2012-2014: GCC 4.8 (Ubuntu 14.04)
-    2012: "14.04", 2013: "14.04", 2014: "14.04",
-    # glibc commits from 2015-2016: GCC 5.x (Ubuntu 16.04)
-    2015: "16.04", 2016: "16.04",
-    # glibc commits from 2017-2018: GCC 7.x (Ubuntu 18.04)
-    2017: "18.04", 2018: "18.04",
-    # glibc commits from 2019-2020: GCC 9.x (Ubuntu 20.04)
-    2019: "20.04", 2020: "20.04",
-    # glibc commits from 2021-2022: GCC 11.x (Ubuntu 22.04)
-    2021: "22.04", 2022: "22.04",
-    # glibc commits from 2023+: GCC 13.x (Ubuntu 24.04)
-    2023: "24.04", 2024: "24.04", 2025: "24.04", 2026: "24.04",
-}
+# Commit-year → Ubuntu-version era map.
+# Populated at startup from _resolve_phase1_settings(); kept as a module-level
+# variable so that resolve_build_ubuntu_version() can access it without needing
+# the full settings dict threaded through every call.
+# The actual values are project-specific and come from glibc_config.yaml phase1.commit_era_map.
+_COMMIT_ERA_MAP: dict = {}
 
 # EOL Ubuntu versions that need APT sources redirected to old-releases.ubuntu.com
 EOL_UBUNTU_VERSIONS = {
@@ -162,42 +184,17 @@ EXTENSION_TO_LANGUAGE = {
     '.sh': 'shell', '.php': 'php', '.txt': 'text',
 }
 
-# Mapping of commit dates to appropriate Ubuntu/Debian versions
-# Old glibc code requires older compilers to build successfully
-COMMIT_OS_MAPPING = {
-    # Commits from 2012-2014: Use Ubuntu 14.04 (GCC 4.8)
-    "2012": "ubuntu:14.04",
-    "2013": "ubuntu:14.04", 
-    "2014": "ubuntu:14.04",
-    # Commits from 2015-2016: Use Ubuntu 16.04 (GCC 5.x)
-    "2015": "ubuntu:16.04",
-    "2016": "ubuntu:16.04",
-    # Commits from 2017-2018: Use Ubuntu 18.04 (GCC 7.x)
-    "2017": "ubuntu:18.04",
-    "2018": "ubuntu:18.04",
-    # Default fallback
-    "default": "ubuntu:16.04"
-}
 
-# Known CVE to approximate commit year mapping
-# Used when git history is not available
-CVE_YEAR_HINTS = {
-    "CVE-2012-3480": "2012",
-    "CVE-2014-5119": "2014",
-    "CVE-2015-7547": "2015",
-}
-
-
-def get_commit_year(glibc_repo_path: Path, commit_hash: str, logger: logging.Logger = None) -> Optional[int]:
-    """Get the year a commit was made by querying the glibc git repo.
+def get_commit_year(project_repo_path: Path, commit_hash: str, logger: logging.Logger = None) -> Optional[int]:
+    """Get the year a commit was made by querying the project git repo.
     
     Returns the commit year as an integer, or None if it cannot be determined.
     """
-    if not glibc_repo_path or not (glibc_repo_path / ".git").exists():
+    if not project_repo_path or not (project_repo_path / ".git").exists():
         return None
     try:
         result = subprocess.run(
-            ["git", "-C", str(glibc_repo_path), "log", "-1", "--format=%ci", commit_hash],
+            ["git", "-C", str(project_repo_path), "log", "-1", "--format=%ci", commit_hash],
             capture_output=True, text=True, timeout=30
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -213,58 +210,62 @@ def get_commit_year(glibc_repo_path: Path, commit_hash: str, logger: logging.Log
 
 
 def resolve_build_ubuntu_version(vuln_ubuntu_version: str, commit_hash: str,
-                                  glibc_repo_path: Path, cve: str,
-                                  logger: logging.Logger) -> str:
-    """Determine the best Ubuntu version for building a specific glibc commit.
-    
-    The CSV-provided ubuntu_version reflects which Ubuntu ships the vulnerable glibc,
-    but building old glibc from source requires an era-appropriate compiler. This function
-    resolves that mismatch by consulting the actual commit date.
-    
+                                  project_repo_path: Path, cve: str,
+                                  logger: logging.Logger,
+                                  commit_era_map: dict = None) -> str:
+    """Determine the best Ubuntu version for building a specific project commit.
+
+    The CSV-provided ubuntu_version reflects which Ubuntu ships the vulnerable
+    release, but building old code from source requires an era-appropriate
+    compiler.  This function resolves that mismatch by consulting the actual
+    commit date and a caller-supplied commit_era_map.
+
     Strategy:
     1. Get the commit year from git history
-    2. Look up the era-appropriate Ubuntu version from GLIBC_COMMIT_ERA_MAP
-    3. If we can't determine the commit year, fall back to CVE year heuristic
-    4. Apply UBUNTU_FALLBACK_MAP if the resolved version isn't available on Docker Hub
+    2. Look up the era-appropriate Ubuntu version from commit_era_map
+    3. If the commit year is unknown, fall back to the CVE year as a proxy
+    4. Apply UBUNTU_FALLBACK_MAP if the resolved version is unavailable on Docker Hub
     """
+    era_map = commit_era_map if commit_era_map is not None else _COMMIT_ERA_MAP
+
+    # Short-circuit: no era map configured → use CSV value as-is
+    if not era_map:
+        return vuln_ubuntu_version
+
     # Step 1: Try to get commit year from git
-    commit_year = get_commit_year(glibc_repo_path, commit_hash, logger)
-    
+    commit_year = get_commit_year(project_repo_path, commit_hash, logger)
+
     # Step 2: Fallback - extract year from CVE ID
     if commit_year is None:
         try:
             parts = cve.split('-')
             if len(parts) >= 2:
                 cve_year = int(parts[1][:4])
-                # CVE year is usually close to commit year, but can lag.
-                # Use it as a reasonable approximation.
                 commit_year = cve_year
                 logger.debug(f"Using CVE year {cve_year} as commit year proxy for {cve}")
         except (IndexError, ValueError):
             pass
-    
+
     if commit_year is None:
-        # Can't determine era; return the original version unchanged
         logger.warning(f"{cve}: Cannot determine commit era, using CSV ubuntu_version={vuln_ubuntu_version}")
         return vuln_ubuntu_version
-    
+
     # Step 3: Map commit year to era-appropriate Ubuntu version
-    era_ubuntu = GLIBC_COMMIT_ERA_MAP.get(commit_year)
+    era_ubuntu = era_map.get(commit_year)
     if era_ubuntu is None:
-        # Year not in map; clamp to known range
-        if commit_year < 2000:
-            era_ubuntu = "14.04"
+        if commit_year < min(era_map):
+            era_ubuntu = era_map[min(era_map)]
         else:
-            era_ubuntu = "24.04"
-    
+            era_ubuntu = era_map[max(era_map)]
+
     # Step 4: Apply Docker Hub availability fallback
     if era_ubuntu in UBUNTU_FALLBACK_MAP:
         era_ubuntu = UBUNTU_FALLBACK_MAP[era_ubuntu]
-    
+
     if era_ubuntu != vuln_ubuntu_version:
         logger.info(f"  {cve}: Overriding build Ubuntu {vuln_ubuntu_version} -> {era_ubuntu} "
-                     f"(commit year {commit_year}, toolchain compatibility)")
-    
+                    f"(commit year {commit_year}, toolchain compatibility)")
+
     return era_ubuntu
 
 
@@ -288,31 +289,34 @@ class VulnerabilityInfo:
     # Phase 0 fields
     ubuntu_version: str = ""
     ubuntu_codename: str = ""
-    glibc_version: str = ""
+    project_version_normalized: str = ""
     poc_path: str = ""
     poc_language: str = ""
-    
+    # Docker image prefix (set by Phase0CSVParser from project config)
+    _base_image_prefix: str = "ai-ssd/project-base"
+    _cve_image_prefix: str = "ai-ssd/project-cve"
+
     @property
     def short_commit(self) -> str:
         return self.commit_hash[:12]
-    
+
     @property
     def container_name(self) -> str:
-        return f"glibc-{self.cve.lower()}-{self.short_commit}"
-    
+        return f"{self.cve.lower()}-{self.short_commit}"
+
     @property
     def image_name(self) -> str:
-        return f"glibc-vuln/{self.cve.lower()}:latest"
-    
+        return f"vuln/{self.cve.lower()}:latest"
+
     @property
     def base_image_tag(self) -> str:
         """Tag for the reusable base image for this CVE's ubuntu version."""
-        return f"{BASE_IMAGE_PREFIX}:ubuntu-{self.ubuntu_version}"
-    
+        return f"{self._base_image_prefix}:ubuntu-{self.ubuntu_version}"
+
     @property
     def cve_image_tag(self) -> str:
         """Tag for the CVE-specific derived image."""
-        return f"{CVE_IMAGE_PREFIX}:{self.cve}-{self.ubuntu_version}"
+        return f"{self._cve_image_prefix}:{self.cve}-{self.ubuntu_version}"
 
 
 @dataclass
@@ -377,42 +381,49 @@ def setup_logging(log_dir: Path, verbose: bool = False) -> logging.Logger:
 # =============================================================================
 
 class Phase0CSVParser:
-    """Parses glibc_cve_poc_complete.csv produced by Phase 0 (glibc_cve_aggregator)"""
-    
-    def __init__(self, csv_path: Path, logger: logging.Logger, skipped_cves: List[str] = None,
-                 glibc_repo_path: Path = None):
+    """Parses the Phase 0 CSV output produced by the CVE aggregator."""
+
+    def __init__(self, csv_path: Path, logger: logging.Logger,
+                 skipped_cves: List[str] = None,
+                 project_repo_path: Path = None,
+                 base_image_prefix: str = "ai-ssd/project-base",
+                 cve_image_prefix: str = "ai-ssd/project-cve",
+                 commit_era_map: dict = None):
         self.csv_path = csv_path
         self.logger = logger
         self.skipped_cves = set(skipped_cves or [])
-        self.glibc_repo_path = glibc_repo_path
-    
+        self.project_repo_path = project_repo_path
+        self.base_image_prefix = base_image_prefix
+        self.cve_image_prefix = cve_image_prefix
+        self.commit_era_map = commit_era_map if commit_era_map is not None else {}
+
     def parse(self) -> List[VulnerabilityInfo]:
         """Parse Phase 0 CSV and return list of VulnerabilityInfo objects."""
         vulnerabilities = []
         seen_cves = set()
         skipped_manual = 0
         skipped_no_ubuntu = 0
-        
+
         self.logger.info(f"Parsing Phase 0 CSV: {self.csv_path}")
-        
+
         if not self.csv_path.exists():
             raise FileNotFoundError(f"Phase 0 CSV not found: {self.csv_path}")
-        
+
         with open(self.csv_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
-            
+
             for row in reader:
                 cve = row.get('CVE', '').strip()
                 if not cve or cve in seen_cves:
                     continue
                 seen_cves.add(cve)
-                
+
                 # Skip CVEs excluded by pipeline (manual review timeout)
                 if cve in self.skipped_cves:
                     skipped_manual += 1
                     self.logger.info(f"Skipping {cve} (pending manual verification)")
                     continue
-                
+
                 # Skip CVEs still pending manual review
                 manual_required = str(row.get('manual_review_required', '')).strip().lower()
                 manual_verified = str(row.get('manual_verified', '')).strip().lower()
@@ -420,40 +431,65 @@ class Phase0CSVParser:
                     skipped_manual += 1
                     self.logger.info(f"Skipping {cve} (manual_review_required=True, manual_verified={manual_verified})")
                     continue
-                
-                # Resolve ubuntu_version
+
+                # Resolve ubuntu_version — Phase 0 should always populate this.
+                # Fall back to ubuntu_codename lookup only as a safety net.
                 ubuntu_version = row.get('ubuntu_version', '').strip()
                 ubuntu_codename = row.get('ubuntu_codename', '').strip()
-                glibc_version = row.get('glibc_version', '').strip()
-                
+                project_version_normalized = row.get('project_version_normalized', '').strip()
+
                 if not ubuntu_version or ubuntu_version == 'unknown':
-                    # Fallback: try codename
+                    # Fallback 1: try Ubuntu codename (generic Ubuntu mapping)
                     if ubuntu_codename and ubuntu_codename in UBUNTU_CODENAME_TO_VERSION:
                         ubuntu_version = UBUNTU_CODENAME_TO_VERSION[ubuntu_codename]
-                    elif glibc_version and glibc_version in GLIBC_TO_UBUNTU_MAP:
-                        ubuntu_version = GLIBC_TO_UBUNTU_MAP[glibc_version]
                     else:
-                        skipped_no_ubuntu += 1
-                        self.logger.warning(f"Skipping {cve}: no ubuntu_version, codename, or glibc_version")
-                        continue
-                
+                        # Fallback 2: infer from commit year via commit_era_map
+                        commit_hash_fb = row.get('V_COMMIT', '').strip()
+                        inferred = None
+                        if commit_hash_fb and self.project_repo_path and self.commit_era_map:
+                            year = get_commit_year(self.project_repo_path, commit_hash_fb, self.logger)
+                            if year is None:
+                                # Try CVE year as last resort
+                                try:
+                                    year = int(cve.split('-')[1][:4])
+                                except (IndexError, ValueError):
+                                    pass
+                            if year is not None:
+                                inferred = self.commit_era_map.get(year)
+                                if inferred is None and self.commit_era_map:
+                                    if year < min(self.commit_era_map):
+                                        inferred = self.commit_era_map[min(self.commit_era_map)]
+                                    else:
+                                        inferred = self.commit_era_map[max(self.commit_era_map)]
+                        if inferred:
+                            ubuntu_version = inferred
+                            self.logger.info(f"  {cve}: ubuntu_version inferred as {ubuntu_version} "
+                                             f"from commit era (project_version_normalized was empty)")
+                        else:
+                            skipped_no_ubuntu += 1
+                            self.logger.warning(f"Skipping {cve}: ubuntu_version missing from CSV "
+                                                f"(project_version_normalized={project_version_normalized!r}). "
+                                                f"Ensure Phase 0 version mapping covers this project version.")
+                            continue
+
                 # Apply fallback for Ubuntu versions no longer on Docker Hub
                 if ubuntu_version in UBUNTU_FALLBACK_MAP:
                     original_version = ubuntu_version
                     ubuntu_version = UBUNTU_FALLBACK_MAP[ubuntu_version]
                     self.logger.info(f"  {cve}: Ubuntu {original_version} unavailable on Docker Hub, "
                                      f"falling back to {ubuntu_version}")
-                
-                # Resolve the best Ubuntu version for BUILDING this glibc commit
-                # The CSV ubuntu_version reflects which Ubuntu ships the vuln, but building
-                # old glibc from source needs an era-appropriate compiler toolchain.
+
+                # Resolve the best Ubuntu version for BUILDING this project's commit.
+                # The CSV ubuntu_version reflects which Ubuntu ships the vulnerable release,
+                # but building old code from source needs an era-appropriate compiler toolchain.
                 commit_hash = row.get('V_COMMIT', '').strip()
-                if commit_hash and self.glibc_repo_path:
+                if commit_hash and self.project_repo_path:
                     build_ubuntu = resolve_build_ubuntu_version(
-                        ubuntu_version, commit_hash, self.glibc_repo_path, cve, self.logger
+                        ubuntu_version, commit_hash, self.project_repo_path, cve,
+                        self.logger, commit_era_map=self.commit_era_map
                     )
                     ubuntu_version = build_ubuntu
-                
+
                 vuln = VulnerabilityInfo(
                     cve=cve,
                     commit_hash=row.get('V_COMMIT', '').strip(),
@@ -462,14 +498,16 @@ class Phase0CSVParser:
                     unit_type=row.get('UNIT_TYPE', '').strip(),
                     ubuntu_version=ubuntu_version,
                     ubuntu_codename=ubuntu_codename,
-                    glibc_version=glibc_version,
+                    project_version_normalized=project_version_normalized,
                     poc_path=row.get('poc_path', '').strip(),
                     poc_language=row.get('poc_language', '').strip(),
+                    _base_image_prefix=self.base_image_prefix,
+                    _cve_image_prefix=self.cve_image_prefix,
                 )
-                
+
                 self.logger.debug(f"Phase0 CVE: {vuln.cve} ubuntu={ubuntu_version} commit={vuln.short_commit}")
                 vulnerabilities.append(vuln)
-        
+
         self.logger.info(f"Parsed {len(vulnerabilities)} CVEs from Phase 0 CSV")
         if skipped_manual:
             self.logger.info(f"  Skipped (manual review pending): {skipped_manual}")
@@ -479,11 +517,11 @@ class Phase0CSVParser:
 
 
 # =============================================================================
-# Glibc Repository Manager
+# Project Repository Manager
 # =============================================================================
 
-class GlibcRepoManager:
-    """Manages the local glibc repository: clone, update, checkout."""
+class ProjectRepoManager:
+    """Manages the local project source repository: clone, update, checkout."""
     
     def __init__(self, repo_path: Path, remote_url: str, logger: logging.Logger):
         self.repo_path = repo_path
@@ -492,16 +530,17 @@ class GlibcRepoManager:
     
     def update_or_clone(self) -> bool:
         """
-        Update the local glibc repository. Clone if missing.
+        Update the local project repository. Clone if missing.
         This MUST succeed or Phase 1 aborts.
-        
+
         Returns:
             True if update successful, False otherwise (Phase 1 should abort)
         """
-        self.logger.info(f"Pre-updating glibc repository at: {self.repo_path}")
-        
+        project_name = self.repo_path.name
+        self.logger.info(f"Pre-updating project repository at: {self.repo_path}")
+
         if not self.repo_path.exists():
-            self.logger.info(f"glibc not found, cloning from {self.remote_url}...")
+            self.logger.info(f"Repository '{project_name}' not found, cloning from {self.remote_url}...")
             try:
                 result = subprocess.run(
                     ["git", "clone", self.remote_url, str(self.repo_path)],
@@ -510,19 +549,19 @@ class GlibcRepoManager:
                 if result.returncode != 0:
                     self.logger.error(f"Clone failed: {result.stderr}")
                     return False
-                self.logger.info("glibc cloned successfully")
+                self.logger.info(f"Repository '{project_name}' cloned successfully")
                 return True
             except subprocess.TimeoutExpired:
-                self.logger.error("glibc clone timed out (60 min)")
+                self.logger.error(f"Repository '{project_name}' clone timed out (60 min)")
                 return False
             except Exception as e:
-                self.logger.error(f"glibc clone error: {e}")
+                self.logger.error(f"Repository '{project_name}' clone error: {e}")
                 return False
-        
+
         if not (self.repo_path / ".git").exists():
             self.logger.error(f"Not a git repo: {self.repo_path}")
             return False
-        
+
         try:
             # fetch --all then pull --ff-only
             result = subprocess.run(
@@ -532,7 +571,7 @@ class GlibcRepoManager:
             if result.returncode != 0:
                 self.logger.error(f"git fetch failed: {result.stderr}")
                 return False
-            
+
             result = subprocess.run(
                 ["git", "-C", str(self.repo_path), "pull", "--ff-only"],
                 capture_output=True, text=True, timeout=600
@@ -542,15 +581,54 @@ class GlibcRepoManager:
                 # Non-fatal: fetch succeeded so we have latest refs
                 self.logger.info("Fetch succeeded; continuing with available refs")
             else:
-                self.logger.info(f"glibc updated: {result.stdout.strip()}")
-            
+                self.logger.info(f"Repository '{project_name}' updated: {result.stdout.strip()}")
+
             return True
         except subprocess.TimeoutExpired:
-            self.logger.error("glibc update timed out")
+            self.logger.error(f"Repository '{project_name}' update timed out")
             return False
         except Exception as e:
-            self.logger.error(f"glibc update error: {e}")
+            self.logger.error(f"Repository '{project_name}' update error: {e}")
             return False
+
+
+# =============================================================================
+# Platform-aware Docker build helper
+# =============================================================================
+
+def _docker_build(client, path: str, tag: str, rm: bool = True, forcerm: bool = True,
+                  timeout: int = 7200, platform: str = None, logger=None):
+    """Build a Docker image, using subprocess when cross-platform is needed.
+
+    The Docker Python SDK's images.build() does NOT honour the ``platform``
+    parameter through BuildKit, so we fall back to ``docker build`` CLI when
+    a non-native platform is requested.
+
+    Returns (image_object, log_text_or_list).
+    """
+    if platform:
+        cmd = ["docker", "build", "--platform", platform, "--load", "-t", tag, "."]
+        if rm:
+            cmd.insert(2, "--rm")
+        if forcerm:
+            cmd.insert(2, "--force-rm")
+        if logger:
+            logger.debug(f"Building via CLI: {' '.join(cmd)} (cwd={path})")
+        result = subprocess.run(
+            cmd, cwd=path, capture_output=True, text=True, timeout=timeout
+        )
+        if result.returncode != 0:
+            error_tail = (result.stdout + result.stderr)[-5000:]
+            raise docker.errors.BuildError(
+                reason=f"docker build exited {result.returncode}:\n{error_tail}",
+                build_log=[],
+            )
+        image = client.images.get(tag)
+        return image, result.stdout + result.stderr
+    else:
+        return client.images.build(
+            path=path, tag=tag, rm=rm, forcerm=forcerm, timeout=timeout,
+        )
 
 
 # =============================================================================
@@ -560,16 +638,21 @@ class GlibcRepoManager:
 class BaseImageBuilder:
     """Builds and caches one Docker base image per ubuntu_version."""
     
-    # Base Dockerfile template: installs build deps + copies glibc source
+    # Base Dockerfile template: installs build deps + copies project source.
+    # Placeholders {source_dir}, {build_dir}, {install_prefix} are filled at
+    # build time from the Phase 0 config (phase1.source_dir_name etc.).
     BASE_DOCKERFILE = '''# =============================================================================
 # AI-SSD Base Image for Ubuntu {ubuntu_version}
-# Contains build dependencies and glibc source
+# Contains build dependencies and project source
 # =============================================================================
 FROM ubuntu:{ubuntu_version}
 
 LABEL maintainer="AI-SSD Project"
 LABEL ai-ssd.type="base"
 LABEL ai-ssd.ubuntu_version="{ubuntu_version}"
+LABEL ai-ssd.source_dir="{source_dir}"
+LABEL ai-ssd.build_dir="{build_dir}"
+LABEL ai-ssd.platform="{docker_platform}"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -591,89 +674,117 @@ RUN apt-get update && apt-get install -y \\
     apt-get install -y linux-libc-dev 2>/dev/null || true && \\
     rm -rf /var/lib/apt/lists/*
 
-# Copy glibc source from host (pre-updated by Phase 1)
-COPY glibc-src/ /build/glibc-src/
+# Copy project source from host (pre-updated by Phase 1)
+COPY {source_dir}/ /build/{source_dir}/
 
 # Create build and poc directories
-RUN mkdir -p /build/glibc-build /poc
+RUN mkdir -p /build/{build_dir} /poc
 
-WORKDIR /build/glibc-src
+WORKDIR /build/{source_dir}
 '''
 
     # Fix for EOL Ubuntu versions whose repos moved to old-releases.ubuntu.com
-    # Also handles the case where sources.list.d contains release-specific files
     EOL_REPO_FIX = '''# Fix APT sources for EOL Ubuntu version
 RUN sed -i -re 's/([a-z]{{2}}\\.)?archive\\.ubuntu\\.com|security\\.ubuntu\\.com/old-releases.ubuntu.com/g' /etc/apt/sources.list 2>/dev/null || true
 RUN sed -i -re 's/([a-z]{{2}}\\.)?archive\\.ubuntu\\.com|security\\.ubuntu\\.com/old-releases.ubuntu.com/g' /etc/apt/sources.list.d/*.list 2>/dev/null || true
 '''
 
-    def __init__(self, docker_client, glibc_repo_path: Path, logger: logging.Logger,
-                 build_timeout: int = 7200):
+    def __init__(self, docker_client, project_repo_path: Path, logger: logging.Logger,
+                 build_timeout: int = 7200,
+                 base_image_prefix: str = _DEFAULT_BASE_IMAGE_PREFIX,
+                 source_dir_name: str = _DEFAULT_SOURCE_DIR_NAME,
+                 build_dir_name: str = _DEFAULT_BUILD_DIR_NAME,
+                 docker_platform: str = None):
         self.client = docker_client
-        self.glibc_repo_path = glibc_repo_path
+        self.project_repo_path = project_repo_path
         self.logger = logger
         self.build_timeout = build_timeout
+        self.base_image_prefix = base_image_prefix
+        self.source_dir_name = source_dir_name
+        self.build_dir_name = build_dir_name
+        self.docker_platform = docker_platform
         self.built_images: Dict[str, str] = {}  # ubuntu_version -> image_tag
         self.failed_versions: set = set()
-    
+
     def ensure_base_image(self, ubuntu_version: str) -> Optional[str]:
         """
         Build or reuse a base image for the given ubuntu_version.
         Returns the image tag if successful, None if failed.
         """
-        tag = f"{BASE_IMAGE_PREFIX}:ubuntu-{ubuntu_version}"
-        
+        tag = f"{self.base_image_prefix}:ubuntu-{ubuntu_version}"
+
         # Already built in this run
         if ubuntu_version in self.built_images:
             self.logger.info(f"Reusing base image: {tag}")
             return tag
-        
+
         # Already failed
         if ubuntu_version in self.failed_versions:
             return None
-        
-        # Check if image already exists in Docker
+
+        # Check if image already exists in Docker AND matches current config
         try:
-            self.client.images.get(tag)
-            self.logger.info(f"Base image already exists: {tag}")
-            self.built_images[ubuntu_version] = tag
-            return tag
+            existing = self.client.images.get(tag)
+            labels = existing.labels or {}
+            cached_src = labels.get('ai-ssd.source_dir', '')
+            cached_bld = labels.get('ai-ssd.build_dir', '')
+            cached_plat = labels.get('ai-ssd.platform', '')
+            expected_plat = self.docker_platform or ''
+            config_match = (
+                cached_src == self.source_dir_name
+                and cached_bld == self.build_dir_name
+                and cached_plat == expected_plat
+            )
+            if config_match:
+                self.logger.info(f"Base image already exists: {tag}")
+                self.built_images[ubuntu_version] = tag
+                return tag
+            else:
+                self.logger.warning(
+                    f"Stale base image {tag}: source_dir={cached_src!r} (expected {self.source_dir_name!r}), "
+                    f"build_dir={cached_bld!r} (expected {self.build_dir_name!r}), "
+                    f"platform={cached_plat!r} (expected {expected_plat!r}). Rebuilding."
+                )
+                try:
+                    self.client.images.remove(tag, force=True)
+                except Exception:
+                    pass
         except ImageNotFound:
             pass
-        
+
         # Build the base image
         self.logger.info(f"Building base image: {tag}")
-        
+
         build_context = None
         try:
-            # Create a temporary build context with glibc source
             build_context = Path(tempfile.mkdtemp(prefix=f"ai-ssd-base-{ubuntu_version}-"))
-            
-            # Write Dockerfile (with EOL repo fix if needed)
+
+            # Write Dockerfile
             eol_fix = self.EOL_REPO_FIX if ubuntu_version in EOL_UBUNTU_VERSIONS else ''
             dockerfile_content = self.BASE_DOCKERFILE.format(
                 ubuntu_version=ubuntu_version,
                 eol_repo_fix=eol_fix,
+                source_dir=self.source_dir_name,
+                build_dir=self.build_dir_name,
+                docker_platform=self.docker_platform or '',
             )
             (build_context / "Dockerfile").write_text(dockerfile_content)
-            
-            # Copy glibc source (use git archive for efficiency if possible, else copy)
-            glibc_dest = build_context / "glibc-src"
-            self._copy_glibc_source(glibc_dest)
-            
+
+            # Copy project source
+            src_dest = build_context / self.source_dir_name
+            self._copy_project_source(src_dest)
+
             # Build
-            image, build_logs = self.client.images.build(
-                path=str(build_context),
-                tag=tag,
-                rm=True,
-                forcerm=True,
-                timeout=self.build_timeout
+            image, build_logs = _docker_build(
+                self.client, str(build_context), tag,
+                rm=True, forcerm=True, timeout=self.build_timeout,
+                platform=self.docker_platform, logger=self.logger,
             )
-            
+
             self.built_images[ubuntu_version] = tag
             self.logger.info(f"Base image built successfully: {tag}")
             return tag
-            
+
         except Exception as e:
             self.logger.error(f"Failed to build base image for ubuntu {ubuntu_version}: {e}")
             self.failed_versions.add(ubuntu_version)
@@ -681,14 +792,14 @@ RUN sed -i -re 's/([a-z]{{2}}\\.)?archive\\.ubuntu\\.com|security\\.ubuntu\\.com
         finally:
             if build_context and build_context.exists():
                 shutil.rmtree(build_context, ignore_errors=True)
-    
-    def _copy_glibc_source(self, dest: Path):
-        """Copy glibc source to build context efficiently."""
+
+    def _copy_project_source(self, dest: Path):
+        """Copy project source to build context efficiently."""
         # Use git archive to avoid copying .git directory
         try:
             dest.mkdir(parents=True, exist_ok=True)
             result = subprocess.run(
-                ["git", "-C", str(self.glibc_repo_path), "archive", "--format=tar", "HEAD"],
+                ["git", "-C", str(self.project_repo_path), "archive", "--format=tar", "HEAD"],
                 capture_output=True, timeout=120
             )
             if result.returncode == 0:
@@ -699,7 +810,7 @@ RUN sed -i -re 's/([a-z]{{2}}\\.)?archive\\.ubuntu\\.com|security\\.ubuntu\\.com
                 # Also ensure .git exists for checkout operations in CVE images
                 # Copy just .git directory
                 shutil.copytree(
-                    self.glibc_repo_path / ".git",
+                    self.project_repo_path / ".git",
                     dest / ".git",
                     symlinks=True,
                     ignore=shutil.ignore_patterns('*.pack.old', 'COMMIT_EDITMSG')
@@ -707,11 +818,11 @@ RUN sed -i -re 's/([a-z]{{2}}\\.)?archive\\.ubuntu\\.com|security\\.ubuntu\\.com
                 return
         except Exception:
             pass
-        
+
         # Fallback: direct copy
         if dest.exists():
             shutil.rmtree(dest)
-        shutil.copytree(self.glibc_repo_path, dest, symlinks=True)
+        shutil.copytree(self.project_repo_path, dest, symlinks=True)
 
 
 # =============================================================================
@@ -740,23 +851,34 @@ LABEL cve="{cve}"
 LABEL commit="{commit_hash}"
 LABEL ai-ssd.ubuntu_version="{ubuntu_version}"
 LABEL ai-ssd.poc_language="{poc_language}"
+LABEL ai-ssd.platform="{docker_platform}"
 
 # Checkout the vulnerable commit
-WORKDIR /build/glibc-src
-RUN git fetch --all 2>/dev/null; \\
-    git checkout {commit_hash} 2>/dev/null || \\
-    (git fetch origin {commit_hash} && git checkout {commit_hash}) || \\
-    (git fetch origin && git checkout {commit_hash})
+# The base image already contains the full .git history copied from the host,
+# so no fetch is needed.  Remove stale lock files that a previous interrupted
+# fetch/checkout may have left behind, then checkout locally.
+WORKDIR /build/{source_dir}
+RUN rm -f .git/index.lock .git/refs/heads/*.lock 2>/dev/null; \\
+    git checkout --force {commit_hash} || \\
+    (echo "ERROR: git checkout {commit_hash} failed — listing available refs:" && \\
+     git log --oneline -5 && exit 1)
 
-# Multi-strategy glibc configure and build
+# Relax tool-version checks in old glibc configure scripts.
+# Old configure scripts reject newer binutils/make/sed with "too old" because
+# their version-match regexes are too narrow.  Bypass the critic_missing error
+# gate so configure proceeds despite version mismatches.
+RUN sed -i 's/test -n "$critic_missing"/false/g; s/test "x$critic_missing" != x/false/g' \\
+    /build/{source_dir}/configure 2>/dev/null || true
+
+# Multi-strategy configure and build
 # Strategy 1: Full configure with warning suppression
 # Strategy 2: Minimal configure with fewer features
 # Strategy 3: Bare-minimum configure (no optional features)
-WORKDIR /build/glibc-build
-RUN rm -rf /build/glibc-build/* && \\
+WORKDIR /build/{build_dir}
+RUN rm -rf /build/{build_dir}/* && \\
     echo "=== Strategy 1: Full configure ===" && \\
-    (../glibc-src/configure \\
-        --prefix=/opt/glibc-vulnerable \\
+    (../{source_dir}/configure \\
+        --prefix={install_prefix} \\
         --disable-werror \\
         --disable-sanity-checks \\
         --disable-profile \\
@@ -765,9 +887,9 @@ RUN rm -rf /build/glibc-build/* && \\
         CFLAGS="-O2 -g -fno-stack-protector -Wno-error -w -U_FORTIFY_SOURCE" \\
         2>&1 && echo "CONFIGURE_OK") || \\
     (echo "=== Strategy 2: Minimal configure ===" && \\
-     rm -rf /build/glibc-build/* && \\
-     ../glibc-src/configure \\
-        --prefix=/opt/glibc-vulnerable \\
+     rm -rf /build/{build_dir}/* && \\
+     ../{source_dir}/configure \\
+        --prefix={install_prefix} \\
         --disable-werror \\
         --disable-sanity-checks \\
         --disable-profile \\
@@ -780,9 +902,9 @@ RUN rm -rf /build/glibc-build/* && \\
         CFLAGS="-O1 -g -w -U_FORTIFY_SOURCE -fno-stack-protector -Wno-error" \\
         2>&1 && echo "CONFIGURE_OK") || \\
     (echo "=== Strategy 3: Bare-minimum configure ===" && \\
-     rm -rf /build/glibc-build/* && \\
-     ../glibc-src/configure \\
-        --prefix=/opt/glibc-vulnerable \\
+     rm -rf /build/{build_dir}/* && \\
+     ../{source_dir}/configure \\
+        --prefix={install_prefix} \\
         --disable-werror \\
         --disable-sanity-checks \\
         --disable-profile \\
@@ -792,22 +914,22 @@ RUN rm -rf /build/glibc-build/* && \\
         CFLAGS="-O0 -g -w -U_FORTIFY_SOURCE -fno-stack-protector -Wno-error -std=gnu99 -fgnu89-inline -fno-strict-aliasing" \\
         2>&1 && echo "CONFIGURE_OK") || \\
     (echo "=== All configure strategies failed ===" && \\
-     echo "--- config.log tail ---" && tail -100 config.log 2>/dev/null && \\
+     echo "--- configure error (last 20 lines) ---" && \\
+     grep -i "error\\|fail\\|cannot\\|not found\\|unsupported" config.log 2>/dev/null | tail -20 && \\
+     echo "--- config.log tail ---" && tail -50 config.log 2>/dev/null && \\
      exit 1)
 
 RUN make -j$(nproc) -k 2>&1 | tail -20; \\
-    echo "GLIBC_BUILD_EXIT_CODE=$?" >> /build/build_status; \\
+    echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; \\
     echo "Build completed (errors may be non-fatal)"
 
 RUN make install -k 2>&1 | tail -20; \\
-    echo "GLIBC_INSTALL_EXIT_CODE=$?" >> /build/build_status; \\
+    echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status; \\
     echo "Install completed"
 
-# Verify glibc build produced usable output
-# Even partial builds that produce libc.so are useful
-RUN ls -la /opt/glibc-vulnerable/lib/ 2>/dev/null || echo "WARNING: lib/ not found"; \\
-    ls /opt/glibc-vulnerable/lib/libc.so* 2>/dev/null || echo "WARNING: libc.so not found"; \\
-    echo "=== Build artifacts ===" && find /opt/glibc-vulnerable -name "*.so*" 2>/dev/null | head -20
+# Verify build produced usable output
+RUN ls -la {install_prefix}/lib/ 2>/dev/null || echo "WARNING: lib/ not found"; \\
+    echo "=== Build artifacts ===" && find {install_prefix} -name "*.so*" 2>/dev/null | head -20
 '''
 
     # Language-specific Dockerfile sections
@@ -816,9 +938,11 @@ RUN ls -la /opt/glibc-vulnerable/lib/ 2>/dev/null || echo "WARNING: lib/ not fou
 COPY {poc_filename} /poc/exploit_raw.c
 
 # Validate and prepare PoC source file
-# Some auto-extracted PoCs may be code fragments rather than complete programs
+# Some auto-extracted PoCs may be code fragments rather than complete programs.
+# Use a broad regex to detect any form of main() declaration, including:
+#   int main(void), main (void), main(const int ...), void main(), etc.
 WORKDIR /poc
-RUN if grep -q 'int main' /poc/exploit_raw.c || grep -q 'void main' /poc/exploit_raw.c; then \\
+RUN if grep -qE '^[[:space:]]*(int|void)?[[:space:]]*main[[:space:]]*\\(' /poc/exploit_raw.c; then \\
         echo "PoC has main() - using as-is"; \\
         cp /poc/exploit_raw.c /poc/exploit.c; \\
     else \\
@@ -832,53 +956,62 @@ RUN if grep -q 'int main' /poc/exploit_raw.c || grep -q 'void main' /poc/exploit
         cat /poc/exploit_raw.c >> /poc/exploit.c; \\
         echo '' >> /poc/exploit.c; \\
         echo 'int main(int argc, char *argv[]) {{' >> /poc/exploit.c; \\
-        echo '    printf("PoC code fragment loaded - vulnerability path exists in binary\\n");' >> /poc/exploit.c; \\
+        echo '    puts("PoC code fragment loaded - vulnerability path exists in binary");' >> /poc/exploit.c; \\
         echo '    return 0;' >> /poc/exploit.c; \\
         echo '}}' >> /poc/exploit.c; \\
     fi
 
 # Compile PoC against vulnerable glibc with multi-strategy fallback chain
-RUN DYNAMIC_LINKER=$(find /opt/glibc-vulnerable/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
-    COMPILE_OK=0 && \\
+# First, detect if the PoC uses i386 inline assembly and install 32-bit libs
+RUN if grep -qE 'int \\$0x80|%eax|%ebx|%ecx|%edx|%esi|%edi|%esp|%ebp' /poc/exploit.c 2>/dev/null; then \\
+        echo "Detected i386 inline assembly — installing 32-bit development libraries" && \\
+        dpkg --add-architecture i386 && \\
+        apt-get update -qq && \\
+        apt-get install -y gcc-multilib libc6-dev-i386 2>/dev/null || true; \\
+    fi
+# Use file-based success tracking (not shell variables) so that subshell
+# gcc compilations can reliably signal success to later strategy guards.
+RUN DYNAMIC_LINKER=$(find {install_prefix}/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
+    rm -f /poc/exploit && \\
     echo "=== Compilation Strategy 1: Link against vulnerable glibc (all libs) ===" && \\
     if [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then \\
-        (gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include \\
-            -ldl -lpthread -lm -lrt 2>&1 && COMPILE_OK=1) || \\
-        (gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include \\
+            -ldl -lpthread -lm -lrt 2>&1 || \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include \\
-            -ldl -lpthread 2>&1 && COMPILE_OK=1) || \\
-        (gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include \\
+            -ldl -lpthread 2>&1 || \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include \\
-            -ldl 2>&1 && COMPILE_OK=1) || \\
-        (gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include \\
+            -ldl 2>&1 || \\
+        gcc -o exploit exploit.c \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include 2>&1 && COMPILE_OK=1) || \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include 2>&1 || \\
         echo "Vulnerable glibc linking failed, trying relaxed flags..."; \\
     fi && \\
-    if [ "$COMPILE_OK" = "0" ] && [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then \\
+    if [ ! -f /poc/exploit ] && [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then \\
         echo "=== Compilation Strategy 2: Relaxed flags (-w -fpermissive) ===" && \\
-        (gcc -o exploit exploit.c -w -fpermissive \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+        gcc -o exploit exploit.c -w -fpermissive \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include \\
             -D_GNU_SOURCE \\
-            -ldl -lpthread -lm 2>&1 && COMPILE_OK=1) || \\
+            -ldl -lpthread -lm 2>&1 || \\
         echo "Relaxed compilation also failed"; \\
     fi && \\
-    if [ "$COMPILE_OK" = "0" ]; then \\
+    if [ ! -f /poc/exploit ]; then \\
         echo "=== Compilation Strategy 3: System glibc ===" && \\
         (gcc -o exploit exploit.c -ldl -lpthread -lm -lrt 2>&1 || \\
          gcc -o exploit exploit.c -ldl -lpthread 2>&1 || \\
@@ -886,14 +1019,23 @@ RUN DYNAMIC_LINKER=$(find /opt/glibc-vulnerable/lib -name 'ld-linux*.so*' -o -na
          gcc -o exploit exploit.c -ldl 2>&1 || \\
          gcc -o exploit exploit.c -lm 2>&1 || \\
          gcc -o exploit exploit.c 2>&1 || \\
-         gcc -o exploit exploit.c -w -fpermissive -D_GNU_SOURCE 2>&1) && COMPILE_OK=1 || \\
+         gcc -o exploit exploit.c -w -fpermissive -D_GNU_SOURCE 2>&1) || \\
         echo "System glibc compilation also failed"; \\
     fi && \\
-    if [ "$COMPILE_OK" = "0" ]; then \\
+    if [ ! -f /poc/exploit ]; then \\
         echo "=== Compilation Strategy 4: C99/GNU99 mode ===" && \\
         (gcc -std=gnu99 -o exploit exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 || \\
-         gcc -std=gnu99 -o exploit exploit.c -w -D_GNU_SOURCE 2>&1) && COMPILE_OK=1 || \\
-        echo "All compilation strategies exhausted"; \\
+         gcc -std=gnu99 -o exploit exploit.c -w -D_GNU_SOURCE 2>&1) || \\
+        echo "All C99/GNU99 strategies exhausted"; \\
+    fi && \\
+    if [ ! -f /poc/exploit ] && {{ which gcc-multilib >/dev/null 2>&1 || dpkg -l gcc-multilib 2>/dev/null | grep -q ^ii; }}; then \\
+        echo "=== Compilation Strategy 5: 32-bit (-m32) for i386 PoCs ===" && \\
+        (gcc -m32 -o exploit exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 || \\
+         gcc -m32 -o exploit exploit.c -w -D_GNU_SOURCE -ldl -lpthread 2>&1 || \\
+         gcc -m32 -o exploit exploit.c -w -D_GNU_SOURCE -ldl 2>&1 || \\
+         gcc -m32 -o exploit exploit.c -w -D_GNU_SOURCE 2>&1 || \\
+         gcc -m32 -std=gnu99 -o exploit exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1) || \\
+        echo "32-bit compilation also failed"; \\
     fi && \\
     if [ -f /poc/exploit ]; then \\
         echo "SUCCESS: Exploit binary created" && file /poc/exploit; \\
@@ -905,7 +1047,7 @@ RUN DYNAMIC_LINKER=$(find /opt/glibc-vulnerable/lib -name 'ld-linux*.so*' -o -na
         exit 1; \\
     fi
 
-ENV LD_LIBRARY_PATH=/opt/glibc-vulnerable/lib
+ENV LD_LIBRARY_PATH={install_prefix}/lib
 CMD ["/poc/exploit"]
 '''
 
@@ -926,7 +1068,7 @@ RUN python3 -c "import py_compile; py_compile.compile('/poc/exploit.py', doraise
     python -c "import py_compile; py_compile.compile('/poc/exploit.py', doraise=True)" 2>&1 || \\
     echo "WARNING: Python syntax validation failed (may still work at runtime)"
 
-ENV LD_LIBRARY_PATH=/opt/glibc-vulnerable/lib
+ENV LD_LIBRARY_PATH={install_prefix}/lib
 CMD ["python3", "/poc/exploit.py"]
 '''
 
@@ -961,7 +1103,7 @@ RUN if grep -q "msf/core\\|Msf::\\|MetasploitModule" /poc/exploit.rb; then \\
         echo 'puts "MSF module loaded for analysis (full exploitation requires MSF framework)"' >> /poc/exploit.rb; \\
     fi
 
-ENV LD_LIBRARY_PATH=/opt/glibc-vulnerable/lib
+ENV LD_LIBRARY_PATH={install_prefix}/lib
 CMD ["ruby", "/poc/exploit.rb"]
 '''
 
@@ -980,7 +1122,7 @@ RUN chmod +x /poc/exploit.pl
 # Check Perl syntax
 RUN perl -c /poc/exploit.pl 2>&1 || echo "WARNING: Perl syntax check failed"
 
-ENV LD_LIBRARY_PATH=/opt/glibc-vulnerable/lib
+ENV LD_LIBRARY_PATH={install_prefix}/lib
 CMD ["perl", "/poc/exploit.pl"]
 '''
 
@@ -995,7 +1137,7 @@ RUN chmod +x /poc/exploit.sh && \\
 # Validate shell script syntax
 RUN bash -n /poc/exploit.sh 2>&1 || echo "WARNING: Shell syntax check failed"
 
-ENV LD_LIBRARY_PATH=/opt/glibc-vulnerable/lib
+ENV LD_LIBRARY_PATH={install_prefix}/lib
 CMD ["/bin/bash", "/poc/exploit.sh"]
 '''
 
@@ -1015,7 +1157,7 @@ RUN chmod +x /poc/exploit.php
 # Check PHP syntax
 RUN php -l /poc/exploit.php 2>&1 || echo "WARNING: PHP syntax check failed"
 
-ENV LD_LIBRARY_PATH=/opt/glibc-vulnerable/lib
+ENV LD_LIBRARY_PATH={install_prefix}/lib
 CMD ["php", "/poc/exploit.php"]
 '''
 
@@ -1029,16 +1171,31 @@ CMD ["php", "/poc/exploit.php"]
         'php': CVE_DOCKERFILE_PHP,
     }
 
-    def __init__(self, docker_client, logger: logging.Logger, build_timeout: int = 7200):
+    def __init__(self, docker_client, logger: logging.Logger, build_timeout: int = 7200,
+                 source_dir_name: str = _DEFAULT_SOURCE_DIR_NAME,
+                 build_dir_name: str = _DEFAULT_BUILD_DIR_NAME,
+                 install_prefix: str = _DEFAULT_INSTALL_PREFIX,
+                 docker_platform: str = None):
         self.client = docker_client
         self.logger = logger
         self.build_timeout = build_timeout
+        self.source_dir_name = source_dir_name
+        self.build_dir_name = build_dir_name
+        self.install_prefix = install_prefix
+        self.docker_platform = docker_platform
         self.built_images: Dict[str, str] = {}  # cve -> image_tag
-    
+
     def _generate_dockerfile(self, vuln: VulnerabilityInfo, base_image_tag: str,
-                              poc_filename: str, poc_language: str) -> str:
-        """Generate a language-aware Dockerfile for the CVE image."""
-        # Select language template (default to C for unknown)
+                              poc_filename: str, poc_language: str,
+                              alt_poc_filenames: List[str] = None) -> str:
+        """Generate a language-aware Dockerfile for the CVE image.
+
+        Args:
+            alt_poc_filenames: Optional list of alternative PoC filenames already
+                               COPYd into the build context. When the primary PoC
+                               fails to compile, the generated Dockerfile will try
+                               each alternative in order.
+        """
         lang = poc_language.lower() if poc_language else 'c'
         if lang in ('py',):
             lang = 'python'
@@ -1048,26 +1205,91 @@ CMD ["php", "/poc/exploit.php"]
             lang = 'shell'
         elif lang in ('pl',):
             lang = 'perl'
-        
+
         template = self.LANGUAGE_TEMPLATES.get(lang)
         if template is None:
             self.logger.warning(f"Unsupported PoC language '{poc_language}' for {vuln.cve}, "
                                 f"falling back to C compilation")
             lang = 'c'
             template = self.LANGUAGE_TEMPLATES['c']
-        
-        # Build the Dockerfile
+
+        # Build the Dockerfile — fill in both structural and project-specific placeholders
         header = self.CVE_DOCKERFILE_HEADER.format(
             cve=vuln.cve,
             commit_hash=vuln.commit_hash,
             ubuntu_version=vuln.ubuntu_version,
             base_image_tag=base_image_tag,
             poc_language=lang,
+            source_dir=self.source_dir_name,
+            build_dir=self.build_dir_name,
+            install_prefix=self.install_prefix,
+            docker_platform=self.docker_platform or '',
         )
-        body = template.format(poc_filename=poc_filename)
-        
+        body = template.format(
+            poc_filename=poc_filename,
+            install_prefix=self.install_prefix,
+        )
+
+        # Append COPY + fallback compilation for alternative PoC files
+        if alt_poc_filenames and lang == 'c':
+            alt_section = self._generate_alt_poc_section(alt_poc_filenames)
+            # When alternatives exist, the primary compilation step must NOT
+            # 'exit 1' on failure — otherwise the build stops before the alt
+            # fallback step runs.  Replace the exit-1 block with a soft warning.
+            body = body.replace(
+                'echo "ERROR: Failed to compile exploit!" && \\\n'
+                '        echo "=== Source file head ===" && head -30 /poc/exploit.c && \\\n'
+                '        echo "=== Verbose compilation attempt ===" && \\\n'
+                '        gcc -v -o exploit exploit.c -w 2>&1 || true && \\\n'
+                '        exit 1; \\',
+                'echo "WARNING: Primary PoC failed to compile — trying alternatives..."; \\'
+            )
+            # Insert alt section BEFORE the final ENV/CMD lines
+            env_marker = '\nENV LD_LIBRARY_PATH='
+            idx = body.rfind(env_marker)
+            if idx != -1:
+                body = body[:idx] + '\n' + alt_section + body[idx:]
+
         self.logger.info(f"Generated {lang} Dockerfile for {vuln.cve}")
         return header + body
+
+    def _generate_alt_poc_section(self, alt_poc_filenames: List[str]) -> str:
+        """Generate Dockerfile snippet that tries alternative PoC files if the
+        primary one failed to compile."""
+        lines = [
+            '',
+            '# === Alternative PoC fallback ===',
+            '# If the primary PoC failed to compile, try each alternative in turn.',
+        ]
+        for alt_name in alt_poc_filenames:
+            lines.append(f'COPY {alt_name} /poc/{alt_name}')
+        # Build a single RUN that tries each alternative with the full strategy chain
+        lines.append('RUN if [ ! -f /poc/exploit ]; then \\')
+        for i, alt_name in enumerate(alt_poc_filenames):
+            lines.append(f'    echo "=== Trying alternative PoC: {alt_name} ===" && \\')
+            lines.append(f'    cp /poc/{alt_name} /poc/exploit.c && \\')
+            lines.append( '    (gcc -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 || \\')
+            lines.append( '     gcc -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl -lpthread 2>&1 || \\')
+            lines.append( '     gcc -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl 2>&1 || \\')
+            lines.append( '     gcc -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE 2>&1 || \\')
+            lines.append( '     gcc -m32 -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 || \\')
+            lines.append( '     gcc -std=gnu99 -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 || \\')
+            lines.append( '     true) && \\')
+            if i < len(alt_poc_filenames) - 1:
+                lines.append( '    if [ -f /poc/exploit ]; then echo "SUCCESS: Compiled alternative PoC"; fi && \\')
+                lines.append( '    if [ ! -f /poc/exploit ]; then \\')
+        # Final check
+        lines.append( '    if [ -f /poc/exploit ]; then \\')
+        lines.append( '        echo "SUCCESS: Compiled alternative PoC" && file /poc/exploit; \\')
+        lines.append( '    else \\')
+        lines.append( '        echo "ERROR: All alternative PoCs also failed to compile" && exit 1; \\')
+        lines.append( '    fi; \\')
+        # Close nested if blocks
+        for i in range(len(alt_poc_filenames) - 1):
+            lines.append( '    fi; \\')
+        lines.append( 'fi')
+        lines.append('')
+        return '\n'.join(lines) + '\n'
     
     def build_cve_image(self, vuln: VulnerabilityInfo, base_image_tag: str,
                         poc_path: Path, poc_language: str = None) -> Tuple[bool, Optional[str]]:
@@ -1090,12 +1312,25 @@ CMD ["php", "/poc/exploit.php"]
             self.logger.info(f"Reusing CVE image: {tag}")
             return True, "Image already built"
         
-        # Check if image exists in Docker
+        # Check if image exists in Docker (with platform staleness detection)
         try:
-            self.client.images.get(tag)
-            self.logger.info(f"CVE image already exists: {tag}")
-            self.built_images[vuln.cve] = tag
-            return True, "Image already exists"
+            existing = self.client.images.get(tag)
+            labels = existing.labels or {}
+            expected_platform = self.docker_platform or ''
+            img_platform = labels.get('ai-ssd.platform', '')
+            if img_platform != expected_platform:
+                self.logger.info(
+                    f"Stale CVE image detected (platform '{img_platform}' != "
+                    f"'{expected_platform}') — rebuilding: {tag}"
+                )
+                try:
+                    self.client.images.remove(tag, force=True)
+                except Exception:
+                    pass
+            else:
+                self.logger.info(f"CVE image already exists: {tag}")
+                self.built_images[vuln.cve] = tag
+                return True, "Image already exists"
         except ImageNotFound:
             pass
         
@@ -1118,27 +1353,43 @@ CMD ["php", "/poc/exploit.php"]
                 self.logger.error(f"PoC file not found: {poc_path}")
                 return False, f"PoC not found: {poc_path}"
             
+            # Discover alternative PoC files for the same CVE.
+            # Convention: {CVE}_poc1.ext, {CVE}_poc2.ext, etc.
+            alt_poc_filenames = []
+            exploits_dir = poc_path.parent
+            ext = poc_path.suffix
+            for alt in sorted(exploits_dir.glob(f"{vuln.cve}_*{ext}")):
+                if alt != poc_path and alt.is_file():
+                    alt_ctx_name = alt.name
+                    shutil.copy2(alt, build_context / alt_ctx_name)
+                    alt_poc_filenames.append(alt_ctx_name)
+            if alt_poc_filenames:
+                self.logger.info(f"  Found {len(alt_poc_filenames)} alternative PoC(s): "
+                                 f"{', '.join(alt_poc_filenames)}")
+            
             # Generate language-aware Dockerfile
             dockerfile_content = self._generate_dockerfile(
-                vuln, base_image_tag, poc_filename, poc_language
+                vuln, base_image_tag, poc_filename, poc_language,
+                alt_poc_filenames=alt_poc_filenames,
             )
             (build_context / "Dockerfile").write_text(dockerfile_content)
             
             # Build
-            image, build_logs = self.client.images.build(
-                path=str(build_context),
-                tag=tag,
-                rm=True,
-                forcerm=True,
-                timeout=self.build_timeout
+            image, build_logs = _docker_build(
+                self.client, str(build_context), tag,
+                rm=True, forcerm=True, timeout=self.build_timeout,
+                platform=self.docker_platform, logger=self.logger,
             )
             
             log_output = []
-            for chunk in build_logs:
-                if 'stream' in chunk:
-                    log_output.append(chunk['stream'])
-                elif 'error' in chunk:
-                    log_output.append(f"ERROR: {chunk['error']}")
+            if isinstance(build_logs, str):
+                log_output = [build_logs]
+            else:
+                for chunk in build_logs:
+                    if 'stream' in chunk:
+                        log_output.append(chunk['stream'])
+                    elif 'error' in chunk:
+                        log_output.append(f"ERROR: {chunk['error']}")
             
             self.built_images[vuln.cve] = tag
             self.logger.info(f"CVE image built: {tag}")
@@ -1250,7 +1501,7 @@ WORKDIR /build/glibc-build
 # Configure glibc build
 # Note: Using --disable-werror to allow building with warnings as errors disabled
 RUN ../glibc-src/configure \\
-    --prefix=/opt/glibc-vulnerable \\
+    --prefix={install_prefix} \\
     --disable-werror \\
     --disable-sanity-checks \\
     --enable-obsolete-rpc \\
@@ -1269,8 +1520,8 @@ RUN make install -k 2>&1 | tee -a /build/build.log; \\
 
 # Verify glibc build produced necessary files
 RUN echo "=== Checking glibc build output ===" && \\
-    ls -la /opt/glibc-vulnerable/lib/ 2>/dev/null || echo "WARNING: /opt/glibc-vulnerable/lib/ not found" && \\
-    ls /opt/glibc-vulnerable/lib/libc.so* 2>/dev/null || echo "WARNING: libc.so not found"
+    ls -la {install_prefix}/lib/ 2>/dev/null || echo "WARNING: {install_prefix}/lib/ not found" && \\
+    ls {install_prefix}/lib/libc.so* 2>/dev/null || echo "WARNING: libc.so not found"
 
 # Create directory for PoC
 RUN mkdir -p /poc
@@ -1283,33 +1534,33 @@ COPY poc_exploit.c /poc/exploit.c
 # Use fallback compilation attempts if linking with specific libraries fails
 # Always fall back to system glibc if vulnerable glibc compilation fails
 WORKDIR /poc
-RUN DYNAMIC_LINKER=$(find /opt/glibc-vulnerable/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
+RUN DYNAMIC_LINKER=$(find {install_prefix}/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
     echo "Found dynamic linker: $DYNAMIC_LINKER" && \\
     if [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then \\
         echo "Attempting compilation with vulnerable glibc..."; \\
         gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include \\
             -ldl -lpthread 2>&1 || \\
         gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include \\
             -ldl 2>&1 || \\
         gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include \\
             -lm 2>&1 || \\
         gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include 2>&1 || \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include 2>&1 || \\
         echo "Vulnerable glibc compilation failed"; \\
     fi && \\
     if [ ! -f /poc/exploit ]; then \\
@@ -1337,7 +1588,7 @@ RUN if [ ! -f /poc/exploit ]; then \\
     fi
 
 # Set environment for running with vulnerable glibc
-ENV LD_LIBRARY_PATH=/opt/glibc-vulnerable/lib
+ENV LD_LIBRARY_PATH={install_prefix}/lib
 
 # Default command: run the exploit
 CMD ["/poc/exploit"]
@@ -1389,7 +1640,7 @@ WORKDIR /build/glibc-build
 
 # Configure glibc build
 RUN ../glibc-src/configure \\
-    --prefix=/opt/glibc-vulnerable \\
+    --prefix={install_prefix} \\
     --disable-werror \\
     --disable-sanity-checks \\
     CC="gcc -fno-stack-protector" \\
@@ -1407,8 +1658,8 @@ RUN make install -k 2>&1 | tee -a /build/build.log; \\
 
 # Verify glibc build produced necessary files
 RUN echo "=== Checking glibc build output ===" && \\
-    ls -la /opt/glibc-vulnerable/lib/ 2>/dev/null || echo "WARNING: /opt/glibc-vulnerable/lib/ not found" && \\
-    ls /opt/glibc-vulnerable/lib/libc.so* 2>/dev/null || echo "WARNING: libc.so not found"
+    ls -la {install_prefix}/lib/ 2>/dev/null || echo "WARNING: {install_prefix}/lib/ not found" && \\
+    ls {install_prefix}/lib/libc.so* 2>/dev/null || echo "WARNING: libc.so not found"
 
 # Create directory for PoC
 RUN mkdir -p /poc
@@ -1421,33 +1672,33 @@ COPY poc_exploit.c /poc/exploit.c
 # Use fallback compilation attempts if linking with specific libraries fails
 # Always fall back to system glibc if vulnerable glibc compilation fails
 WORKDIR /poc
-RUN DYNAMIC_LINKER=$(find /opt/glibc-vulnerable/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
+RUN DYNAMIC_LINKER=$(find {install_prefix}/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
     echo "Found dynamic linker: $DYNAMIC_LINKER" && \\
     if [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then \\
         echo "Attempting compilation with vulnerable glibc..."; \\
         gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include \\
             -ldl -lpthread 2>&1 || \\
         gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include \\
             -ldl 2>&1 || \\
         gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include \\
             -lm 2>&1 || \\
         gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include 2>&1 || \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include 2>&1 || \\
         echo "Vulnerable glibc compilation failed"; \\
     fi && \\
     if [ ! -f /poc/exploit ]; then \\
@@ -1475,7 +1726,7 @@ RUN if [ ! -f /poc/exploit ]; then \\
     fi
 
 # Set environment for running with vulnerable glibc
-ENV LD_LIBRARY_PATH=/opt/glibc-vulnerable/lib
+ENV LD_LIBRARY_PATH={install_prefix}/lib
 
 # Default command: run the exploit
 CMD ["/poc/exploit"]
@@ -1527,7 +1778,7 @@ WORKDIR /build/glibc-build
 
 # Configure glibc build
 RUN ../glibc-src/configure \\
-    --prefix=/opt/glibc-vulnerable \\
+    --prefix={install_prefix} \\
     --disable-werror \\
     --disable-sanity-checks \\
     CC="gcc -fno-stack-protector" \\
@@ -1545,8 +1796,8 @@ RUN make install -k 2>&1 | tee -a /build/build.log; \\
 
 # Verify glibc build produced necessary files
 RUN echo "=== Checking glibc build output ===" && \\
-    ls -la /opt/glibc-vulnerable/lib/ 2>/dev/null || echo "WARNING: /opt/glibc-vulnerable/lib/ not found" && \\
-    ls /opt/glibc-vulnerable/lib/libc.so* 2>/dev/null || echo "WARNING: libc.so not found"
+    ls -la {install_prefix}/lib/ 2>/dev/null || echo "WARNING: {install_prefix}/lib/ not found" && \\
+    ls {install_prefix}/lib/libc.so* 2>/dev/null || echo "WARNING: libc.so not found"
 
 # Create directory for PoC
 RUN mkdir -p /poc
@@ -1559,33 +1810,33 @@ COPY poc_exploit.c /poc/exploit.c
 # Use fallback compilation attempts if linking with specific libraries fails
 # Always fall back to system glibc if vulnerable glibc compilation fails
 WORKDIR /poc
-RUN DYNAMIC_LINKER=$(find /opt/glibc-vulnerable/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
+RUN DYNAMIC_LINKER=$(find {install_prefix}/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
     echo "Found dynamic linker: $DYNAMIC_LINKER" && \\
     if [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then \\
         echo "Attempting compilation with vulnerable glibc..."; \\
         gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include \\
             -ldl -lpthread 2>&1 || \\
         gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include \\
             -ldl 2>&1 || \\
         gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include \\
             -lm 2>&1 || \\
         gcc -o exploit exploit.c \\
-            -Wl,-rpath,/opt/glibc-vulnerable/lib \\
+            -Wl,-rpath,{install_prefix}/lib \\
             -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L/opt/glibc-vulnerable/lib \\
-            -I/opt/glibc-vulnerable/include 2>&1 || \\
+            -L{install_prefix}/lib \\
+            -I{install_prefix}/include 2>&1 || \\
         echo "Vulnerable glibc compilation failed"; \\
     fi && \\
     if [ ! -f /poc/exploit ]; then \\
@@ -1613,7 +1864,7 @@ RUN if [ ! -f /poc/exploit ]; then \\
     fi
 
 # Set environment for running with vulnerable glibc
-ENV LD_LIBRARY_PATH=/opt/glibc-vulnerable/lib
+ENV LD_LIBRARY_PATH={install_prefix}/lib
 
 # Default command: run the exploit
 CMD ["/poc/exploit"]
@@ -1678,9 +1929,10 @@ CMD ["/poc/exploit"]
 class DockerManager:
     """Manages Docker image builds and container execution"""
     
-    def __init__(self, logger: logging.Logger, timeout: int = 3600):
+    def __init__(self, logger: logging.Logger, timeout: int = 3600, docker_platform: str = None):
         self.logger = logger
         self.timeout = timeout
+        self.docker_platform = docker_platform
         try:
             self.client = docker.from_env()
             self.client.ping()
@@ -1694,26 +1946,27 @@ class DockerManager:
         self.logger.info(f"Building Docker image for {vuln.cve}...")
         
         try:
-            image, build_logs = self.client.images.build(
-                path=str(build_context),
-                tag=vuln.image_name,
-                rm=True,
-                forcerm=True,
-                timeout=self.timeout
+            image, build_logs = _docker_build(
+                self.client, str(build_context), vuln.image_name,
+                rm=True, forcerm=True, timeout=self.timeout,
+                platform=self.docker_platform, logger=self.logger,
             )
             
             # Collect build logs
             log_output = []
-            for chunk in build_logs:
-                if 'stream' in chunk:
-                    log_output.append(chunk['stream'])
-                elif 'error' in chunk:
-                    log_output.append(f"ERROR: {chunk['error']}")
+            if isinstance(build_logs, str):
+                log_output = [build_logs]
+            else:
+                for chunk in build_logs:
+                    if 'stream' in chunk:
+                        log_output.append(chunk['stream'])
+                    elif 'error' in chunk:
+                        log_output.append(f"ERROR: {chunk['error']}")
             
             self.logger.info(f"Successfully built image: {vuln.image_name}")
             return True, '\n'.join(log_output)
             
-        except BuildError as e:
+        except (BuildError, docker.errors.BuildError) as e:
             self.logger.error(f"Build failed for {vuln.cve}: {e}")
             return False, str(e)
         except APIError as e:
@@ -1723,6 +1976,15 @@ class DockerManager:
     def run_container(self, vuln: VulnerabilityInfo, run_timeout: int = 300) -> Tuple[bool, int, str]:
         """Run container and execute PoC"""
         self.logger.info(f"Running container for {vuln.cve}...")
+        container = None
+        
+        # Remove leftover container from a previous run (avoids 409 Conflict)
+        try:
+            stale = self.client.containers.get(vuln.container_name)
+            stale.remove(force=True)
+            self.logger.info(f"Removed leftover container: {vuln.container_name}")
+        except Exception:
+            pass
         
         try:
             # Run container with resource limits
@@ -1734,7 +1996,7 @@ class DockerManager:
                 cpu_period=100000,
                 cpu_quota=100000,  # Limit to 1 CPU
                 network_disabled=True,  # Security: disable network
-                remove=False  # Keep container for log inspection
+                remove=False,  # Keep container for log inspection
             )
             
             # Wait for container to finish (with timeout)
@@ -1751,7 +2013,6 @@ class DockerManager:
                 pass
             
             # Interpret results
-            # For most vulnerabilities, a crash (segfault) or specific exit codes indicate success
             vulnerability_triggered = self._interpret_exit_code(vuln, exit_code, logs)
             
             self.logger.info(f"Container {vuln.container_name} exited with code {exit_code}")
@@ -1759,9 +2020,31 @@ class DockerManager:
             
         except ContainerError as e:
             self.logger.warning(f"Container error (may indicate vulnerability triggered): {e}")
-            # Container errors often mean the vulnerability was triggered
             return True, e.exit_status, str(e)
         except Exception as e:
+            if container is not None:
+                try:
+                    container.stop(timeout=5)
+                except:
+                    pass
+                try:
+                    logs = container.logs(stdout=True, stderr=True).decode('utf-8', errors='replace')
+                except:
+                    logs = ""
+                try:
+                    container.remove(force=True)
+                except:
+                    pass
+                if "timed out" in str(e).lower() or "timeout" in str(e).lower():
+                    self.logger.warning(
+                        f"Container for {vuln.cve} timed out after {run_timeout}s "
+                        f"(PoC may hang or trigger deadlock). Partial logs: {logs[:500]}"
+                    )
+                    # A timeout means the PoC caused a hang, infinite loop, or
+                    # deadlock — which IS vulnerability reproduction for DoS-class
+                    # bugs (resource exhaustion, stack overflow causing infinite
+                    # recursion, etc.).
+                    return True, -1, f"TIMEOUT after {run_timeout}s (vulnerability likely triggered - PoC caused hang/deadlock). Partial output: {logs}"
             self.logger.error(f"Failed to run container for {vuln.cve}: {e}")
             return False, -1, str(e)
     
@@ -1965,6 +2248,15 @@ class DockerManager:
         self.logger.info(f"Running container from tag {image_tag} for {vuln.cve}...")
         
         container_name = f"ai-ssd-{vuln.cve.lower()}-run"
+        container = None
+        
+        # Remove leftover container from a previous run (avoids 409 Conflict)
+        try:
+            stale = self.client.containers.get(container_name)
+            stale.remove(force=True)
+            self.logger.info(f"Removed leftover container: {container_name}")
+        except Exception:
+            pass
         
         try:
             container = self.client.containers.run(
@@ -1975,7 +2267,7 @@ class DockerManager:
                 cpu_period=100000,
                 cpu_quota=100000,
                 network_disabled=True,
-                remove=False
+                remove=False,
             )
             
             result = container.wait(timeout=run_timeout)
@@ -1995,6 +2287,26 @@ class DockerManager:
             self.logger.warning(f"Container error (may indicate vulnerability triggered): {e}")
             return True, e.exit_status, str(e)
         except Exception as e:
+            # On timeout or other errors, stop and remove the container
+            if container is not None:
+                try:
+                    container.stop(timeout=5)
+                except:
+                    pass
+                try:
+                    logs = container.logs(stdout=True, stderr=True).decode('utf-8', errors='replace')
+                except:
+                    logs = ""
+                try:
+                    container.remove(force=True)
+                except:
+                    pass
+                if "timed out" in str(e).lower() or "timeout" in str(e).lower():
+                    self.logger.warning(
+                        f"Container for {vuln.cve} timed out after {run_timeout}s "
+                        f"(PoC may hang or trigger deadlock). Partial logs: {logs[:500]}"
+                    )
+                    return True, -1, f"TIMEOUT after {run_timeout}s (vulnerability likely triggered - PoC caused hang/deadlock). Partial output: {logs}"
             self.logger.error(f"Failed to run container for {vuln.cve}: {e}")
             return False, -1, str(e)
 
@@ -2180,53 +2492,79 @@ class PipelineOrchestrator:
         self.specific_cve = args.cve
         self.dry_run = getattr(args, 'dry_run', False)
         self.skipped_cves = getattr(args, 'skipped_cves', []) or []
-        
-        # Phase 0 CSV path (preferred if it exists)
-        self.phase0_csv_path = Path(getattr(args, 'phase0_csv', '') or 
-                                     str(self.base_dir / PHASE0_CSV_PATH))
-        
+
+        # Load Phase 0 config and resolve all project-specific Phase 1 settings
+        phase0_config_path = getattr(args, 'phase0_config', None)
+        if phase0_config_path:
+            phase0_config_path = Path(phase0_config_path)
+        raw_cfg = _load_phase0_config(phase0_config_path)
+        self._p1 = _resolve_phase1_settings(raw_cfg, self.base_dir)
+
+        # Populate the module-level era map so helper functions can access it
+        global _COMMIT_ERA_MAP
+        _COMMIT_ERA_MAP = {int(k): v for k, v in self._p1["commit_era_map"].items()}
+
+        # CSV path: CLI override → config-derived → fallback default
+        cli_csv = getattr(args, 'phase0_csv', None)
+        self.phase0_csv_path = (
+            Path(cli_csv) if cli_csv else self._p1["csv_path"]
+        )
+
         # Setup directories
         self.docker_builds_dir = self.base_dir / "docker_builds"
         self.results_dir = self.base_dir / "results"
         self.logs_dir = self.base_dir / "logs"
-        
+
         # Setup logging
         self.logger = setup_logging(self.logs_dir, args.verbose)
-        
-        # glibc repo path (used for commit date resolution)
-        self.glibc_repo_path = self.base_dir / GLIBC_LOCAL_PATH
-        
-        # Initialize components
-        self.logger.info(f"Phase 0 CSV detected: {self.phase0_csv_path}")
+
+        self.logger.info(f"Phase 0 config: {phase0_config_path or '(none)'}")
+        self.logger.info(f"Phase 0 CSV: {self.phase0_csv_path}")
+        self.logger.info(f"Project repo: {self._p1['project_repo_path']}")
+
+        project_repo = self._p1["project_repo_path"]
         self.csv_parser = Phase0CSVParser(
             self.phase0_csv_path, self.logger,
             skipped_cves=self.skipped_cves,
-            glibc_repo_path=self.glibc_repo_path if self.glibc_repo_path.exists() else None
+            project_repo_path=project_repo if project_repo.exists() else None,
+            base_image_prefix=self._p1["base_image_prefix"],
+            cve_image_prefix=self._p1["cve_image_prefix"],
+            commit_era_map=self._p1["commit_era_map"],
         )
-        
+
         self.dockerfile_gen = DockerfileGenerator(self.logger)
-        self.docker_mgr = DockerManager(self.logger, self.build_timeout)
+        self.docker_mgr = DockerManager(self.logger, self.build_timeout,
+                                        docker_platform=self._p1.get("docker_platform"))
         self.poc_mgr = PoCManager(self.exploits_dir, self.logger)
         self.report_gen = ReportGenerator(self.results_dir, self.logger)
-        
+
         # Phase 0 components (initialized lazily)
-        self._glibc_mgr = None
+        self._repo_mgr = None
         self._base_builder = None
         self._cve_builder = None
         self._manifest = None
-    
+
     def _init_phase0_components(self):
         """Initialize Phase 0 image-building components."""
-        glibc_path = self.glibc_repo_path
-        self._glibc_mgr = GlibcRepoManager(glibc_path, GLIBC_REMOTE_URL, self.logger)
+        project_repo = self._p1["project_repo_path"]
+        self._repo_mgr = ProjectRepoManager(
+            project_repo, self._p1["project_repo_remote_url"], self.logger
+        )
         self._base_builder = BaseImageBuilder(
-            self.docker_mgr.client, glibc_path, self.logger, self.build_timeout
+            self.docker_mgr.client, project_repo, self.logger, self.build_timeout,
+            base_image_prefix=self._p1["base_image_prefix"],
+            source_dir_name=self._p1["source_dir_name"],
+            build_dir_name=self._p1["build_dir_name"],
+            docker_platform=self._p1.get("docker_platform"),
         )
         self._cve_builder = CVEImageBuilder(
-            self.docker_mgr.client, self.logger, self.build_timeout
+            self.docker_mgr.client, self.logger, self.build_timeout,
+            source_dir_name=self._p1["source_dir_name"],
+            build_dir_name=self._p1["build_dir_name"],
+            install_prefix=self._p1["install_prefix"],
+            docker_platform=self._p1.get("docker_platform"),
         )
-        manifest_path = self.base_dir / IMAGE_MANIFEST_PATH
-        self._manifest = ImageManifest(manifest_path, self.logger)
+        self._manifest = ImageManifest(self._p1["image_manifest_path"], self.logger)
     
     def run(self):
         """Execute the full pipeline"""
@@ -2267,13 +2605,14 @@ class PipelineOrchestrator:
         """Phase 0 optimized path: reusable base images, derived CVE images."""
         self._init_phase0_components()
         
-        # Step 1: Pre-update glibc repository (fail fast)
-        self.logger.info("\n--- Pre-updating glibc repository ---")
+        # Step 1: Pre-update project repository (fail fast)
+        project_repo = self._p1["project_repo_path"]
+        self.logger.info(f"\n--- Pre-updating project repository: {project_repo} ---")
         if self.dry_run:
-            self.logger.info("[DRY RUN] Would update glibc repository")
+            self.logger.info("[DRY RUN] Would update project repository")
         else:
-            if not self._glibc_mgr.update_or_clone():
-                self.logger.error("FATAL: glibc repository update failed. Aborting Phase 1.")
+            if not self._repo_mgr.update_or_clone():
+                self.logger.error("FATAL: project repository update failed. Aborting Phase 1.")
                 sys.exit(1)
         
         # Step 2: Group CVEs by ubuntu_version
@@ -2298,7 +2637,7 @@ class PipelineOrchestrator:
                 continue
             
             if self.dry_run:
-                tag = f"{BASE_IMAGE_PREFIX}:ubuntu-{ubuntu_version}"
+                tag = f"{self._p1['base_image_prefix']}:ubuntu-{ubuntu_version}"
                 self.logger.info(f"[DRY RUN] Would build base image: {tag}")
                 continue
             
@@ -2506,13 +2845,21 @@ Examples:
         default=os.path.dirname(os.path.abspath(__file__)),
         help='Base directory for the project (default: script directory)'
     )
-    
-    
+
+    parser.add_argument(
+        '--phase0-config',
+        type=str,
+        default=None,
+        help='Path to the Phase 0 YAML config file. Used to derive project-specific '
+             'Phase 1 settings (repo URL, image prefixes, commit-era map, CSV path, etc.).'
+    )
+
     parser.add_argument(
         '--phase0-csv',
         type=str,
         default=None,
-        help='Path to Phase 0 CSV (glibc_cve_poc_complete.csv). Auto-detected if omitted.'
+        help='Explicit path to the Phase 0 CSV output. Overrides the path derived from '
+             '--phase0-config when both are given.'
     )
     
     parser.add_argument(

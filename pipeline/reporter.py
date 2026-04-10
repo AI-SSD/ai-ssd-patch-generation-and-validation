@@ -30,15 +30,22 @@ import matplotlib.patches as mpatches
 import numpy as np
 
 # =============================================================================
-# Configuration
+# Configuration – loaded from config.yaml
 # =============================================================================
 
 BASE_DIR = Path(__file__).parent.resolve()
-RESULTS_DIR = BASE_DIR / "results"
-PATCHES_DIR = BASE_DIR / "patches"
-VALIDATION_RESULTS_DIR = BASE_DIR / "validation_results"
-REPORTS_DIR = BASE_DIR / "reports"
-LOG_DIR = BASE_DIR / "logs"
+
+sys.path.insert(0, str(BASE_DIR))
+from master_pipeline.config import load_pipeline_config  # noqa: E402
+
+_cfg = load_pipeline_config(BASE_DIR)
+_paths = _cfg.get("paths", {}) if isinstance(_cfg.get("paths"), dict) else {}
+
+RESULTS_DIR = BASE_DIR / str(_paths.get("results", "results"))
+PATCHES_DIR = BASE_DIR / str(_paths.get("patches", "patches"))
+VALIDATION_RESULTS_DIR = BASE_DIR / str(_paths.get("validation_results", "validation_results"))
+REPORTS_DIR = BASE_DIR / str(_paths.get("reports", "reports"))
+LOG_DIR = BASE_DIR / str(_paths.get("logs", "logs"))
 
 # Color scheme for visualizations
 COLORS = {
@@ -225,9 +232,10 @@ class DataLoader:
     
     def __init__(self, base_dir: Path):
         self.base_dir = base_dir
-        self.results_dir = base_dir / "results"
-        self.patches_dir = base_dir / "patches"
-        self.validation_dir = base_dir / "validation_results"
+        _p = _paths  # use module-level config
+        self.results_dir = base_dir / str(_p.get("results", "results"))
+        self.patches_dir = base_dir / str(_p.get("patches", "patches"))
+        self.validation_dir = base_dir / str(_p.get("validation_results", "validation_results"))
     
     def load_phase1_results(self) -> List[Phase1Result]:
         """Load Phase 1 vulnerability reproduction results."""
@@ -1387,7 +1395,7 @@ class PipelineReporter:
     
     def __init__(self, base_dir: Path, output_dir: Optional[Path] = None):
         self.base_dir = base_dir
-        self.output_dir = output_dir or (base_dir / "reports")
+        self.output_dir = output_dir or (base_dir / str(_paths.get("reports", "reports")))
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         self.loader = DataLoader(base_dir)

@@ -176,7 +176,15 @@ poc_repair:
   max_repair_attempts: 3
 
   # Timeout for each LLM API call (seconds)
-  api_timeout: 300
+  api_timeout: 120
+
+  # Ollama context window override passed as options.num_ctx.
+  # 0 = use the server default.
+  num_ctx: 0
+
+  # Maximum characters of PoC source code included in the prompt.
+  # 0 = no truncation.
+  max_poc_chars: 0
 
   # Sampling temperature for the LLM
   temperature: 0.2
@@ -225,7 +233,9 @@ output:
     - "CWE"
     - "CWE_Description"
     - "project_version"
+    - "project_version_normalized"
     - "ubuntu_version"
+    - "poc_index"
     - "poc_path"
     - "poc_language"
     - "manual_review_required"

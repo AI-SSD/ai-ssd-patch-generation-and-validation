@@ -556,6 +556,7 @@ class SyntaxValidator(PipelineModule):
             "details": results,
         }
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
             logger.info("Syntax validation report saved to %s", path)
         except IOError as exc:

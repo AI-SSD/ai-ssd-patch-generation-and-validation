@@ -47,13 +47,9 @@ pipeline/p.txt
 pipeline/docker-debug.txt
 pipeline/random.txt
 pipeline/glibc_cve_poc_complete.csv
-pipeline/glibc_cve_poc_map_filtered.json
-pipeline/glibc_cve_poc_map.json
-pipeline/image_manifest.json
-pipeline/syntax_validation_report.json
 pipeline/exploit-database
 pipeline/glibc
 pipeline/exploits
 pipeline/manual_supervision
-pipeline/manual_review_queue.json
-pipeline/poc_repair_report.json
+
+_ISSRE_2026___Almeida_

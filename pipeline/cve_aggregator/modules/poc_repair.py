@@ -34,19 +34,41 @@ logger = logging.getLogger(__name__)
 # Prompt Templates
 # ═══════════════════════════════════════════════════════════════════════
 
+# --- Comment-prefix per language (used in retry prompts) ---
+_COMMENT_PREFIX: Dict[str, str] = {
+    "c": "//", "python": "#", "shell": "#", "ruby": "#",
+    "perl": "#", "php": "//",
+}
+
 # --- Language-specific guidance injected into prompts ---
 _LANG_GUIDANCE: Dict[str, str] = {
     "c": (
-        "C-SPECIFIC CORRUPTION PATTERNS TO FIX:\n"
+        "C-SPECIFIC RULES:\n"
         "  • Preprocessor directives missing the leading '#' (e.g. 'include <stdio.h>' → '#include <stdio.h>')\n"
         "  • Bare numeric tokens on their own line (OCR/scraping noise) — comment them out with '//'\n"
         "  • Plain-English prose lines embedded in code — comment them out with '//'\n"
         "  • Unbalanced braces or parentheses from truncated scraping\n"
         "  • Missing 'int main()' or function return types stripped during extraction\n"
-        "  DO NOT add #include statements that were not in the original to fix missing-header errors."
+        "  • If an error says 'undeclared identifier' for a well-known POSIX/Linux symbol\n"
+        "    (e.g. environ, O_RDONLY, PAGE_SIZE, SOMAXCONN, socklen_t), add the STANDARD\n"
+        "    header that declares it (e.g. <unistd.h>, <fcntl.h>, <sys/socket.h>).\n"
+        "    These headers were almost certainly in the original code and were stripped during scraping.\n"
+        "  • If the file appears to be a SHELL SCRIPT or prose write-up (contains '$', 'mkdir',\n"
+        "    'ln /bin/', 'exec 3<', 'whoami', etc. but NO #include directives and NO function\n"
+        "    definitions), do NOT try to convert it to C. Instead, wrap the ENTIRE content\n"
+        "    in a block comment /* ... */ so it compiles as an empty C translation unit.\n"
+        "\n"
+        "  IMPORTANT: Validation runs on macOS with Xcode's clang, NOT Linux gcc.\n"
+        "  Some Linux-only headers (e.g. <sys/mount.h> fields, <asm/..., linux/...)>\n"
+        "  may produce 'undeclared identifier' errors that are FALSE POSITIVES.\n"
+        "  For those, add a minimal stub definition guarded by #ifndef, e.g.:\n"
+        "    #ifndef PAGE_MASK\n"
+        "    #define PAGE_MASK (~(PAGE_SIZE - 1))\n"
+        "    #endif\n"
+        "  This preserves compilation on both macOS and Linux."
     ),
     "python": (
-        "PYTHON-SPECIFIC CORRUPTION PATTERNS TO FIX:\n"
+        "PYTHON-SPECIFIC RULES:\n"
         "  • Python 2 syntax that is not valid Python 3 (print statement, except E, e: syntax)\n"
         "  • Indentation errors caused by HTML-to-text conversion (tabs vs spaces mixed)\n"
         "  • Prose/description lines inserted between code sections — comment them out with '#'\n"
@@ -54,7 +76,7 @@ _LANG_GUIDANCE: Dict[str, str] = {
         "  • Missing colons at the end of def/class/if/for/while lines (stripped by scrapers)"
     ),
     "shell": (
-        "SHELL-SPECIFIC CORRUPTION PATTERNS TO FIX:\n"
+        "SHELL-SPECIFIC RULES:\n"
         "  • Missing shebang line (add '#!/bin/bash' or '#!/bin/sh' if absent)\n"
         "  • Prose/description lines not commented out — prefix them with '#'\n"
         "  • Broken heredoc syntax from scraping (EOF markers not on their own line)\n"
@@ -62,21 +84,21 @@ _LANG_GUIDANCE: Dict[str, str] = {
         "  • Variable assignments with spaces around '=' (bash requires no spaces)"
     ),
     "ruby": (
-        "RUBY-SPECIFIC CORRUPTION PATTERNS TO FIX:\n"
+        "RUBY-SPECIFIC RULES:\n"
         "  • Prose lines without comment markers — prefix with '#'\n"
         "  • Missing 'end' keywords from truncated scraping\n"
         "  • Require statements with incorrect string quoting from HTML entities\n"
         "  • Unbalanced do/end or begin/rescue/end blocks"
     ),
     "perl": (
-        "PERL-SPECIFIC CORRUPTION PATTERNS TO FIX:\n"
+        "PERL-SPECIFIC RULES:\n"
         "  • Missing 'use strict;' / 'use warnings;' is OK — do not add them\n"
         "  • Prose lines not commented — prefix with '#'\n"
         "  • Broken heredoc markers\n"
         "  • Missing semicolons at end of statements stripped during scraping"
     ),
     "php": (
-        "PHP-SPECIFIC CORRUPTION PATTERNS TO FIX:\n"
+        "PHP-SPECIFIC RULES:\n"
         "  • Missing '<?php' opening tag — add if absent\n"
         "  • Prose lines inside code blocks — comment out with '//'\n"
         "  • HTML entity artefacts (&lt; &gt; &amp;) that should be < > &\n"
@@ -92,12 +114,76 @@ _DEFAULT_LANG_GUIDANCE = (
     "  • Unbalanced brackets or block delimiters"
 )
 
+
+# ── Error classification helpers ─────────────────────────────────────
+# Used to give the LLM targeted hints about what kind of errors it faces.
+
+def _classify_errors(errors: List[str], language: str) -> Dict[str, List[str]]:
+    """Classify compiler/validator errors into actionable categories.
+
+    Returns a dict with keys: 'scraping', 'missing_decl', 'platform', 'other'.
+    """
+    cats: Dict[str, List[str]] = {
+        "scraping": [], "missing_decl": [], "platform": [], "other": [],
+    }
+    if language != "c":
+        cats["other"] = list(errors)
+        return cats
+
+    for e in errors:
+        lower = e.lower()
+        if "invalid preprocessing directive" in lower:
+            cats["scraping"].append(e)
+        elif "expected ';' after top level declarator" in lower and "from:" in lower:
+            cats["scraping"].append(e)
+        elif any(p in lower for p in [
+            "unknown type name", "use of undeclared identifier",
+            "no member named", "expected expression",
+        ]):
+            cats["missing_decl"].append(e)
+        elif "xcode" in lower or "macosx" in lower or "xcrun" in lower:
+            cats["platform"].append(e)
+        else:
+            cats["other"].append(e)
+    return cats
+
+
+def _build_error_summary(cats: Dict[str, List[str]]) -> str:
+    """Build a human-readable summary of classified errors for the prompt."""
+    parts = []
+    if cats["scraping"]:
+        parts.append(
+            f"  SCRAPING DAMAGE ({len(cats['scraping'])} errors):\n"
+            f"    Prose lines, missing '#' on preprocessor directives, HTML artefacts.\n"
+            f"    → Comment out prose with '//', restore '#' on directives."
+        )
+    if cats["missing_decl"]:
+        parts.append(
+            f"  MISSING DECLARATIONS ({len(cats['missing_decl'])} errors):\n"
+            f"    Undeclared identifiers, unknown types, missing struct members.\n"
+            f"    → If it's a standard POSIX/Linux symbol, add the missing #include.\n"
+            f"    → If it's a project-specific constant (e.g. PAGE_MASK), add a\n"
+            f"      guarded #define stub. Do NOT remove the code that uses it."
+        )
+    if cats["platform"]:
+        parts.append(
+            f"  PLATFORM MISMATCH ({len(cats['platform'])} errors):\n"
+            f"    Errors from compiling Linux-targeted code on macOS.\n"
+            f"    → Add #ifdef/#ifndef guards or stub definitions as needed."
+        )
+    if cats["other"]:
+        parts.append(
+            f"  OTHER ({len(cats['other'])} errors):\n"
+            f"    General compilation errors — fix as needed."
+        )
+    return "\n".join(parts)
+
 SYSTEM_PROMPT = """\
 You are a senior security researcher and expert programmer.\
- Your task is to repair the SYNTAX errors in a Proof-of-Concept (PoC) exploit\
- script that was automatically scraped from ExploitDB.
+ Your task is to repair COMPILATION/SYNTAX errors in a Proof-of-Concept (PoC)\
+ exploit script that was automatically scraped from ExploitDB.
 
-CONTEXT — WHY THESE FILES HAVE SYNTAX ERRORS:
+CONTEXT — WHY THESE FILES HAVE ERRORS:
 These PoC scripts were scraped from web pages and PDF files.\
  During extraction, the following corruption routinely occurs:
   • Prose/description text is mixed into the source code without comment markers.
@@ -106,45 +192,69 @@ These PoC scripts were scraped from web pages and PDF files.\
   • HTML entities (&lt; &gt; &amp;) replace real characters.
   • Indentation is garbled (tabs replaced by spaces inconsistently).
   • Numeric labels or line numbers from listings are left as bare tokens.
+  • Standard #include headers may have been accidentally stripped.
 
-YOUR JOB:
-  1. Identify and fix the SYNTAX errors reported by the validator.
+ADDITIONAL CONTEXT — CROSS-PLATFORM VALIDATION:
+The validator may run on macOS (clang/Xcode) but the PoC targets Linux.\
+ Some Linux-only symbols (PAGE_MASK, SOMAXCONN, environ, etc.) will appear\
+ as 'undeclared identifier' errors. These are NOT real bugs in the PoC.\
+ Fix them by adding the correct standard header or a guarded #define stub.
+
+YOUR RULES:
+  1. Fix ALL errors reported by the validator so the code compiles cleanly.
   2. Treat the EXPLOIT LOGIC as sacred — never change what the script does.
-  3. Do NOT rewrite, optimise, or modernise the code beyond what is needed for syntax.
-  4. Do NOT add imports, headers, or dependencies not originally in the script.
+  3. Do NOT rewrite, optimise, or modernise the code beyond what is needed.
+  4. You MAY add standard library #include headers if the errors clearly show\
+ they are missing (e.g. <unistd.h> for environ, <fcntl.h> for O_RDONLY).\
+ Do NOT add third-party dependencies.
   5. Comment out (do NOT delete) any prose lines that cannot be valid code.
   6. Return ONLY the complete, corrected source code — no markdown fences,\
- no explanations, no preamble.
+ no explanations, no preamble, no leading comment about what you fixed.
 
 OUTPUT FORMAT:
-Start directly with the first line of the source file (e.g. '#!/usr/bin/env python3',\
- '#include <stdio.h>', '<?php', etc.).\
+Start directly with the first line of the source file (e.g. '#include <stdio.h>',\
+ '#!/usr/bin/env python3', '<?php', etc.).\
  Do NOT wrap the code in triple backticks or any other delimiters.\
+ Do NOT start with a comment describing your fix.\
 """
 
 RETRY_SYSTEM_PROMPT = """\
 You are a senior security researcher and expert programmer.\
- Your previous attempt to repair a scraped PoC exploit script FAILED syntax validation.\
+ Your previous attempt to repair a scraped PoC exploit script FAILED validation.\
  You must analyse your mistake and produce a corrected version.
 
-CONTEXT — WHY THESE FILES HAVE SYNTAX ERRORS:
+CONTEXT — WHY THESE FILES HAVE ERRORS:
 These PoC scripts were scraped from ExploitDB web pages and PDFs.\
  Common corruption: prose lines mixed into code without comment markers,\
  missing preprocessor '#' characters, truncated lines, HTML entities,\
- garbled indentation, and bare numeric line-number artefacts.
+ garbled indentation, and bare numeric line-number artefacts.\
+ Standard #include headers may also have been stripped during scraping.
 
-YOUR JOB:
+ADDITIONAL CONTEXT — CROSS-PLATFORM VALIDATION:
+The validator may run on macOS (clang/Xcode) but the PoC targets Linux.\
+ Fix Linux-only symbols by adding the correct standard header or a stub #define.
+
+YOUR RULES:
   1. Study BOTH the original errors AND the new errors from your previous attempt.
-  2. Your previous repair introduced NEW errors or failed to fix the original ones — fix these.
+  2. Your previous repair introduced NEW errors or failed to fix the originals — fix them.
   3. Treat the EXPLOIT LOGIC as sacred — never change what the script does.
-  4. Do NOT add imports, headers, or dependencies not originally in the script.
+  4. You MAY add standard library #include headers when they are clearly missing.\
+ Do NOT add third-party or non-standard dependencies.
   5. Comment out (do NOT delete) any prose lines that cannot be valid code.
   6. Return ONLY the complete, corrected source code — no markdown fences,\
- no explanations, no preamble.
+ no explanations, no preamble, no leading comment about what you fixed.
+
+CRITICAL — DO NOT REPEAT THESE COMMON MISTAKES:
+  • Do NOT start your output with '# FIX: ...' — in C, '#' begins a preprocessor\
+ directive and '# FIX:' is an invalid directive that creates a new error.
+  • Do NOT generate code in a DIFFERENT language than requested.\
+ If the file is labelled C, output only C code.
+  • Do NOT hallucinate new functionality — only fix what is broken.
 
 OUTPUT FORMAT:
 Start directly with the first line of the source file.\
  Do NOT wrap the code in triple backticks or any other delimiters.\
+ Do NOT start with a comment describing your fix.\
 """
 
 
@@ -155,28 +265,45 @@ def _build_repair_prompt(
 ) -> str:
     """Build the initial user prompt for PoC repair.
 
-    Includes language-specific guidance about ExploitDB scraping artefacts
-    and the exact validator error messages to target.
+    Includes language-specific guidance, classified error analysis, and
+    the exact validator error messages to target.
     """
     lang_guidance = _LANG_GUIDANCE.get(language, _DEFAULT_LANG_GUIDANCE)
     error_block = "\n".join(f"  [{i+1}] {e}" for i, e in enumerate(errors))
 
-    return (
-        f"LANGUAGE: {language.upper()}\n\n"
-        f"{lang_guidance}\n\n"
+    # Classify errors and build targeted guidance
+    cats = _classify_errors(errors, language)
+    error_summary = _build_error_summary(cats)
+
+    parts = [
+        f"LANGUAGE: {language.upper()}\n",
+        f"{lang_guidance}\n",
+    ]
+
+    if error_summary:
+        parts.append(
+            f"══════════════════════════════════════════════════════════\n"
+            f"ERROR ANALYSIS (categorised for you):\n"
+            f"══════════════════════════════════════════════════════════\n"
+            f"{error_summary}\n"
+        )
+
+    parts.extend([
         f"══════════════════════════════════════════════════════════\n"
-        f"SYNTAX ERRORS REPORTED BY VALIDATOR:\n"
+        f"RAW ERRORS REPORTED BY VALIDATOR:\n"
         f"══════════════════════════════════════════════════════════\n"
-        f"{error_block}\n\n"
+        f"{error_block}\n",
         f"══════════════════════════════════════════════════════════\n"
         f"POC SOURCE CODE (scraped — may contain corruption):\n"
         f"══════════════════════════════════════════════════════════\n"
         f"{poc_code}\n"
-        f"══════════════════════════════════════════════════════════\n\n"
-        f"TASK: Fix the {len(errors)} syntax error(s) listed above while\n"
+        f"══════════════════════════════════════════════════════════\n",
+        f"TASK: Fix the {len(errors)} error(s) listed above while\n"
         f"preserving all exploit logic.\n"
-        f"Return the complete corrected script — nothing else."
-    )
+        f"Return the complete corrected source file — nothing else.",
+    ])
+
+    return "\n".join(parts)
 
 
 def _build_retry_prompt(
@@ -188,33 +315,49 @@ def _build_retry_prompt(
 ) -> str:
     """Build a retry prompt that surfaces the failed attempt and new errors.
 
-    Forces the LLM to reason about what went wrong before producing a new
-    version, rather than blindly regenerating.
+    Uses error classification and language-aware comment prefix to avoid
+    the LLM introducing new errors (e.g. ``# FIX:`` in C files).
     """
     lang_guidance = _LANG_GUIDANCE.get(language, _DEFAULT_LANG_GUIDANCE)
     error_block = "\n".join(f"  [{i+1}] {e}" for i, e in enumerate(new_errors))
 
-    return (
-        f"RETRY ATTEMPT #{attempt_number} — LANGUAGE: {language.upper()}\n\n"
-        f"{lang_guidance}\n\n"
+    # Classify errors for targeted guidance
+    cats = _classify_errors(new_errors, language)
+    error_summary = _build_error_summary(cats)
+
+    parts = [
+        f"RETRY ATTEMPT #{attempt_number} — LANGUAGE: {language.upper()}\n",
+        f"{lang_guidance}\n",
+    ]
+
+    if error_summary:
+        parts.append(
+            f"══════════════════════════════════════════════════════════\n"
+            f"ERROR ANALYSIS (categorised for you):\n"
+            f"══════════════════════════════════════════════════════════\n"
+            f"{error_summary}\n"
+        )
+
+    parts.extend([
         f"══════════════════════════════════════════════════════════\n"
         f"YOUR PREVIOUS REPAIR ATTEMPT (STILL INVALID):\n"
         f"══════════════════════════════════════════════════════════\n"
-        f"{previous_attempt}\n\n"
+        f"{previous_attempt}\n",
         f"══════════════════════════════════════════════════════════\n"
-        f"NEW SYNTAX ERRORS FROM YOUR PREVIOUS ATTEMPT:\n"
+        f"NEW ERRORS FROM YOUR PREVIOUS ATTEMPT:\n"
         f"══════════════════════════════════════════════════════════\n"
-        f"{error_block}\n\n"
+        f"{error_block}\n",
         f"══════════════════════════════════════════════════════════\n"
         f"ORIGINAL SCRAPED POC (for reference):\n"
         f"══════════════════════════════════════════════════════════\n"
         f"{original_code}\n"
-        f"══════════════════════════════════════════════════════════\n\n"
-        f"TASK: Before writing code, identify WHAT was wrong with your\n"
-        f"previous repair (in a single-line comment at the top, e.g.\n"
-        f"'# FIX: previous attempt left prose line on line 12 uncommented').\n"
-        f"Then return the complete corrected script — nothing else."
-    )
+        f"══════════════════════════════════════════════════════════\n",
+        f"TASK: Fix the {len(new_errors)} remaining error(s) in your previous\n"
+        f"attempt. Start your output directly with the first line of code.\n"
+        f"Return the complete corrected source file — nothing else.",
+    ])
+
+    return "\n".join(parts)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -232,6 +375,34 @@ def strip_markdown_fences(code: str) -> str:
     # Standalone fence lines
     code = re.sub(r"^\s*```[a-zA-Z0-9+#]*\s*$", "", code, flags=re.MULTILINE)
     return code.strip()
+
+
+def _strip_llm_preamble(code: str, language: str) -> str:
+    """Remove leading '# FIX: ...' or '// FIX: ...' comment lines.
+
+    LLMs often add a self-reflective comment at the top despite being told
+    not to.  In C, '# FIX:' is an invalid preprocessor directive, so this
+    must be stripped before validation.
+    """
+    if not code:
+        return code
+    prefix = _COMMENT_PREFIX.get(language, "//")
+    lines = code.split("\n")
+    # Strip up to 3 leading preamble lines (# FIX:, // FIX:, etc.)
+    stripped = 0
+    while stripped < min(3, len(lines)):
+        line = lines[stripped].strip()
+        if not line:
+            stripped += 1
+            continue
+        # Match '# FIX:', '// FIX:', '/* FIX:', etc.
+        if re.match(r"^(#\s*FIX\b|//\s*FIX\b|/\*\s*FIX\b)", line, re.IGNORECASE):
+            stripped += 1
+            continue
+        break
+    if stripped:
+        return "\n".join(lines[stripped:])
+    return code
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -255,11 +426,16 @@ class PoCRepairLLM(PipelineModule):
         api_endpoint: str = cfg.get("api_endpoint", "http://10.3.2.171:80/api/chat")
         model: str = cfg.get("model", "qwen2.5-coder:7b")
         max_attempts: int = cfg.get("max_repair_attempts", 3)
-        api_timeout: int = cfg.get("api_timeout", 300)
+        api_timeout: int = cfg.get("api_timeout", 600)
+        num_ctx: int = cfg.get("num_ctx", 0)          # 0 = use server default
+        max_poc_chars: int = cfg.get("max_poc_chars", 0)  # 0 = no truncation
         temperature: float = cfg.get("temperature", 0.2)
         report_path = Path(cfg.get("report_path", "poc_repair_report.json"))
         manual_queue_path = Path(cfg.get("manual_review_queue_path", "manual_review_queue.json"))
         poc_dir = Path(self.config.get("output", {}).get("poc_dir", "exploits"))
+        manual_dir = Path(
+            self.config.get("syntax_validator", {}).get("manual_supervision_dir", "manual_supervision")
+        )
 
         poc_dir.mkdir(parents=True, exist_ok=True)
 
@@ -294,6 +470,34 @@ class PoCRepairLLM(PipelineModule):
             )
             return context
 
+        # GPU availability gate: wait up to gpu_wait_timeout seconds for a
+        # free GPU.  When the timeout expires, skip repairs entirely to avoid
+        # wasting hours on CPU-only inference.
+        gpu_wait_timeout: int = cfg.get("gpu_wait_timeout", 120)
+        if gpu_wait_timeout > 0 and not self._wait_for_gpu(
+            api_endpoint, timeout=gpu_wait_timeout
+        ):
+            self.logger.warning(
+                "GPU not available after %d s — skipping PoC repair. "
+                "Set poc_repair.gpu_wait_timeout to 0 to disable this check.",
+                gpu_wait_timeout,
+            )
+            return context
+
+        # Pre-load the model before starting repairs.
+        # Ollama lazy-loads models on the first inference call; for large
+        # models like devstral (~14 GiB) this cold-start can take several
+        # minutes, exceeding api_timeout and causing every initial request
+        # to time out.  We trigger loading explicitly here and wait until
+        # the model is confirmed to be in GPU VRAM before continuing.
+        model_load_timeout: int = cfg.get("model_load_timeout", 300)
+        if not self._preload_model(api_endpoint, model, timeout=model_load_timeout):
+            self.logger.warning(
+                "Model '%s' did not reach GPU VRAM within %d s — "
+                "inference may be slow or time out.",
+                model, model_load_timeout,
+            )
+
         # Instantiate a SyntaxValidator to reuse Module 5 validation logic
         syntax_validator = SyntaxValidator(self.config)
         sv_cfg = self.config.get("syntax_validator", {})
@@ -304,6 +508,16 @@ class PoCRepairLLM(PipelineModule):
         repaired_count = 0
         failed_count = 0
 
+        # Build a set of CVE IDs that already have at least one valid PoC.
+        # When a CVE has a working exploit, spending LLM time repairing a
+        # broken *additional* PoC for the same CVE is wasteful (the repair
+        # for large files can easily exceed the API timeout).
+        cves_with_valid_poc: set = set()
+        for sr_key, sr_val in syntax_results.items():
+            if sr_val.get("is_valid"):
+                sr_cve, _, _ = sr_key.partition(":")
+                cves_with_valid_poc.add(sr_cve)
+
         for item in invalid_pocs:
             cve_id = item["cve_id"]
             exploit_idx = item["exploit_idx"]
@@ -311,6 +525,99 @@ class PoCRepairLLM(PipelineModule):
             language = item["language"]
             errors = item["errors"]
             key = f"{cve_id}:{exploit_idx}"
+
+            # ── Pre-check: skip if another valid PoC already exists ──
+            if cve_id in cves_with_valid_poc:
+                skip_msg = (
+                    f"CVE already has a valid PoC — skipping LLM repair "
+                    f"for supplementary PoC {key}"
+                )
+                self.logger.info("Skipping PoC %s — %s.", key, skip_msg)
+                failed_count += 1
+                repair_report[key] = {
+                    "repaired": False,
+                    "fixed_code": None,
+                    "attempts": 0,
+                    "last_errors": errors,
+                    "attempt_history": [],
+                    "skip_reason": skip_msg,
+                }
+                manual_queue.append({
+                    "cve_id": cve_id,
+                    "exploit_idx": exploit_idx,
+                    "language": language,
+                    "original_errors": errors,
+                    "last_errors": errors,
+                    "attempts": 0,
+                    "skip_reason": skip_msg,
+                    "flagged_at": datetime.now().isoformat(),
+                })
+                continue
+
+            # ── Pre-check: estimate token budget ──
+            # If the PoC is too large for the model to regenerate within the
+            # timeout, skip it early rather than burning 3×2 API calls.
+            # Assumes ~3 tok/s at full GPU speed; partial offload is slower.
+            est_output_tokens = len(original_code) // 4
+            est_generation_secs = est_output_tokens / 3  # conservative: 3 tok/s
+            if est_generation_secs > api_timeout * 0.8:
+                skip_msg = (
+                    f"PoC too large for LLM repair (~{est_output_tokens} output "
+                    f"tokens, ~{est_generation_secs:.0f}s estimated vs "
+                    f"{api_timeout}s timeout)"
+                )
+                self.logger.warning(
+                    "Skipping PoC %s — %s. Flagging for manual review.",
+                    key, skip_msg,
+                )
+                failed_count += 1
+                repair_report[key] = {
+                    "repaired": False,
+                    "fixed_code": None,
+                    "attempts": 0,
+                    "last_errors": errors,
+                    "attempt_history": [],
+                    "skip_reason": skip_msg,
+                }
+                manual_queue.append({
+                    "cve_id": cve_id,
+                    "exploit_idx": exploit_idx,
+                    "language": language,
+                    "original_errors": errors,
+                    "last_errors": errors,
+                    "attempts": 0,
+                    "skip_reason": skip_msg,
+                    "flagged_at": datetime.now().isoformat(),
+                })
+                continue
+
+            # ── Pre-check: detect obvious language mismatch ──
+            mismatch = self._detect_language_mismatch(original_code, language)
+            if mismatch:
+                self.logger.warning(
+                    "Skipping PoC %s — %s. Flagging for manual review.",
+                    key, mismatch,
+                )
+                failed_count += 1
+                repair_report[key] = {
+                    "repaired": False,
+                    "fixed_code": None,
+                    "attempts": 0,
+                    "last_errors": errors,
+                    "attempt_history": [],
+                    "skip_reason": mismatch,
+                }
+                manual_queue.append({
+                    "cve_id": cve_id,
+                    "exploit_idx": exploit_idx,
+                    "language": language,
+                    "original_errors": errors,
+                    "last_errors": errors,
+                    "attempts": 0,
+                    "skip_reason": mismatch,
+                    "flagged_at": datetime.now().isoformat(),
+                })
+                continue
 
             self.logger.info(
                 "Repairing PoC %s (lang=%s, errors=%d) …",
@@ -325,6 +632,8 @@ class PoCRepairLLM(PipelineModule):
                 api_endpoint=api_endpoint,
                 model=model,
                 api_timeout=api_timeout,
+                num_ctx=num_ctx,
+                max_poc_chars=max_poc_chars,
                 temperature=temperature,
                 syntax_validator=syntax_validator,
                 sv_cfg=sv_cfg,
@@ -340,6 +649,9 @@ class PoCRepairLLM(PipelineModule):
                 entry = dataset.cves.get(cve_id)
                 if entry and exploit_idx < len(entry.exploits):
                     entry.exploits[exploit_idx].source_code_content = fixed_code
+                    # Also update the language if it was originally misidentified
+                    if entry.exploits[exploit_idx].language in ("unknown", "text"):
+                        entry.exploits[exploit_idx].language = language
 
                 # ── Update syntax_results so OutputGenerator no longer flags it
                 if key in syntax_results:
@@ -361,6 +673,33 @@ class PoCRepairLLM(PipelineModule):
                     self.logger.warning(
                         "Failed to save repaired PoC %s: %s", key, exc
                     )
+
+                # ── Remove stale manual_supervision/ files for this PoC ──
+                if manual_dir.exists():
+                    # Remove exact files created by SyntaxValidator
+                    stale_candidates = [
+                        manual_dir / f"{cve_id}_{exploit_idx}{ext}",
+                        manual_dir / f"{cve_id}_{exploit_idx}.validation.json",
+                    ]
+                    # Also remove files created by master pipeline's
+                    # _generate_syntax_report (uses exploit filename without
+                    # index suffix, e.g. CVE-2011-2702.c)
+                    stale_candidates.extend(manual_dir.glob(f"{cve_id}{ext}"))
+                    stale_candidates.extend(manual_dir.glob(f"{cve_id}_syntax_report.txt"))
+                    stale_candidates.extend(manual_dir.glob(f"{cve_id}.ok"))
+                    for stale in stale_candidates:
+                        stale_path = Path(stale)
+                        if stale_path.exists():
+                            try:
+                                stale_path.unlink()
+                                self.logger.info(
+                                    "Removed stale manual supervision file: %s",
+                                    stale_path,
+                                )
+                            except OSError as exc:
+                                self.logger.warning(
+                                    "Could not remove %s: %s", stale_path, exc
+                                )
             else:
                 failed_count += 1
                 # ── Flag for manual supervision
@@ -454,6 +793,64 @@ class PoCRepairLLM(PipelineModule):
         return invalid
 
     # ------------------------------------------------------------------
+    # Language mismatch detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_language_mismatch(content: str, language: str) -> Optional[str]:
+        """Detect obvious language misidentification.
+
+        Returns a warning string if the content is clearly NOT the labelled
+        language, or None if it looks plausible.  This prevents the LLM from
+        wasting attempts trying to make prose/shell into valid C.
+        """
+        if language != "c":
+            return None
+
+        lines = content.split("\n")
+        total = len(lines)
+        if total < 5:
+            return None
+
+        c_anchors = 0
+        prose_lines = 0
+        shell_lines = 0
+        for line in lines:
+            s = line.strip()
+            if not s:
+                continue
+            # Strong C indicators
+            if re.match(r"^#\s*(include|define|if|ifdef|ifndef|elif|else|endif|pragma)\b", s):
+                c_anchors += 1
+            elif re.match(r"^(typedef|struct|union|enum|static|extern|void|char|int|long|float|double|unsigned|signed)\b", s):
+                c_anchors += 1
+            elif re.match(r"^(return|for|while|if|else|switch|case|break|continue)\b", s):
+                c_anchors += 1
+            # Shell indicators
+            elif re.match(r"^\$\s", s) or re.match(r"^(mkdir|ln |rm |ls |cat |exec |chmod |export )\b", s):
+                shell_lines += 1
+            # Prose indicators (5+ words, no code punctuation)
+            elif not any(ch in s for ch in (";", "{", "}", "(", ")", "#")):
+                words = re.findall(r"[A-Za-z]+", s)
+                if len(words) >= 6:
+                    prose_lines += 1
+
+        non_blank = sum(1 for l in lines if l.strip())
+        if non_blank == 0:
+            return None
+
+        # If <5% of lines look like C and >30% look like prose/shell, it's mislabeled
+        c_ratio = c_anchors / non_blank
+        prose_shell_ratio = (prose_lines + shell_lines) / non_blank
+
+        if c_ratio < 0.05 and prose_shell_ratio > 0.30:
+            return (
+                f"Content appears to be prose/shell (C anchors: {c_ratio:.0%}, "
+                f"prose+shell: {prose_shell_ratio:.0%}) — likely mislabeled as C"
+            )
+        return None
+
+    # ------------------------------------------------------------------
     # Core LLM repair loop
     # ------------------------------------------------------------------
 
@@ -467,8 +864,10 @@ class PoCRepairLLM(PipelineModule):
         api_endpoint: str,
         model: str,
         api_timeout: int,
-        temperature: float,
-        syntax_validator: SyntaxValidator,
+        num_ctx: int = 0,
+        max_poc_chars: int = 0,
+        temperature: float = 0.2,
+        syntax_validator: "SyntaxValidator",
         sv_cfg: Dict,
     ) -> Dict[str, Any]:
         """Try up to *max_attempts* LLM repairs, re-validating each time.
@@ -480,16 +879,32 @@ class PoCRepairLLM(PipelineModule):
         previous_attempt: Optional[str] = None
         attempt_history: List[Dict[str, Any]] = []
 
+        # Truncate PoC code to avoid exceeding the model's context window.
+        # The truncation notice lets the LLM know the file was cut, so it
+        # doesn't hallucinate a complete file from a partial one.
+        if max_poc_chars and len(original_code) > max_poc_chars:
+            truncated_chars = len(original_code) - max_poc_chars
+            prompt_code = (
+                original_code[:max_poc_chars]
+                + f"\n# ... [{truncated_chars} characters truncated — fix only what is shown]"
+            )
+            self.logger.debug(
+                "  PoC truncated from %d to %d chars for prompt.",
+                len(original_code), max_poc_chars,
+            )
+        else:
+            prompt_code = original_code
+
         for attempt in range(1, max_attempts + 1):
             self.logger.info("  Attempt %d/%d …", attempt, max_attempts)
 
             # Build the prompt
             if attempt == 1:
-                user_prompt = _build_repair_prompt(original_code, language, current_errors)
+                user_prompt = _build_repair_prompt(prompt_code, language, current_errors)
                 system_prompt = SYSTEM_PROMPT
             else:
                 user_prompt = _build_retry_prompt(
-                    original_code,
+                    prompt_code,
                     previous_attempt or "",
                     language,
                     current_errors,
@@ -497,10 +912,9 @@ class PoCRepairLLM(PipelineModule):
                 )
                 system_prompt = RETRY_SYSTEM_PROMPT
 
-            # Stagger temperature: base on attempt 1, +0.2 per retry (cap 0.9)
-            # This forces the LLM to explore different outputs rather than
-            # reproducing the same failed repair on every retry.
-            attempt_temperature = min(temperature + (attempt - 1) * 0.2, 0.9)
+            # Stagger temperature: base on attempt 1, +0.1 per retry (cap 0.5)
+            # This encourages slight exploration without hallucination.
+            attempt_temperature = min(temperature + (attempt - 1) * 0.1, 0.5)
 
             # Call the LLM
             raw_response, api_meta = self._call_llm(
@@ -510,6 +924,7 @@ class PoCRepairLLM(PipelineModule):
                 user_prompt=user_prompt,
                 timeout=api_timeout,
                 temperature=attempt_temperature,
+                num_ctx=num_ctx,
             )
 
             if raw_response is None:
@@ -525,6 +940,7 @@ class PoCRepairLLM(PipelineModule):
 
             # Clean the LLM output
             cleaned_code = strip_markdown_fences(raw_response)
+            cleaned_code = _strip_llm_preamble(cleaned_code, language)
             if not cleaned_code.strip():
                 self.logger.warning("  LLM returned empty code on attempt %d.", attempt)
                 attempt_history.append({
@@ -588,8 +1004,9 @@ class PoCRepairLLM(PipelineModule):
         user_prompt: str,
         timeout: int,
         temperature: float,
-        max_retries: int = 2,     # was 3; with lower api_timeout each retry is cheap
-        retry_delay: int = 5,     # was 10; shorter wait between inner retries
+        num_ctx: int = 0,
+        max_retries: int = 2,
+        retry_delay: int = 5,
     ) -> Tuple[Optional[str], Dict[str, Any]]:
         """Call the Ollama-compatible LLM API with retry logic.
 
@@ -601,19 +1018,43 @@ class PoCRepairLLM(PipelineModule):
             {"role": "user", "content": user_prompt},
         ]
 
+        options: Dict[str, Any] = {"temperature": temperature}
+        if num_ctx:
+            # Tell the Ollama server to use a specific context window for this
+            # request, overriding its loaded default (often 4096).  Without
+            # this, prompts larger than the server default are silently truncated.
+            options["num_ctx"] = num_ctx
+
         payload = {
             "model": model,
             "messages": messages,
             "stream": False,
-            "options": {
-                "temperature": temperature,
-            },
+            "options": options,
         }
+
+        # Rough token estimate (~4 chars/token for code).  This is logged
+        # so the user can detect when prompts risk being truncated by the
+        # server's context window.
+        total_chars = len(system_prompt) + len(user_prompt)
+        est_prompt_tokens = total_chars // 4
+        effective_ctx = num_ctx or 4096  # Ollama default when not set
+        if est_prompt_tokens > effective_ctx * 0.8:
+            self.logger.warning(
+                "  Prompt may exceed context window (~%d tokens vs num_ctx=%d). "
+                "Increase poc_repair.num_ctx or reduce prompt size.",
+                est_prompt_tokens, effective_ctx,
+            )
+        else:
+            self.logger.debug(
+                "  Prompt size: ~%d tokens (num_ctx=%d)",
+                est_prompt_tokens, effective_ctx,
+            )
 
         metadata: Dict[str, Any] = {
             "model": model,
             "timestamp_start": datetime.now().isoformat(),
             "payload_size": len(json.dumps(payload)),
+            "est_prompt_tokens": est_prompt_tokens,
             "retries": 0,
             "success": False,
             "error": None,
@@ -639,6 +1080,10 @@ class PoCRepairLLM(PipelineModule):
                 metadata["prompt_tokens"] = result.get("prompt_eval_count")
                 metadata["response_tokens"] = result.get("eval_count")
                 metadata["total_duration"] = result.get("total_duration")
+
+                # Post-inference GPU check: Ollama lazy-loads models on first
+                # call, so /api/ps is now guaranteed to show the runner.
+                self._check_gpu_status(api_endpoint, model)
 
                 return content, metadata
 
@@ -673,24 +1118,35 @@ class PoCRepairLLM(PipelineModule):
         return None, metadata
 
     # ------------------------------------------------------------------
-    # API health check
+    # API health check + GPU/CPU detection
     # ------------------------------------------------------------------
 
     def _check_api_health(self, api_endpoint: str, model: str) -> bool:
-        """Quick health check before processing (mirrors Phase 2)."""
+        """Quick health check before processing.
+
+        Uses GET /api/tags rather than a full inference POST so that the
+        check completes in milliseconds regardless of hardware speed.
+        Also triggers a best-effort GPU/CPU check via /api/ps.
+        """
+        from urllib.parse import urlparse, urlunparse
+
+        parsed = urlparse(api_endpoint)
+        base_url = urlunparse((parsed.scheme, parsed.netloc, "/api/tags", "", "", ""))
         try:
-            test_payload = {
-                "model": model,
-                "messages": [{"role": "user", "content": "test"}],
-                "stream": False,
-                "options": {"num_predict": 1},
-            }
-            resp = requests.post(api_endpoint, json=test_payload, timeout=30)
+            resp = requests.get(base_url, timeout=10)
             resp.raise_for_status()
-            self.logger.info("✓ LLM API health check passed (%s)", api_endpoint)
+            self.logger.info(
+                "✓ LLM API health check passed (%s reachable, %d models listed)",
+                api_endpoint,
+                len(resp.json().get("models", [])),
+            )
+            # Best-effort GPU check — model may not be loaded yet (Ollama
+            # lazy-loads on first inference), so we also check after the first
+            # successful call in _call_llm.
+            self._check_gpu_status(api_endpoint, model)
             return True
         except requests.exceptions.Timeout:
-            self.logger.error("✗ LLM API health check timed out.")
+            self.logger.error("✗ LLM API health check timed out (GET %s).", base_url)
             return False
         except requests.exceptions.ConnectionError:
             self.logger.error(
@@ -700,6 +1156,176 @@ class PoCRepairLLM(PipelineModule):
         except Exception as exc:
             self.logger.error("✗ LLM API health check failed: %s", exc)
             return False
+
+    def _check_gpu_status(self, api_endpoint: str, model: str) -> None:
+        """Check whether the model is GPU- or CPU-accelerated via /api/ps.
+
+        Ollama's /api/ps lists currently loaded runners.  Each entry includes:
+          • ``size``      – total model size in bytes
+          • ``size_vram`` – bytes currently held in GPU VRAM (0 ↔ CPU-only)
+
+        If the model is not yet loaded (lazy Ollama behaviour), the list will
+        be empty and we defer to the post-inference check in ``_call_llm``.
+        This method is idempotent: it sets ``self._gpu_status_logged = True``
+        after the first conclusive check so subsequent calls are no-ops.
+        """
+        if getattr(self, "_gpu_status_logged", False):
+            return
+
+        from urllib.parse import urlparse, urlunparse
+
+        parsed = urlparse(api_endpoint)
+        ps_url = urlunparse((parsed.scheme, parsed.netloc, "/api/ps", "", "", ""))
+        try:
+            resp = requests.get(ps_url, timeout=5)
+            resp.raise_for_status()
+            running = resp.json().get("models", [])
+
+            # Match by model name prefix (ignore tag suffix for flexibility)
+            model_base = model.split(":")[0].lower()
+            for entry in running:
+                if model_base in entry.get("name", "").lower():
+                    size_vram = entry.get("size_vram", 0)
+                    size_total = entry.get("size", 0)
+                    self._gpu_status_logged = True
+
+                    if size_vram == 0:
+                        self.logger.warning(
+                            "⚠ WARNING: Model '%s' is running on CPU only "
+                            "(size_vram=0). Inference will be significantly "
+                            "slower than GPU. Check that the Ollama server has "
+                            "CUDA/ROCm drivers installed and the container has "
+                            "GPU access (e.g. --gpus all).",
+                            model,
+                        )
+                    elif size_total > 0 and size_vram < size_total:
+                        pct = size_vram / size_total * 100
+                        self.logger.warning(
+                            "⚠ WARNING: Model '%s' is only partially "
+                            "GPU-accelerated (%.0f%% in VRAM, %.1f/%.1f GiB). "
+                            "Some layers are running on CPU — consider a "
+                            "smaller model or a GPU with more VRAM.",
+                            model, pct,
+                            size_vram / 1024 ** 3,
+                            size_total / 1024 ** 3,
+                        )
+                    else:
+                        self.logger.info(
+                            "✓ Model '%s' is fully GPU-accelerated "
+                            "(%.1f GiB in VRAM).",
+                            model, size_vram / 1024 ** 3,
+                        )
+                    return  # conclusive result found
+
+            # Model not loaded yet — will re-check after first inference
+            self.logger.debug(
+                "GPU status check: model '%s' not yet loaded in /api/ps — "
+                "will re-check after first inference.",
+                model,
+            )
+
+        except Exception as exc:
+            self.logger.debug("GPU status check skipped (%s).", exc)
+
+    def _wait_for_gpu(self, api_endpoint: str, timeout: int = 120,
+                      poll_interval: int = 15) -> bool:
+        """Poll /api/ps until GPU VRAM is free or *timeout* expires.
+
+        Returns True if GPU is available, False if the wait timed out.
+        """
+        from urllib.parse import urlparse, urlunparse
+
+        parsed = urlparse(api_endpoint)
+        ps_url = urlunparse((parsed.scheme, parsed.netloc, "/api/ps", "", "", ""))
+        start = time.time()
+
+        while True:
+            try:
+                resp = requests.get(ps_url, timeout=10)
+                resp.raise_for_status()
+                running = resp.json().get("models", [])
+                total_vram = sum(e.get("size_vram", 0) for e in running)
+                if not running or total_vram == 0:
+                    return True
+            except Exception:
+                return True  # can't reach /api/ps — assume available
+
+            elapsed = time.time() - start
+            if elapsed >= timeout:
+                return False
+
+            names = [e.get("name", "?") for e in running]
+            vram_gib = total_vram / (1024 ** 3)
+            self.logger.info(
+                "GPU busy (%.1f GiB VRAM used by %s) — waiting (%d/%d s) …",
+                vram_gib, ", ".join(names), int(elapsed), timeout,
+            )
+            time.sleep(poll_interval)
+
+    def _preload_model(self, api_endpoint: str, model: str,
+                       timeout: int = 300, poll_interval: int = 10) -> bool:
+        """Trigger Ollama lazy-loading and wait until *model* is in GPU VRAM.
+
+        Ollama loads model weights on the first inference request.  For large
+        models this cold-start can take several minutes, causing the first
+        real API call to time out.  This method sends a zero-effort
+        ``/api/generate`` request (no prompt) to trigger loading, then polls
+        ``/api/ps`` until the model's ``size_vram`` is non-zero.
+
+        Returns True when the model is confirmed in VRAM, False on timeout.
+        """
+        from urllib.parse import urlparse, urlunparse
+        import threading
+
+        parsed = urlparse(api_endpoint)
+        ps_url = urlunparse((parsed.scheme, parsed.netloc, "/api/ps", "", "", ""))
+        gen_url = urlunparse((parsed.scheme, parsed.netloc, "/api/generate", "", "", ""))
+
+        self.logger.info("Pre-loading model '%s' into GPU VRAM …", model)
+
+        # Fire the preload POST in a background thread so we can poll
+        # /api/ps independently without blocking on the response.
+        def _trigger() -> None:
+            try:
+                requests.post(
+                    gen_url,
+                    json={"model": model, "keep_alive": "10m"},
+                    timeout=timeout,
+                )
+            except Exception:
+                pass  # expected — loading large model may take a while
+
+        threading.Thread(target=_trigger, daemon=True).start()
+
+        model_base = model.split(":")[0].lower()
+        start = time.time()
+        while True:
+            try:
+                resp = requests.get(ps_url, timeout=5)
+                resp.raise_for_status()
+                for entry in resp.json().get("models", []):
+                    if model_base in entry.get("name", "").lower():
+                        size_vram = entry.get("size_vram", 0)
+                        if size_vram > 0:
+                            self.logger.info(
+                                "✓ Model '%s' ready in GPU VRAM (%.1f GiB).",
+                                model, size_vram / 1024 ** 3,
+                            )
+                            return True
+            except Exception:
+                pass
+
+            elapsed = time.time() - start
+            if elapsed >= timeout:
+                self.logger.warning(
+                    "Model '%s' not in GPU VRAM after %d s.", model, int(elapsed)
+                )
+                return False
+
+            self.logger.debug(
+                "Waiting for '%s' to load … (%d/%d s)", model, int(elapsed), timeout
+            )
+            time.sleep(poll_interval)
 
     # ------------------------------------------------------------------
     # Report / manual-queue persistence

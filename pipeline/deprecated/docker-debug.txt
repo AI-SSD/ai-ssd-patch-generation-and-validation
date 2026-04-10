@@ -1,0 +1,15 @@
+# Stop Docker and containerd completely
+sudo systemctl stop docker
+sudo systemctl stop containerd
+
+# Remove corrupted blob storage
+sudo rm -rf /var/lib/containerd/io.containerd.content.v1.content/blobs
+sudo rm -rf /var/lib/docker/image
+sudo rm -rf /var/lib/docker/overlay2
+
+# Restart services
+sudo systemctl start containerd
+sudo systemctl start docker
+
+# Verify Docker is working
+docker run hello-world

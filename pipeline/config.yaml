@@ -1,22 +1,40 @@
 # =============================================================================
-# AI-SSD Project - Pipeline Configuration
+# AI-SSD Project – Unified Pipeline Configuration
+# =============================================================================
+# Single source of truth for Phases 1-4 and the master pipeline orchestrator.
+# Phase 0 (cve_aggregator) uses its own YAML (glibc_config.yaml / aggregator_config.yaml)
+# but shares the LLM and path settings defined here where applicable.
 # =============================================================================
 
 # =============================================================================
-# Phase 1: Vulnerability Reproduction Settings
+# Global Settings
 # =============================================================================
 
-# Timeouts (in seconds)
-build_timeout: 3600
-run_timeout: 300
+# Phase 0 configuration file (relative to base directory)
+phase0_config: "cve_aggregator/glibc_config.yaml"
 
-# Docker settings
+# Per-phase process timeouts (seconds) – used by the master pipeline executor
+phase_timeouts:
+  0: 7200       # Phase 0: Data aggregation (API calls + git operations)
+  1: 3600       # Phase 1: Vulnerability reproduction (Docker builds)
+  2: 10800      # Phase 2: Patch generation (LLM API calls)
+  3: 7200       # Phase 3: Patch validation (Docker builds + PoC + SAST)
+  4: 600        # Phase 4: Reporting
+
+# Docker-level timeouts (seconds) – used inside individual phases
+build_timeout: 3600     # Docker image build timeout
+run_timeout: 300        # Container run / PoC execution timeout
+
+# Docker resource settings
 docker:
   memory_limit: "2g"
   cpu_limit: 1
   network_disabled: true
 
-# Paths (relative to base directory)
+# =============================================================================
+# Directory Layout (relative to base directory)
+# =============================================================================
+
 paths:
   csv_file: "documentation/file-function.csv"
   exploits_dir: "exploits"
@@ -24,8 +42,16 @@ paths:
   results: "results"
   logs: "logs"
   patches: "patches"
+  validation_results: "validation_results"
+  reports: "reports"
+  manual_supervision: "manual_supervision"
+  documentation: "documentation"
 
-# OS image mapping based on CVE year
+# =============================================================================
+# OS / Ubuntu Mapping
+# =============================================================================
+
+# CVE-year → Ubuntu base image for Docker builds (Phase 1 + Phase 3)
 os_mapping:
   "2012": "ubuntu:14.04"
   "2013": "ubuntu:14.04"
@@ -36,7 +62,7 @@ os_mapping:
   "2018": "ubuntu:18.04"
   default: "ubuntu:16.04"
 
-# Vulnerability detection patterns
+# Vulnerability detection patterns (Phase 1)
 detection_patterns:
   exit_codes:
     - 139  # SIGSEGV
@@ -49,89 +75,73 @@ detection_patterns:
     - "buffer overflow"
 
 # =============================================================================
-# Phase 2: Patch Generation Settings
+# LLM Settings (Phase 2 patch generation + master pipeline health check)
 # =============================================================================
 
 llm:
-  # LLM API endpoint (Ollama compatible)
+  # Ollama-compatible chat API endpoint
   endpoint: "http://10.3.2.171:80/api/chat"
-  
+
   # Models to iterate through for patch generation
-  # Each CVE will be processed with ALL models listed here
   models:
     - "qwen2.5-coder:1.5b"
     - "qwen2.5-coder:7b"
     - "qwen2.5:1.5b"
     - "qwen2.5:7b"
-  
+
   # Request settings
-  timeout: 180          # Request timeout in seconds (reduced from 300)
-  retry_attempts: 2     # Number of retry attempts on failure (reduced from 3)
-  retry_delay: 5        # Delay between retries in seconds
-  
+  timeout: 600            # Per-request timeout (seconds)
+  retry_attempts: 2       # Retry attempts on failure
+  retry_delay: 5          # Delay between retries (seconds)
+  num_ctx: 32768          # Ollama context window (avoids silent 4096 truncation)
+  gpu_wait_timeout: 120   # Wait for GPU before generation (seconds, 0 = skip)
+
   # Generation parameters
-  temperature: 0.2      # Lower = more deterministic
-  max_tokens: 8192      # Maximum tokens in response
+  temperature: 0.2        # Lower = more deterministic
+  max_tokens: 8192        # Maximum tokens in response
+
+  # Health check settings (used by master pipeline before Phase 2)
+  health_check:
+    timeout: 60           # Health-check request timeout (seconds)
+    num_predict: 5        # Minimal token count for the probe request
 
 # =============================================================================
 # Phase 3: Validation Settings
 # =============================================================================
 
 validation:
-  # Whether to automatically validate patches after generation
   auto_validate: false
-  
-  # Validation timeout per patch (seconds)
-  validate_timeout: 600
-  
-  # Docker build timeout for validation containers (seconds)
-  build_timeout: 3600
-  
-  # PoC execution timeout (seconds)
-  poc_timeout: 300
-  
+  validate_timeout: 600       # Per-patch validation timeout (seconds)
+  build_timeout: 3600         # Validation Docker build timeout (seconds)
+  poc_timeout: 300            # PoC execution timeout (seconds)
+
   # SAST Configuration
   sast:
-    # Enable/disable SAST analysis
     enabled: true
-    
-    # Cppcheck settings
+
     cppcheck:
       enabled: true
-      # Severity levels to report: error, warning, style, performance, portability, information
       enable_checks: "all"
-      # Suppress specific warnings (IDs)
       suppress: []
-      # Maximum allowed errors for patch to pass
       max_errors: 0
-      # Maximum allowed high-severity warnings
       max_warnings: 10
-    
-    # Flawfinder settings
+
     flawfinder:
       enabled: true
-      # Minimum risk level to report (1-5, where 5 is highest risk)
       min_level: 1
-      # Maximum allowed high-severity hits (level 4-5) for patch to pass
       max_high_severity: 0
-      # Maximum total hits allowed
       max_total_hits: 50
-  
-  # Baseline comparison settings
+
+  # Baseline comparison
   baseline:
-    # Whether to compare against baseline (original vulnerable code)
     compare_to_baseline: true
-    # Allow this many more issues than baseline
     tolerance_errors: 0
     tolerance_warnings: 5
-  
-  # Cleanup settings
+
+  # Cleanup
   cleanup:
-    # Remove Docker images after validation
     remove_images: true
-    # Remove build contexts after validation
     remove_build_dirs: false
-    # Keep logs for failed validations
     keep_failure_logs: true
 
 # =============================================================================
@@ -139,58 +149,47 @@ validation:
 # =============================================================================
 
 feedback_loop:
-  # Enable/disable the iterative feedback loop
   enabled: true
-  
-  # Maximum retry attempts for failed patches
-  # If a patch fails validation, it will be regenerated with failure context
-  # up to this many times before being marked as "Unpatchable"
   max_retries: 3
-  
-  # Timeout for the entire feedback loop process (in seconds)
-  # Should account for: max_retries * (generation_time + validation_time)
-  # Default: 2 hours (7200s) to allow for multiple retries
-  timeout: 7200
-  
-  # Retry triggers - which validation failures trigger a retry
+  timeout: 7200               # Total feedback-loop timeout (seconds)
+
   retry_on:
-    poc_still_works: true    # PoC exploit still triggers vulnerability
-    sast_failed: true        # SAST found new security issues
-    build_error: false       # Build failed (usually indicates fundamental issue)
-  
-  # Context injection settings
+    poc_still_works: true
+    sast_failed: true
+    build_error: false
+
   context_injection:
-    # Include full PoC output in retry prompt
     include_poc_output: true
-    # Maximum characters of PoC output to include
     max_poc_output_length: 1500
-    # Include SAST findings in retry prompt
     include_sast_findings: true
-    # Maximum number of SAST findings to include per tool
     max_sast_findings: 5
-  
-  # Output settings
+
   output:
-    # Save retry patch artifacts
     save_retry_artifacts: true
-    # Keep validation history for all attempts
     keep_validation_history: true
-    # Create success marker file when retry succeeds
     create_success_marker: true
 
 # =============================================================================
-# CVE-specific file mappings
+# Manual Verification (Phase 0 post-processing)
+# =============================================================================
+
+manual_verification:
+  timeout: 1800               # Wait for manual review (seconds)
+  poll_interval: 30           # Poll frequency (seconds)
+
+# =============================================================================
+# CVE-specific file mappings (Phase 3 Dockerfile generation)
 # =============================================================================
 
 cve_mappings:
   CVE-2012-3480:
     glibc_file: "stdlib/strtod_l.c"
     patch_file: "strtod_l.c"
-    
+
   CVE-2014-5119:
     glibc_file: "iconv/gconv_trans.c"
     patch_file: "gconv_trans.c"
-    
+
   CVE-2015-7547:
     glibc_file: "resolv/res_send.c"
     patch_file: "res_send.c"

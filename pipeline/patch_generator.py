@@ -24,33 +24,41 @@ from typing import Optional, Tuple, Dict, Any, List
 
 import requests
 import pandas as pd
+import yaml
 
 # =============================================================================
-# Configuration
+# Configuration – loaded from config.yaml via master_pipeline.config
 # =============================================================================
+
+BASE_DIR = Path(__file__).parent.resolve()
+
+# Import the shared config loader
+sys.path.insert(0, str(BASE_DIR))
+from master_pipeline.config import load_pipeline_config, cfg_section  # noqa: E402
+
+_cfg = load_pipeline_config(BASE_DIR)
+_llm = _cfg.get("llm", {}) if isinstance(_cfg.get("llm"), dict) else {}
+_paths = _cfg.get("paths", {}) if isinstance(_cfg.get("paths"), dict) else {}
 
 # API Configuration
-API_ENDPOINT = "http://10.3.2.171:80/api/chat"
-API_TIMEOUT = 300  # 10 minutes timeout for LLM inference (glibc code is complex)
-MAX_RETRIES = 3    # Retry attempts for failed API calls
-RETRY_DELAY = 10   # seconds between retries
+API_ENDPOINT = str(_llm.get("endpoint", "http://10.3.2.171:80/api/chat"))
+API_TIMEOUT = int(_llm.get("timeout", 600))
+MAX_RETRIES = int(_llm.get("retry_attempts", 3))
+RETRY_DELAY = int(_llm.get("retry_delay", 5))
+NUM_CTX = int(_llm.get("num_ctx", 32768))
 
-# Model list to iterate through
-MODELS = [
-    "qwen2.5-coder:1.5b",
-    "qwen2.5-coder:7b",
-    "qwen2.5:1.5b",
-    "qwen2.5:7b"
-]
+# Model list
+MODELS = [str(m) for m in _llm.get("models", [
+    "qwen2.5-coder:1.5b", "qwen2.5-coder:7b", "qwen2.5:1.5b", "qwen2.5:7b"
+])]
 
 # LLM Parameters
-LLM_TEMPERATURE = 0.2
+LLM_TEMPERATURE = float(_llm.get("temperature", 0.2))
 
 # Paths
-BASE_DIR = Path(__file__).parent.resolve()
-CSV_PATH = BASE_DIR / "documentation" / "file-function.csv"
-OUTPUT_DIR = BASE_DIR / "patches"
-LOG_DIR = BASE_DIR / "logs"
+CSV_PATH = BASE_DIR / str(_paths.get("csv_file", "documentation/file-function.csv"))
+OUTPUT_DIR = BASE_DIR / str(_paths.get("patches", "patches"))
+LOG_DIR = BASE_DIR / str(_paths.get("logs", "logs"))
 
 # =============================================================================
 # Logging Setup
@@ -344,24 +352,27 @@ def _build_failure_analysis(failure_context: Dict[str, Any]) -> str:
 def check_api_health() -> bool:
     """
     Quick health check to verify LLM API is responsive before processing.
-    
+
+    Uses GET /api/tags instead of a full inference POST so the check
+    completes in milliseconds regardless of hardware (CPU vs GPU).
+
     Returns:
         True if API is healthy, False otherwise
     """
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(API_ENDPOINT)
+    tags_url = urlunparse((parsed.scheme, parsed.netloc, "/api/tags", "", "", ""))
     try:
-        # Simple test with minimal payload
-        test_payload = {
-            "model": MODELS[0],
-            "messages": [{"role": "user", "content": "test"}],
-            "stream": False,
-            "options": {"num_predict": 1}  # Limit response to 1 token for speed
-        }
-        response = requests.post(API_ENDPOINT, json=test_payload, timeout=30)
+        response = requests.get(tags_url, timeout=10)
         response.raise_for_status()
-        logger.info("✓ API health check passed")
+        n_models = len(response.json().get("models", []))
+        logger.info("✓ API health check passed (%d models available)", n_models)
+        # Best-effort GPU check at startup (model may not be loaded yet)
+        for model in MODELS:
+            _check_gpu_status(model)
         return True
     except requests.exceptions.Timeout:
-        logger.error("✗ API health check failed: Server not responding (timeout)")
+        logger.error("✗ API health check failed: Server not responding (GET %s timed out)", tags_url)
         return False
     except requests.exceptions.ConnectionError:
         logger.error(f"✗ API health check failed: Cannot connect to {API_ENDPOINT}")
@@ -369,6 +380,113 @@ def check_api_health() -> bool:
     except Exception as e:
         logger.error(f"✗ API health check failed: {e}")
         return False
+
+
+# Module-level set tracking which models have already had their GPU status logged
+_gpu_status_logged: set = set()
+
+
+def _check_gpu_status(model: str) -> None:
+    """Check whether *model* is GPU- or CPU-accelerated via Ollama's /api/ps.
+
+    Ollama's /api/ps lists currently loaded runners with:
+      • ``size``      – total model size in bytes
+      • ``size_vram`` – bytes in GPU VRAM (0 means CPU-only)
+
+    If the model is not yet loaded (Ollama lazy-loads on first inference)
+    the list will be empty and the check is silently deferred.
+    Each model is only reported once per process (tracked by _gpu_status_logged).
+    """
+    global _gpu_status_logged
+    if model in _gpu_status_logged:
+        return
+
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(API_ENDPOINT)
+    ps_url = urlunparse((parsed.scheme, parsed.netloc, "/api/ps", "", "", ""))
+    try:
+        resp = requests.get(ps_url, timeout=5)
+        resp.raise_for_status()
+        running = resp.json().get("models", [])
+
+        model_base = model.split(":")[0].lower()
+        for entry in running:
+            if model_base in entry.get("name", "").lower():
+                size_vram = entry.get("size_vram", 0)
+                size_total = entry.get("size", 0)
+                _gpu_status_logged.add(model)
+
+                if size_vram == 0:
+                    logger.warning(
+                        "⚠ WARNING: Model '%s' is running on CPU only "
+                        "(size_vram=0). Inference will be significantly slower "
+                        "than GPU. Ensure the Ollama server has CUDA/ROCm "
+                        "drivers and the container has GPU access (--gpus all).",
+                        model,
+                    )
+                elif size_total > 0 and size_vram < size_total:
+                    pct = size_vram / size_total * 100
+                    logger.warning(
+                        "⚠ WARNING: Model '%s' is only partially "
+                        "GPU-accelerated (%.0f%% in VRAM, %.1f/%.1f GiB). "
+                        "Some layers are on CPU — consider a GPU with more VRAM.",
+                        model, pct,
+                        size_vram / 1024 ** 3,
+                        size_total / 1024 ** 3,
+                    )
+                else:
+                    logger.info(
+                        "✓ Model '%s' is fully GPU-accelerated (%.1f GiB VRAM).",
+                        model, size_vram / 1024 ** 3,
+                    )
+                return
+        # Model not in /api/ps yet — deferred to post-inference check
+        logger.debug("GPU status check: '%s' not yet loaded in /api/ps.", model)
+    except Exception as exc:
+        logger.debug("GPU status check skipped for '%s' (%s).", model, exc)
+
+
+# GPU wait timeout – loaded from config.yaml llm.gpu_wait_timeout
+GPU_WAIT_TIMEOUT = int(_llm.get("gpu_wait_timeout", 120))
+
+
+def wait_for_gpu(timeout: Optional[int] = None,
+                 poll_interval: int = 15) -> bool:
+    """Poll /api/ps until GPU VRAM is free, or *timeout* expires.
+
+    Returns True if GPU is available, False if wait timed out.
+    """
+    from urllib.parse import urlparse, urlunparse
+
+    if timeout is None:
+        timeout = GPU_WAIT_TIMEOUT
+
+    parsed = urlparse(API_ENDPOINT)
+    ps_url = urlunparse((parsed.scheme, parsed.netloc, "/api/ps", "", "", ""))
+    start = time.time()
+
+    while True:
+        try:
+            resp = requests.get(ps_url, timeout=10)
+            resp.raise_for_status()
+            running = resp.json().get("models", [])
+            total_vram = sum(e.get("size_vram", 0) for e in running)
+            if not running or total_vram == 0:
+                return True
+        except Exception:
+            return True  # can't reach /api/ps — assume available
+
+        elapsed = time.time() - start
+        if timeout and elapsed >= timeout:
+            return False
+
+        names = [e.get("name", "?") for e in running]
+        vram_gib = total_vram / (1024 ** 3)
+        logger.info(
+            "GPU busy (%.1f GiB VRAM used by %s) — waiting (%d/%d s) …",
+            vram_gib, ", ".join(names), int(elapsed), timeout,
+        )
+        time.sleep(poll_interval)
 
 
 def call_llm_api(model: str, user_prompt: str, system_prompt: str = SYSTEM_PROMPT) -> Tuple[Optional[str], Dict[str, Any]]:
@@ -393,7 +511,8 @@ def call_llm_api(model: str, user_prompt: str, system_prompt: str = SYSTEM_PROMP
         "messages": messages,
         "stream": False,
         "options": {
-            "temperature": LLM_TEMPERATURE
+            "temperature": LLM_TEMPERATURE,
+            "num_ctx": NUM_CTX
         }
     }
     
@@ -428,6 +547,10 @@ def call_llm_api(model: str, user_prompt: str, system_prompt: str = SYSTEM_PROMP
             metadata["total_duration"] = result.get('total_duration', None)
             
             logger.debug(f"API call successful for model {model}")
+
+            # Post-inference GPU check: model is guaranteed loaded now
+            _check_gpu_status(model)
+
             return content, metadata
             
         except requests.exceptions.Timeout:
@@ -1670,7 +1793,6 @@ Examples:
         '--model',
         type=str,
         nargs='+',
-        choices=MODELS,
         help='Specific model(s) to use'
     )
     
@@ -1697,11 +1819,11 @@ Examples:
     
     # Set up paths based on base-dir
     base_dir = Path(args.base_dir)
-    csv_path = Path(args.csv) if args.csv else base_dir / "documentation" / "file-function.csv"
+    csv_path = Path(args.csv) if args.csv else CSV_PATH
     
     # Update global OUTPUT_DIR based on base_dir
     global OUTPUT_DIR
-    OUTPUT_DIR = base_dir / "patches"
+    OUTPUT_DIR = base_dir / str(_paths.get("patches", "patches"))
     
     # Adjust logging level if verbose
     if args.verbose:
@@ -1732,9 +1854,21 @@ Examples:
     if not check_api_health():
         logger.error("Cannot proceed without a responsive LLM API. Please check:")
         logger.error(f"  1. Is the server at {API_ENDPOINT} running?")
-        logger.error(f"  2. Are the models loaded? (qwen2.5-coder, qwen2.5)")
+        logger.error("  2. Are the configured models available in Ollama?")
         logger.error(f"  3. Is there network connectivity?")
         sys.exit(1)
+    
+    # Wait for GPU availability before starting generation
+    logger.info("Checking GPU availability...")
+    if not wait_for_gpu():
+        logger.warning(
+            "GPU still busy after %d s timeout. "
+            "Patch generation may be slow (CPU-only) or time out.",
+            GPU_WAIT_TIMEOUT,
+        )
+        # Exit with code 2 so the master pipeline can detect "skipped"
+        logger.error("Exiting — GPU not available within timeout.")
+        sys.exit(2)
     
     # Run pipeline
     summary = run_pipeline(

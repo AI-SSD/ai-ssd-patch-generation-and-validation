@@ -22,6 +22,7 @@ import tempfile
 # Increase CSV field size limit to handle large PoC content fields
 csv.field_size_limit(sys.maxsize)
 import re
+import yaml
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
@@ -37,11 +38,20 @@ except ImportError:
     sys.exit(1)
 
 # =============================================================================
-# Configuration and Constants
+# Configuration – loaded from config.yaml
 # =============================================================================
 
+_BASE_DIR = Path(__file__).parent.resolve()
+sys.path.insert(0, str(_BASE_DIR))
+from master_pipeline.config import load_pipeline_config, cfg_section  # noqa: E402
+
+_cfg = load_pipeline_config(_BASE_DIR)
+_os_mapping = _cfg.get("os_mapping", {}) if isinstance(_cfg.get("os_mapping"), dict) else {}
+_paths = _cfg.get("paths", {}) if isinstance(_cfg.get("paths"), dict) else {}
+_cve_mappings = _cfg.get("cve_mappings", {}) if isinstance(_cfg.get("cve_mappings"), dict) else {}
+
 # Mapping of commit dates to appropriate Ubuntu/Debian versions
-COMMIT_OS_MAPPING = {
+COMMIT_OS_MAPPING = {str(k): str(v) for k, v in _os_mapping.items()} if _os_mapping else {
     "2012": "ubuntu:14.04",
     "2013": "ubuntu:14.04",
     "2014": "ubuntu:14.04",
@@ -49,22 +59,35 @@ COMMIT_OS_MAPPING = {
     "2016": "ubuntu:16.04",
     "2017": "ubuntu:18.04",
     "2018": "ubuntu:18.04",
-    "default": "ubuntu:16.04"
+    "default": "ubuntu:16.04",
 }
 
-# Known CVE to approximate commit year mapping
-CVE_YEAR_HINTS = {
-    "CVE-2012-3480": "2012",
-    "CVE-2014-5119": "2014",
-    "CVE-2015-7547": "2015",
-}
+# Known CVE to approximate commit year mapping (derived from CVE IDs)
+CVE_YEAR_HINTS = {}
+for _cve_id in _cve_mappings:
+    try:
+        _year = _cve_id.split("-")[1][:4]
+        CVE_YEAR_HINTS[_cve_id] = _year
+    except (IndexError, ValueError):
+        pass
+if not CVE_YEAR_HINTS:
+    CVE_YEAR_HINTS = {
+        "CVE-2012-3480": "2012",
+        "CVE-2014-5119": "2014",
+        "CVE-2015-7547": "2015",
+    }
 
 # CVE to vulnerable file path mapping (within glibc source tree)
-CVE_FILE_MAPPING = {
-    "CVE-2012-3480": "stdlib/strtod_l.c",
-    "CVE-2014-5119": "iconv/gconv_trans.c",
-    "CVE-2015-7547": "resolv/res_send.c",
-}
+CVE_FILE_MAPPING = {}
+for _cve_id, _mapping in _cve_mappings.items():
+    if isinstance(_mapping, dict) and "glibc_file" in _mapping:
+        CVE_FILE_MAPPING[_cve_id] = _mapping["glibc_file"]
+if not CVE_FILE_MAPPING:
+    CVE_FILE_MAPPING = {
+        "CVE-2012-3480": "stdlib/strtod_l.c",
+        "CVE-2014-5119": "iconv/gconv_trans.c",
+        "CVE-2015-7547": "resolv/res_send.c",
+    }
 
 # SAST Tools Configuration
 # These are common, well-established C/C++ static analysis tools
@@ -1647,18 +1670,19 @@ Examples:
         help='Validate only this specific CVE'
     )
     
+    _val_cfg = _cfg.get("validation", {}) if isinstance(_cfg.get("validation"), dict) else {}
     parser.add_argument(
         '--build-timeout',
         type=int,
-        default=3600,
-        help='Docker build timeout in seconds (default: 3600)'
+        default=int(_val_cfg.get("build_timeout", _cfg.get("build_timeout", 3600))),
+        help='Docker build timeout in seconds (default: from config.yaml)'
     )
     
     parser.add_argument(
         '--run-timeout',
         type=int,
-        default=300,
-        help='Container run timeout in seconds (default: 300)'
+        default=int(_val_cfg.get("poc_timeout", _cfg.get("run_timeout", 300))),
+        help='Container run timeout in seconds (default: from config.yaml)'
     )
     
     parser.add_argument(
@@ -1681,15 +1705,15 @@ Examples:
     
     args = parser.parse_args()
     
-    # Set default paths relative to base directory
+    # Set default paths from config.yaml, relative to base directory
     if args.csv_file is None:
-        args.csv_file = os.path.join(args.base_dir, 'documentation', 'file-function.csv')
+        args.csv_file = os.path.join(args.base_dir, str(_paths.get('csv_file', 'documentation/file-function.csv')))
     
     if args.patches_dir is None:
-        args.patches_dir = os.path.join(args.base_dir, 'patches')
+        args.patches_dir = os.path.join(args.base_dir, str(_paths.get('patches', 'patches')))
     
     if args.exploits_dir is None:
-        args.exploits_dir = os.path.join(args.base_dir, 'exploits')
+        args.exploits_dir = os.path.join(args.base_dir, str(_paths.get('exploits_dir', 'exploits')))
     
     return args
 

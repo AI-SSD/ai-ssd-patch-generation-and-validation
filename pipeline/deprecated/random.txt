@@ -1,0 +1,1 @@
+sudo nohup python3 pipeline.py --verbose > pipeline.log 2>&1 &

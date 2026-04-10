@@ -61,8 +61,9 @@ class OutputGenerator(PipelineModule):
         csv_path = Path(cfg.get("csv_path", "cve_poc_complete.csv"))
         poc_dir = Path(cfg.get("poc_dir", "exploits"))
         syntax_results = context.get("syntax_results", {})
+        poc_repair_report = context.get("poc_repair_report", {})
         total, complete, saved = self._export_csv_and_pocs(
-            filtered, csv_path, poc_dir, syntax_results, cfg,
+            filtered, csv_path, poc_dir, syntax_results, poc_repair_report, cfg,
         )
 
         # Summary
@@ -158,6 +159,7 @@ class OutputGenerator(PipelineModule):
         csv_path: Path,
         poc_dir: Path,
         syntax_results: Dict,
+        poc_repair_report: Dict,
         cfg: Dict,
     ) -> Tuple[int, int, int]:
         poc_dir.mkdir(parents=True, exist_ok=True)
@@ -167,7 +169,7 @@ class OutputGenerator(PipelineModule):
             "CVE", "V_COMMIT", "FilePath", "F_NAME", "UNIT_TYPE",
             "V_FILE", "V_FUNCTION",
             "CVE_Description", "CWE", "CWE_Description",
-            "project_version", "ubuntu_version",
+            "project_version", "project_version_normalized", "ubuntu_version",
             "poc_index", "poc_path", "poc_language",
             "manual_review_required", "manual_verified",
         ]
@@ -179,7 +181,7 @@ class OutputGenerator(PipelineModule):
 
         for cve_id, entry in dataset.cves.items():
             total += 1
-            result = self._build_csv_row(cve_id, entry, poc_dir, syntax_results, cfg)
+            result = self._build_csv_row(cve_id, entry, poc_dir, syntax_results, poc_repair_report, cfg)
             if result is None:
                 continue
 
@@ -223,6 +225,7 @@ class OutputGenerator(PipelineModule):
         entry: CVEEntry,
         poc_dir: Path,
         syntax_results: Dict,
+        poc_repair_report: Dict,
         cfg: Dict,
     ) -> Optional[List[Dict[str, Any]]]:
         """Build CSV rows per **(changed code unit × exploit)** combination.
@@ -271,7 +274,7 @@ class OutputGenerator(PipelineModule):
                 continue
 
             poc_lang = exploit.language
-            if poc_lang == "unknown":
+            if poc_lang in ("unknown", "text"):
                 poc_lang = detect_language_from_content(content)
 
             content, _ = clean_poc_content(content)
@@ -283,6 +286,12 @@ class OutputGenerator(PipelineModule):
             key = f"{cve_id}:{orig_idx}"
             sr = syntax_results.get(key, {})
             needs_manual = bool(sr.get("needs_manual_review"))
+
+            # If the LLM repair module successfully fixed this PoC, it is no
+            # longer pending manual review regardless of what the syntax validator
+            # originally flagged.
+            if needs_manual and poc_repair_report.get(key, {}).get("repaired"):
+                needs_manual = False
 
             # Flag PoCs saved as .txt (unrecognised language) for manual review
             if ext == ".txt":
@@ -331,9 +340,12 @@ class OutputGenerator(PipelineModule):
         project_version = extract_project_version_from_cpe(
             meta.affected_products, project_name,
         )
-        ubuntu_version = get_ubuntu_version(
+        # Extract the most recent single version from the (potentially multi-value)
+        # project_version string. Used by Phase 1 to resolve the OS build target.
+        project_version_normalized = (
             project_version.split(",")[-1].strip() if project_version else ""
         )
+        ubuntu_version = get_ubuntu_version(project_version_normalized)
 
         # ---- Collect code-unit rows (without PoC info yet) ----
         base_rows: List[Dict[str, Any]] = []
@@ -355,6 +367,7 @@ class OutputGenerator(PipelineModule):
                     "CWE": ",".join(meta.cwe_ids or []),
                     "CWE_Description": get_cwe_descriptions(meta.cwe_ids),
                     "project_version": project_version,
+                    "project_version_normalized": project_version_normalized,
                     "ubuntu_version": ubuntu_version,
                 })
 
@@ -378,6 +391,7 @@ class OutputGenerator(PipelineModule):
                     "CWE": ",".join(meta.cwe_ids or []),
                     "CWE_Description": get_cwe_descriptions(meta.cwe_ids),
                     "project_version": project_version,
+                    "project_version_normalized": project_version_normalized,
                     "ubuntu_version": ubuntu_version,
                 })
 
@@ -398,6 +412,7 @@ class OutputGenerator(PipelineModule):
                 "CWE": ",".join(meta.cwe_ids or []),
                 "CWE_Description": get_cwe_descriptions(meta.cwe_ids),
                 "project_version": project_version,
+                "project_version_normalized": project_version_normalized,
                 "ubuntu_version": ubuntu_version,
             })
 

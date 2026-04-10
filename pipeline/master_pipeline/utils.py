@@ -1,6 +1,8 @@
 import logging
+import time
 from datetime import datetime
-from typing import List
+from typing import List, Optional, Tuple
+from urllib.parse import urlparse, urlunparse
 from .config import LOG_DIR
 from .models import PhaseResult, PhaseStatus
 
@@ -111,4 +113,105 @@ def format_duration(seconds: float) -> str:
         hours = int(seconds // 3600)
         mins = int((seconds % 3600) // 60)
         return f"{hours}h {mins}m"
+
+
+# =========================================================================
+# GPU availability helpers (for LLM-dependent phases)
+# =========================================================================
+
+def check_gpu_availability(api_endpoint: str) -> Tuple[bool, str]:
+    """Check if any GPU VRAM is available on the Ollama server.
+
+    Queries ``/api/ps`` to see which models are currently loaded and how
+    much VRAM they occupy.
+
+    Returns:
+        (gpu_free, detail_message)
+        *gpu_free* is True when NO model is loaded or the loaded model(s)
+        leave significant VRAM free.  False when VRAM is fully occupied.
+    """
+    import requests
+
+    parsed = urlparse(api_endpoint)
+    ps_url = urlunparse((parsed.scheme, parsed.netloc, "/api/ps", "", "", ""))
+
+    try:
+        resp = requests.get(ps_url, timeout=10)
+        resp.raise_for_status()
+        running = resp.json().get("models", [])
+    except Exception as exc:
+        return True, f"Could not query /api/ps ({exc}) — assuming GPU is available."
+
+    if not running:
+        return True, "No models currently loaded on the Ollama server — GPU is free."
+
+    total_vram = sum(entry.get("size_vram", 0) for entry in running)
+    model_names = [entry.get("name", "?") for entry in running]
+
+    if total_vram == 0:
+        return True, (
+            f"Models loaded ({', '.join(model_names)}) are running on CPU — "
+            "GPU appears free."
+        )
+
+    vram_gib = total_vram / (1024 ** 3)
+    return False, (
+        f"GPU VRAM occupied: {vram_gib:.1f} GiB by {', '.join(model_names)}. "
+        "Starting another model may cause CPU-only inference (very slow)."
+    )
+
+
+def prompt_gpu_action(phase_name: str, detail: str) -> str:
+    """Interactive prompt when GPU is unavailable before an LLM phase.
+
+    Returns one of: ``"wait"``, ``"skip"``, ``"continue"``
+    """
+    print(f"\n{'─'*70}")
+    print(f"  ⚠  GPU BUSY — {phase_name}")
+    print(f"{'─'*70}")
+    print(f"  {detail}\n")
+    print("  Options:")
+    print("    [W] Wait — poll every 30 s until GPU is free, then proceed")
+    print("    [S] Skip — skip this LLM phase entirely")
+    print("    [C] Continue — proceed anyway (will run on CPU, much slower)")
+    print()
+
+    while True:
+        try:
+            choice = input("  Choose [W/S/C]: ").strip().upper()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "skip"
+        if choice in ("W", "S", "C"):
+            return {"W": "wait", "S": "skip", "C": "continue"}[choice]
+        print("  Invalid choice. Please enter W, S, or C.")
+
+
+def wait_for_gpu(api_endpoint: str, poll_interval: int = 30,
+                 timeout: int = 0) -> bool:
+    """Block until GPU VRAM is free on the Ollama server.
+
+    Args:
+        api_endpoint: Ollama API endpoint (e.g. ``http://host:port/api/chat``)
+        poll_interval: Seconds between polls.
+        timeout: Max seconds to wait.  0 = wait indefinitely.
+
+    Returns:
+        True if GPU became free, False if timed out.
+    """
+    start = time.time()
+    while True:
+        free, detail = check_gpu_availability(api_endpoint)
+        if free:
+            logger.info("GPU is now available — proceeding.")
+            return True
+        elapsed = time.time() - start
+        if timeout and elapsed >= timeout:
+            logger.warning("GPU wait timed out after %d s.", int(elapsed))
+            return False
+        remaining = ""
+        if timeout:
+            remaining = f" ({int(timeout - elapsed)}s remaining)"
+        logger.info("Waiting for GPU to free up%s … (%s)", remaining, detail)
+        time.sleep(poll_interval)
 

@@ -184,7 +184,7 @@ poc_mapper:
 # ---------------------------------------------------------------------------
 data_aggregator:
   # Path to the global (all-CVEs) JSON dataset
-  global_json_path: "glibc_cve_poc_map.json"
+  global_json_path: "results/glibc_cve_poc_map.json"
 
   # When true, remove CVEs from the persisted dataset that are not present
   # in the current run's raw_cves set.
@@ -198,7 +198,7 @@ syntax_validator:
   manual_supervision_dir: "manual_supervision"
 
   # Path for the JSON validation report
-  report_path: "syntax_validation_report.json"
+  report_path: "results/syntax_validation_report.json"
 
   # When false, only PoCs belonging to CVEs that have an associated fix
   # commit are flagged for manual review (avoids reviewing unreachable PoCs).
@@ -215,33 +215,58 @@ poc_repair:
 
   # LLM model to use for repairs (must be available on the Ollama server).
   # devstral is faster than qwen3-coder:30b and code-repair specialised.
-  model: "devstral:latest"
+  model: "devstral:32k"
 
   # Maximum number of repair attempts per PoC before flagging for manual review
   max_repair_attempts: 3
 
   # Timeout for each LLM API call (seconds).
-  # Keep low to fail fast and retry sooner with a varied temperature.
-  api_timeout: 120
+  # Cold-start model loading is handled by model_load_timeout (see below);
+  # this only covers the actual inference once the model is in VRAM.
+  # At ~2-3 tok/s (no flash attention) generating 1000 tokens takes ~6 min.
+  # With flash attention enabled (recommended) this can be lowered to 300.
+  api_timeout: 600
+
+  # Max seconds to wait for the model to load into GPU VRAM before
+  # starting repairs.  Ollama lazy-loads on first inference, so large models
+  # (devstral ~14 GiB) can exceed api_timeout on the very first call.
+  model_load_timeout: 300
+
+  # Ollama context window size passed as options.num_ctx in the API call.
+  # Must be large enough to hold the full prompt + response tokens.
+  # Prompts with PoC source typically range from 4K-15K tokens.
+  # If set to 0, Ollama falls back to its server default (often 4096),
+  # which SILENTLY TRUNCATES the prompt and causes 500 errors.
+  num_ctx: 32768
+
+  # Maximum characters of PoC source code included in the prompt.
+  # 0 = no truncation (recommended when running on GPU with sufficient VRAM).
+  max_poc_chars: 0
 
   # Sampling temperature for the LLM.
   # Base temperature – the code staggers it upward on each retry.
   temperature: 0.4
 
   # Output paths
-  report_path: "poc_repair_report.json"
-  manual_review_queue_path: "manual_review_queue.json"
+  report_path: "results/poc_repair_report.json"
+  manual_review_queue_path: "results/manual_review_queue.json"
+
+  # GPU availability wait timeout (seconds).
+  # Before starting repairs, poll /api/ps until a GPU is free.
+  # If the GPU is still busy after this many seconds, skip repairs entirely.
+  # Set to 0 to disable the check and always proceed.
+  gpu_wait_timeout: 120
 
 # ---------------------------------------------------------------------------
 # Module 7: Output Generation
 # ---------------------------------------------------------------------------
 output:
   # JSON output paths
-  global_json_path: "glibc_cve_poc_map.json"
-  filtered_json_path: "glibc_cve_poc_map_filtered.json"
+  global_json_path: "results/glibc_cve_poc_map.json"
+  filtered_json_path: "results/glibc_cve_poc_map_filtered.json"
 
   # CSV output
-  csv_path: "glibc_cve_poc_complete.csv"
+  csv_path: "results/glibc_cve_poc_complete.csv"
 
   # Directory for saving individual PoC exploit files
   poc_dir: "exploits"
@@ -272,8 +297,82 @@ output:
     - "CWE"
     - "CWE_Description"
     - "project_version"
+    - "project_version_normalized"
     - "ubuntu_version"
+    - "poc_index"
     - "poc_path"
     - "poc_language"
     - "manual_review_required"
     - "manual_verified"
+
+# ---------------------------------------------------------------------------
+# Phase 1 (orchestrator.py) – project-specific settings
+# ---------------------------------------------------------------------------
+# All values here are read by orchestrator.py at startup via --phase0-config.
+# Changing these keys is the ONLY thing needed to adapt Phase 1 to a new project.
+phase1:
+  # Local path to the project source repository (relative to pipeline base_dir)
+  project_repo_local_path: "glibc"
+
+  # Remote URL used to clone the repo when it is absent locally
+  project_repo_remote_url: "https://sourceware.org/git/glibc.git"
+
+  # Docker image tag prefixes (must be valid Docker image name components)
+  docker_base_image_prefix: "ai-ssd/glibc-base"
+  docker_cve_image_prefix: "ai-ssd/glibc-cve"
+
+  # Path (relative to base_dir) where the image manifest JSON is written
+  image_manifest_path: "results/image_manifest.json"
+
+  # Build system used inside the Docker container.
+  # "autotools"  → run ./configure + make (default; used for C projects like glibc)
+  # "cmake"      → run cmake + make
+  # "custom"     → just copy sources; no automated build step added by Phase 1
+  build_system: "autotools"
+
+  # configure flags passed during the build (autotools only).
+  # These are appended AFTER the strategy-specific flags that Phase 1 inserts.
+  extra_configure_flags: []
+
+  # Install prefix inside the container for the compiled project artefacts.
+  # Phase 1 links PoCs against libraries found here.
+  install_prefix: "/opt/project-build"
+
+  # Name of the source directory inside the Docker build context.
+  # Must be a single path component (no slashes).
+  source_dir_name: "project-src"
+
+  # Name of the build directory inside the Docker build context.
+  build_dir_name: "project-build"
+
+  # Commit-year → Ubuntu-version mapping for toolchain compatibility.
+  # Format: {year: "ubuntu_version"}.  Missing years are clamped to the nearest bound.
+  # Remove or leave empty ({}) to disable era mapping (use CSV ubuntu_version as-is).
+  commit_era_map:
+    2000: "14.04"
+    2001: "14.04"
+    2002: "14.04"
+    2003: "14.04"
+    2004: "14.04"
+    2005: "14.04"
+    2006: "14.04"
+    2007: "14.04"
+    2008: "14.04"
+    2009: "14.04"
+    2010: "14.04"
+    2011: "14.04"
+    2012: "14.04"
+    2013: "14.04"
+    2014: "14.04"
+    2015: "16.04"
+    2016: "16.04"
+    2017: "18.04"
+    2018: "18.04"
+    2019: "20.04"
+    2020: "20.04"
+    2021: "22.04"
+    2022: "22.04"
+    2023: "24.04"
+    2024: "24.04"
+    2025: "24.04"
+    2026: "24.04"
