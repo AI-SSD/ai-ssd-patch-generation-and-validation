@@ -79,6 +79,15 @@ detection_patterns:
 # =============================================================================
 
 llm:
+  # -------------------------------------------------------------------------
+  # Backend provider: "ollama" (local GPU server) or "openai" (OpenAI API)
+  # -------------------------------------------------------------------------
+  provider: "ollama"
+
+  # -------------------------------------------------------------------------
+  # Ollama settings (used only when provider: "ollama")
+  # -------------------------------------------------------------------------
+
   # Ollama-compatible chat API endpoint
   endpoint: "http://10.3.2.171:80/api/chat"
 
@@ -89,21 +98,40 @@ llm:
     - "qwen2.5:1.5b"
     - "qwen2.5:7b"
 
-  # Request settings
-  timeout: 600            # Per-request timeout (seconds)
-  retry_attempts: 2       # Retry attempts on failure
-  retry_delay: 5          # Delay between retries (seconds)
-  num_ctx: 32768          # Ollama context window (avoids silent 4096 truncation)
-  gpu_wait_timeout: 120   # Wait for GPU before generation (seconds, 0 = skip)
+  # Ollama context window (avoids silent 4096 truncation)
+  num_ctx: 32768
 
-  # Generation parameters
-  temperature: 0.2        # Lower = more deterministic
-  max_tokens: 8192        # Maximum tokens in response
+  # Wait for GPU before generation (seconds, 0 = skip)
+  gpu_wait_timeout: 120
 
   # Health check settings (used by master pipeline before Phase 2)
   health_check:
     timeout: 60           # Health-check request timeout (seconds)
     num_predict: 5        # Minimal token count for the probe request
+
+  # -------------------------------------------------------------------------
+  # OpenAI settings (used only when provider: "openai")
+  # -------------------------------------------------------------------------
+
+  # Model to use. gpt-4.1-mini is a non-reasoning model with a 10 M token/day
+  # free tier – well suited for code generation tasks.
+  openai_model: "gpt-4.1-mini"
+
+  # API key. The OPENAI_API_KEY environment variable takes precedence.
+  # If neither is set the pipeline will raise an error at startup.
+  # Do NOT commit a real key here; prefer the environment variable.
+  openai_api_key: ""
+
+  # -------------------------------------------------------------------------
+  # Shared request settings (apply to both providers)
+  # -------------------------------------------------------------------------
+  timeout: 600            # Per-request timeout (seconds)
+  retry_attempts: 2       # Retry attempts on failure
+  retry_delay: 5          # Delay between retries (seconds)
+
+  # Generation parameters
+  temperature: 0.2        # Lower = more deterministic
+  max_tokens: 8192        # Maximum tokens in response
 
 # =============================================================================
 # Phase 3: Validation Settings

@@ -423,8 +423,13 @@ class PoCRepairLLM(PipelineModule):
         cfg = self.config.get("poc_repair", {})
 
         # Configuration knobs
+        provider: str = cfg.get("provider", "ollama").lower()
         api_endpoint: str = cfg.get("api_endpoint", "http://10.3.2.171:80/api/chat")
         model: str = cfg.get("model", "qwen2.5-coder:7b")
+        openai_model: str = cfg.get("openai_model", "gpt-4.1-mini")
+        # API key: env var takes precedence over config value
+        import os as _os
+        openai_api_key: str = _os.environ.get("OPENAI_API_KEY") or str(cfg.get("openai_api_key", ""))
         max_attempts: int = cfg.get("max_repair_attempts", 3)
         api_timeout: int = cfg.get("api_timeout", 600)
         num_ctx: int = cfg.get("num_ctx", 0)          # 0 = use server default
@@ -464,39 +469,49 @@ class PoCRepairLLM(PipelineModule):
         )
 
         # Pre-flight: check API health
-        if not self._check_api_health(api_endpoint, model):
-            self.logger.error(
-                "LLM API at %s is not reachable – skipping PoC repair.", api_endpoint
-            )
-            return context
-
-        # GPU availability gate: wait up to gpu_wait_timeout seconds for a
-        # free GPU.  When the timeout expires, skip repairs entirely to avoid
-        # wasting hours on CPU-only inference.
-        gpu_wait_timeout: int = cfg.get("gpu_wait_timeout", 120)
-        if gpu_wait_timeout > 0 and not self._wait_for_gpu(
-            api_endpoint, timeout=gpu_wait_timeout
+        if not self._check_api_health(
+            api_endpoint, model,
+            provider=provider, openai_api_key=openai_api_key, openai_model=openai_model,
         ):
-            self.logger.warning(
-                "GPU not available after %d s — skipping PoC repair. "
-                "Set poc_repair.gpu_wait_timeout to 0 to disable this check.",
-                gpu_wait_timeout,
-            )
+            if provider == "openai":
+                self.logger.error("OpenAI API key not configured – skipping PoC repair.")
+            else:
+                self.logger.error(
+                    "LLM API at %s is not reachable – skipping PoC repair.", api_endpoint
+                )
             return context
 
-        # Pre-load the model before starting repairs.
-        # Ollama lazy-loads models on the first inference call; for large
-        # models like devstral (~14 GiB) this cold-start can take several
-        # minutes, exceeding api_timeout and causing every initial request
-        # to time out.  We trigger loading explicitly here and wait until
-        # the model is confirmed to be in GPU VRAM before continuing.
-        model_load_timeout: int = cfg.get("model_load_timeout", 300)
-        if not self._preload_model(api_endpoint, model, timeout=model_load_timeout):
-            self.logger.warning(
-                "Model '%s' did not reach GPU VRAM within %d s — "
-                "inference may be slow or time out.",
-                model, model_load_timeout,
-            )
+        if provider == "openai":
+            # No GPU or model pre-loading needed for OpenAI
+            pass
+        else:
+            # GPU availability gate: wait up to gpu_wait_timeout seconds for a
+            # free GPU.  When the timeout expires, skip repairs entirely to avoid
+            # wasting hours on CPU-only inference.
+            gpu_wait_timeout: int = cfg.get("gpu_wait_timeout", 120)
+            if gpu_wait_timeout > 0 and not self._wait_for_gpu(
+                api_endpoint, timeout=gpu_wait_timeout
+            ):
+                self.logger.warning(
+                    "GPU not available after %d s — skipping PoC repair. "
+                    "Set poc_repair.gpu_wait_timeout to 0 to disable this check.",
+                    gpu_wait_timeout,
+                )
+                return context
+
+            # Pre-load the model before starting repairs.
+            # Ollama lazy-loads models on the first inference call; for large
+            # models like devstral (~14 GiB) this cold-start can take several
+            # minutes, exceeding api_timeout and causing every initial request
+            # to time out.  We trigger loading explicitly here and wait until
+            # the model is confirmed to be in GPU VRAM before continuing.
+            model_load_timeout: int = cfg.get("model_load_timeout", 300)
+            if not self._preload_model(api_endpoint, model, timeout=model_load_timeout):
+                self.logger.warning(
+                    "Model '%s' did not reach GPU VRAM within %d s — "
+                    "inference may be slow or time out.",
+                    model, model_load_timeout,
+                )
 
         # Instantiate a SyntaxValidator to reuse Module 5 validation logic
         syntax_validator = SyntaxValidator(self.config)
@@ -509,14 +524,55 @@ class PoCRepairLLM(PipelineModule):
         failed_count = 0
 
         # Build a set of CVE IDs that already have at least one valid PoC.
-        # When a CVE has a working exploit, spending LLM time repairing a
-        # broken *additional* PoC for the same CVE is wasteful (the repair
-        # for large files can easily exceed the API timeout).
         cves_with_valid_poc: set = set()
         for sr_key, sr_val in syntax_results.items():
             if sr_val.get("is_valid"):
                 sr_cve, _, _ = sr_key.partition(":")
                 cves_with_valid_poc.add(sr_cve)
+
+        # ── Promote valid PoC to primary position ──
+        # If a CVE's primary PoC (index 0) is invalid but a secondary PoC is
+        # valid, swap them so downstream tools always see the best exploit
+        # first.  The swapped (invalid) PoC is still queued for LLM repair.
+        for cve_id_swap in list(cves_with_valid_poc):
+            entry_swap = dataset.cves.get(cve_id_swap)
+            if not entry_swap or not entry_swap.exploits:
+                continue
+            primary_key = f"{cve_id_swap}:0"
+            if syntax_results.get(primary_key, {}).get("is_valid"):
+                continue  # Primary is already valid — nothing to do
+            # Find the first valid secondary PoC
+            valid_idx: Optional[int] = None
+            for idx in range(1, len(entry_swap.exploits)):
+                if syntax_results.get(f"{cve_id_swap}:{idx}", {}).get("is_valid"):
+                    valid_idx = idx
+                    break
+            if valid_idx is None:
+                continue
+            # Swap exploits in the dataset
+            entry_swap.exploits[0], entry_swap.exploits[valid_idx] = (
+                entry_swap.exploits[valid_idx], entry_swap.exploits[0]
+            )
+            self.logger.info(
+                "CVE %s: promoted valid PoC (idx %d) to primary — "
+                "invalid PoC moved to idx %d.",
+                cve_id_swap, valid_idx, valid_idx,
+            )
+            # Swap the corresponding syntax_results entries
+            sr_primary = dict(syntax_results.get(primary_key, {}))
+            sr_valid = dict(syntax_results.get(f"{cve_id_swap}:{valid_idx}", {}))
+            if primary_key in syntax_results:
+                syntax_results[primary_key] = sr_valid
+            if f"{cve_id_swap}:{valid_idx}" in syntax_results:
+                syntax_results[f"{cve_id_swap}:{valid_idx}"] = sr_primary
+            # Update exploit_idx in the already-collected invalid_pocs list
+            for item_swap in invalid_pocs:
+                if item_swap["cve_id"] != cve_id_swap:
+                    continue
+                if item_swap["exploit_idx"] == 0:
+                    item_swap["exploit_idx"] = valid_idx
+                elif item_swap["exploit_idx"] == valid_idx:
+                    item_swap["exploit_idx"] = 0
 
         for item in invalid_pocs:
             cve_id = item["cve_id"]
@@ -526,40 +582,16 @@ class PoCRepairLLM(PipelineModule):
             errors = item["errors"]
             key = f"{cve_id}:{exploit_idx}"
 
-            # ── Pre-check: skip if another valid PoC already exists ──
-            if cve_id in cves_with_valid_poc:
-                skip_msg = (
-                    f"CVE already has a valid PoC — skipping LLM repair "
-                    f"for supplementary PoC {key}"
-                )
-                self.logger.info("Skipping PoC %s — %s.", key, skip_msg)
-                failed_count += 1
-                repair_report[key] = {
-                    "repaired": False,
-                    "fixed_code": None,
-                    "attempts": 0,
-                    "last_errors": errors,
-                    "attempt_history": [],
-                    "skip_reason": skip_msg,
-                }
-                manual_queue.append({
-                    "cve_id": cve_id,
-                    "exploit_idx": exploit_idx,
-                    "language": language,
-                    "original_errors": errors,
-                    "last_errors": errors,
-                    "attempts": 0,
-                    "skip_reason": skip_msg,
-                    "flagged_at": datetime.now().isoformat(),
-                })
-                continue
-
             # ── Pre-check: estimate token budget ──
             # If the PoC is too large for the model to regenerate within the
             # timeout, skip it early rather than burning 3×2 API calls.
-            # Assumes ~3 tok/s at full GPU speed; partial offload is slower.
+            # For Ollama (local GPU): ~3 tok/s; for OpenAI: effectively unlimited
+            # (API responses arrive in seconds, so this check is skipped).
             est_output_tokens = len(original_code) // 4
-            est_generation_secs = est_output_tokens / 3  # conservative: 3 tok/s
+            if provider != "openai":
+                est_generation_secs = est_output_tokens / 3  # conservative: 3 tok/s
+            else:
+                est_generation_secs = est_output_tokens / 150  # OpenAI API is fast
             if est_generation_secs > api_timeout * 0.8:
                 skip_msg = (
                     f"PoC too large for LLM repair (~{est_output_tokens} output "
@@ -637,6 +669,9 @@ class PoCRepairLLM(PipelineModule):
                 temperature=temperature,
                 syntax_validator=syntax_validator,
                 sv_cfg=sv_cfg,
+                provider=provider,
+                openai_model=openai_model,
+                openai_api_key=openai_api_key,
             )
 
             repair_report[key] = result
@@ -869,6 +904,9 @@ class PoCRepairLLM(PipelineModule):
         temperature: float = 0.2,
         syntax_validator: "SyntaxValidator",
         sv_cfg: Dict,
+        provider: str = "ollama",
+        openai_model: str = "",
+        openai_api_key: str = "",
     ) -> Dict[str, Any]:
         """Try up to *max_attempts* LLM repairs, re-validating each time.
 
@@ -925,6 +963,9 @@ class PoCRepairLLM(PipelineModule):
                 timeout=api_timeout,
                 temperature=attempt_temperature,
                 num_ctx=num_ctx,
+                provider=provider,
+                openai_model=openai_model,
+                openai_api_key=openai_api_key,
             )
 
             if raw_response is None:
@@ -1007,12 +1048,53 @@ class PoCRepairLLM(PipelineModule):
         num_ctx: int = 0,
         max_retries: int = 2,
         retry_delay: int = 5,
+        provider: str = "ollama",
+        openai_model: str = "",
+        openai_api_key: str = "",
     ) -> Tuple[Optional[str], Dict[str, Any]]:
-        """Call the Ollama-compatible LLM API with retry logic.
+        """Call the configured LLM backend (Ollama or OpenAI) with retry logic.
 
-        Mirrors the ``call_llm_api`` function in ``patch_generator.py``
-        (Phase 2 of the master pipeline).
+        Dispatches to the Ollama-compatible implementation or to the OpenAI
+        client based on *provider*.  Mirrors ``call_llm_api`` in
+        ``patch_generator.py`` (Phase 2 of the master pipeline).
         """
+        if provider == "openai":
+            return self._call_openai_api(
+                model=openai_model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                timeout=timeout,
+                temperature=temperature,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+                openai_api_key=openai_api_key,
+            )
+        return self._call_ollama_api(
+            api_endpoint=api_endpoint,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            timeout=timeout,
+            temperature=temperature,
+            num_ctx=num_ctx,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+        )
+
+    def _call_ollama_api(
+        self,
+        *,
+        api_endpoint: str,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        timeout: int,
+        temperature: float,
+        num_ctx: int = 0,
+        max_retries: int = 2,
+        retry_delay: int = 5,
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Call the Ollama-compatible local server API with retry logic."""
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -1020,9 +1102,6 @@ class PoCRepairLLM(PipelineModule):
 
         options: Dict[str, Any] = {"temperature": temperature}
         if num_ctx:
-            # Tell the Ollama server to use a specific context window for this
-            # request, overriding its loaded default (often 4096).  Without
-            # this, prompts larger than the server default are silently truncated.
             options["num_ctx"] = num_ctx
 
         payload = {
@@ -1032,12 +1111,10 @@ class PoCRepairLLM(PipelineModule):
             "options": options,
         }
 
-        # Rough token estimate (~4 chars/token for code).  This is logged
-        # so the user can detect when prompts risk being truncated by the
-        # server's context window.
+        # Rough token estimate (~4 chars/token for code).
         total_chars = len(system_prompt) + len(user_prompt)
         est_prompt_tokens = total_chars // 4
-        effective_ctx = num_ctx or 4096  # Ollama default when not set
+        effective_ctx = num_ctx or 4096
         if est_prompt_tokens > effective_ctx * 0.8:
             self.logger.warning(
                 "  Prompt may exceed context window (~%d tokens vs num_ctx=%d). "
@@ -1052,6 +1129,7 @@ class PoCRepairLLM(PipelineModule):
 
         metadata: Dict[str, Any] = {
             "model": model,
+            "provider": "ollama",
             "timestamp_start": datetime.now().isoformat(),
             "payload_size": len(json.dumps(payload)),
             "est_prompt_tokens": est_prompt_tokens,
@@ -1081,8 +1159,6 @@ class PoCRepairLLM(PipelineModule):
                 metadata["response_tokens"] = result.get("eval_count")
                 metadata["total_duration"] = result.get("total_duration")
 
-                # Post-inference GPU check: Ollama lazy-loads models on first
-                # call, so /api/ps is now guaranteed to show the runner.
                 self._check_gpu_status(api_endpoint, model)
 
                 return content, metadata
@@ -1117,17 +1193,133 @@ class PoCRepairLLM(PipelineModule):
         )
         return None, metadata
 
+    def _call_openai_api(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        timeout: int,
+        temperature: float,
+        max_retries: int = 2,
+        retry_delay: int = 5,
+        openai_api_key: str = "",
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Call the OpenAI API with retry logic."""
+        try:
+            from openai import OpenAI, APIError, APIConnectionError, APITimeoutError, RateLimitError
+        except ImportError:
+            raise RuntimeError(
+                "The 'openai' package is required for provider='openai'. "
+                "Install it with: pip install openai>=1.0.0"
+            )
+
+        if not openai_api_key:
+            raise RuntimeError(
+                "OpenAI API key not configured. Set the OPENAI_API_KEY environment "
+                "variable or poc_repair.openai_api_key in the config file."
+            )
+
+        client = OpenAI(api_key=openai_api_key, timeout=timeout)
+        metadata: Dict[str, Any] = {
+            "model": model,
+            "provider": "openai",
+            "timestamp_start": datetime.now().isoformat(),
+            "retries": 0,
+            "success": False,
+            "error": None,
+        }
+
+        for attempt in range(max_retries):
+            try:
+                self.logger.debug(
+                    "  OpenAI API call attempt %d/%d (model=%s)",
+                    attempt + 1, max_retries, model,
+                )
+                completion = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=temperature,
+                )
+                content = completion.choices[0].message.content or ""
+                usage = completion.usage
+                metadata["timestamp_end"] = datetime.now().isoformat()
+                metadata["success"] = True
+                metadata["retries"] = attempt
+                metadata["prompt_tokens"] = usage.prompt_tokens if usage else None
+                metadata["response_tokens"] = usage.completion_tokens if usage else None
+                metadata["total_tokens"] = usage.total_tokens if usage else None
+                self.logger.debug("  OpenAI API call successful for model %s", model)
+                return content, metadata
+
+            except (APITimeoutError, APIConnectionError) as exc:
+                self.logger.warning(
+                    "  OpenAI connection/timeout on attempt %d/%d: %s",
+                    attempt + 1, max_retries, exc,
+                )
+                metadata["error"] = str(exc)
+                metadata["retries"] = attempt + 1
+
+            except RateLimitError as exc:
+                self.logger.warning(
+                    "  OpenAI rate limit on attempt %d/%d: %s",
+                    attempt + 1, max_retries, exc,
+                )
+                metadata["error"] = str(exc)
+                metadata["retries"] = attempt + 1
+
+            except APIError as exc:
+                self.logger.error(
+                    "  OpenAI API error on attempt %d/%d: %s",
+                    attempt + 1, max_retries, exc,
+                )
+                metadata["error"] = str(exc)
+                metadata["retries"] = attempt + 1
+
+            if attempt < max_retries - 1:
+                self.logger.info("  Retrying in %d s …", retry_delay)
+                time.sleep(retry_delay)
+
+        metadata["timestamp_end"] = datetime.now().isoformat()
+        self.logger.error(
+            "All %d OpenAI API attempts failed for model %s", max_retries, model
+        )
+        return None, metadata
+
     # ------------------------------------------------------------------
     # API health check + GPU/CPU detection
     # ------------------------------------------------------------------
 
-    def _check_api_health(self, api_endpoint: str, model: str) -> bool:
+    def _check_api_health(
+        self,
+        api_endpoint: str,
+        model: str,
+        *,
+        provider: str = "ollama",
+        openai_api_key: str = "",
+        openai_model: str = "",
+    ) -> bool:
         """Quick health check before processing.
 
-        Uses GET /api/tags rather than a full inference POST so that the
-        check completes in milliseconds regardless of hardware speed.
-        Also triggers a best-effort GPU/CPU check via /api/ps.
+        For the "openai" provider, validates that an API key is set.
+        For the "ollama" provider, uses GET /api/tags (fast, no inference).
         """
+        if provider == "openai":
+            if not openai_api_key:
+                self.logger.error(
+                    "✗ OpenAI API key not configured. Set the OPENAI_API_KEY "
+                    "environment variable or poc_repair.openai_api_key in config."
+                )
+                return False
+            self.logger.info(
+                "✓ OpenAI provider configured (model: %s)", openai_model
+            )
+            return True
+
+        # --- Ollama health check ---
         from urllib.parse import urlparse, urlunparse
 
         parsed = urlparse(api_endpoint)

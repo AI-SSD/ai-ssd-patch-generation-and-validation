@@ -164,8 +164,17 @@ syntax_validator:
 # Module 6: LLM PoC Repair
 # ---------------------------------------------------------------------------
 # Attempts to auto-fix invalid PoCs using an LLM before flagging for manual
-# review.  Requires an Ollama-compatible API endpoint.
+# review.  Supports "ollama" (local GPU server) or "openai" (OpenAI API).
 poc_repair:
+  # Backend provider: "ollama" or "openai"
+  provider: "ollama"
+
+  # -- OpenAI settings (used only when provider: "openai") --
+  openai_model: "gpt-4.1-mini"
+  # API key. The OPENAI_API_KEY environment variable takes precedence.
+  openai_api_key: ""
+
+  # -- Ollama settings (used only when provider: "ollama") --
   # Ollama-compatible chat API endpoint
   api_endpoint: "http://10.3.2.171:80/api/chat"
 

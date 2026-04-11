@@ -40,20 +40,31 @@ _cfg = load_pipeline_config(BASE_DIR)
 _llm = _cfg.get("llm", {}) if isinstance(_cfg.get("llm"), dict) else {}
 _paths = _cfg.get("paths", {}) if isinstance(_cfg.get("paths"), dict) else {}
 
-# API Configuration
-API_ENDPOINT = str(_llm.get("endpoint", "http://10.3.2.171:80/api/chat"))
-API_TIMEOUT = int(_llm.get("timeout", 600))
-MAX_RETRIES = int(_llm.get("retry_attempts", 3))
-RETRY_DELAY = int(_llm.get("retry_delay", 5))
-NUM_CTX = int(_llm.get("num_ctx", 32768))
+# ---------------------------------------------------------------------------
+# Provider selection: "ollama" (local GPU server) or "openai" (OpenAI API)
+# ---------------------------------------------------------------------------
+LLM_PROVIDER = str(_llm.get("provider", "ollama")).lower()
 
-# Model list
+# Ollama-specific settings
+API_ENDPOINT = str(_llm.get("endpoint", "http://10.3.2.171:80/api/chat"))
+NUM_CTX = int(_llm.get("num_ctx", 32768))
 MODELS = [str(m) for m in _llm.get("models", [
     "qwen2.5-coder:1.5b", "qwen2.5-coder:7b", "qwen2.5:1.5b", "qwen2.5:7b"
 ])]
 
+# OpenAI-specific settings
+OPENAI_MODEL = str(_llm.get("openai_model", "gpt-4.1-mini"))
+# API key: env var takes precedence over config file value
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or str(_llm.get("openai_api_key", ""))
+
+# Shared request settings
+API_TIMEOUT = int(_llm.get("timeout", 600))
+MAX_RETRIES = int(_llm.get("retry_attempts", 3))
+RETRY_DELAY = int(_llm.get("retry_delay", 5))
+
 # LLM Parameters
 LLM_TEMPERATURE = float(_llm.get("temperature", 0.2))
+LLM_MAX_TOKENS = int(_llm.get("max_tokens", 8192))
 
 # Paths
 CSV_PATH = BASE_DIR / str(_paths.get("csv_file", "documentation/file-function.csv"))
@@ -353,12 +364,23 @@ def check_api_health() -> bool:
     """
     Quick health check to verify LLM API is responsive before processing.
 
-    Uses GET /api/tags instead of a full inference POST so the check
-    completes in milliseconds regardless of hardware (CPU vs GPU).
+    For the "ollama" provider, uses GET /api/tags (fast, no inference).
+    For the "openai" provider, validates that an API key is configured.
 
     Returns:
-        True if API is healthy, False otherwise
+        True if API is healthy/configured, False otherwise
     """
+    if LLM_PROVIDER == "openai":
+        if not OPENAI_API_KEY:
+            logger.error(
+                "✗ OpenAI health check failed: no API key found. "
+                "Set the OPENAI_API_KEY environment variable or llm.openai_api_key in config.yaml."
+            )
+            return False
+        logger.info("✓ OpenAI provider configured (model: %s)", OPENAI_MODEL)
+        return True
+
+    # --- Ollama health check ---
     from urllib.parse import urlparse, urlunparse
     parsed = urlparse(API_ENDPOINT)
     tags_url = urlunparse((parsed.scheme, parsed.netloc, "/api/tags", "", "", ""))
@@ -454,8 +476,12 @@ def wait_for_gpu(timeout: Optional[int] = None,
                  poll_interval: int = 15) -> bool:
     """Poll /api/ps until GPU VRAM is free, or *timeout* expires.
 
+    For the "openai" provider this is a no-op (always returns True).
     Returns True if GPU is available, False if wait timed out.
     """
+    if LLM_PROVIDER == "openai":
+        return True  # No GPU to wait for when using OpenAI
+
     from urllib.parse import urlparse, urlunparse
 
     if timeout is None:
@@ -489,23 +515,12 @@ def wait_for_gpu(timeout: Optional[int] = None,
         time.sleep(poll_interval)
 
 
-def call_llm_api(model: str, user_prompt: str, system_prompt: str = SYSTEM_PROMPT) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    Call the LLM API with retry logic.
-    
-    Args:
-        model: Model name to use
-        user_prompt: The user's prompt
-        system_prompt: System prompt for context
-    
-    Returns:
-        Tuple of (response_content, metadata_dict)
-    """
+def _call_ollama_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Call the Ollama-compatible local server API with retry logic."""
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt}
     ]
-    
     payload = {
         "model": model,
         "messages": messages,
@@ -515,66 +530,141 @@ def call_llm_api(model: str, user_prompt: str, system_prompt: str = SYSTEM_PROMP
             "num_ctx": NUM_CTX
         }
     }
-    
     metadata = {
         "model": model,
+        "provider": "ollama",
         "timestamp_start": datetime.now().isoformat(),
         "payload_size": len(json.dumps(payload)),
         "retries": 0,
         "success": False,
         "error": None
     }
-    
     for attempt in range(MAX_RETRIES):
         try:
-            logger.debug(f"API call attempt {attempt + 1}/{MAX_RETRIES} for model {model}")
-            
-            response = requests.post(
-                API_ENDPOINT,
-                json=payload,
-                timeout=API_TIMEOUT
-            )
+            logger.debug(f"Ollama API call attempt {attempt + 1}/{MAX_RETRIES} for model {model}")
+            response = requests.post(API_ENDPOINT, json=payload, timeout=API_TIMEOUT)
             response.raise_for_status()
-            
             result = response.json()
             content = result.get('message', {}).get('content', '')
-            
             metadata["timestamp_end"] = datetime.now().isoformat()
             metadata["success"] = True
             metadata["retries"] = attempt
             metadata["prompt_tokens"] = result.get('prompt_eval_count', None)
             metadata["response_tokens"] = result.get('eval_count', None)
             metadata["total_duration"] = result.get('total_duration', None)
-            
-            logger.debug(f"API call successful for model {model}")
-
-            # Post-inference GPU check: model is guaranteed loaded now
+            logger.debug(f"Ollama API call successful for model {model}")
             _check_gpu_status(model)
-
             return content, metadata
-            
         except requests.exceptions.Timeout:
             logger.warning(f"Timeout on attempt {attempt + 1} for model {model}")
             metadata["error"] = f"Timeout after {API_TIMEOUT}s"
             metadata["retries"] = attempt + 1
-            
         except requests.exceptions.RequestException as e:
             logger.warning(f"Request error on attempt {attempt + 1} for model {model}: {e}")
             metadata["error"] = str(e)
             metadata["retries"] = attempt + 1
-            
         except json.JSONDecodeError as e:
             logger.error(f"JSON decode error for model {model}: {e}")
             metadata["error"] = f"Invalid JSON response: {e}"
             metadata["retries"] = attempt + 1
-        
         if attempt < MAX_RETRIES - 1:
             logger.info(f"Retrying in {RETRY_DELAY} seconds...")
             time.sleep(RETRY_DELAY)
-    
     metadata["timestamp_end"] = datetime.now().isoformat()
     logger.error(f"All {MAX_RETRIES} attempts failed for model {model}")
     return None, metadata
+
+
+def _call_openai_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Call the OpenAI API with retry logic."""
+    try:
+        from openai import OpenAI, APIError, APIConnectionError, APITimeoutError, RateLimitError
+    except ImportError:
+        raise RuntimeError(
+            "The 'openai' package is required for provider='openai'. "
+            "Install it with: pip install openai>=1.0.0"
+        )
+
+    if not OPENAI_API_KEY:
+        raise RuntimeError(
+            "OpenAI API key not configured. Set the OPENAI_API_KEY environment "
+            "variable or llm.openai_api_key in config.yaml."
+        )
+
+    client = OpenAI(api_key=OPENAI_API_KEY, timeout=API_TIMEOUT)
+    metadata: Dict[str, Any] = {
+        "model": model,
+        "provider": "openai",
+        "timestamp_start": datetime.now().isoformat(),
+        "retries": 0,
+        "success": False,
+        "error": None
+    }
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.debug(f"OpenAI API call attempt {attempt + 1}/{MAX_RETRIES} for model {model}")
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=LLM_TEMPERATURE,
+                max_tokens=LLM_MAX_TOKENS,
+            )
+            content = completion.choices[0].message.content or ""
+            usage = completion.usage
+            metadata["timestamp_end"] = datetime.now().isoformat()
+            metadata["success"] = True
+            metadata["retries"] = attempt
+            metadata["prompt_tokens"] = usage.prompt_tokens if usage else None
+            metadata["response_tokens"] = usage.completion_tokens if usage else None
+            metadata["total_tokens"] = usage.total_tokens if usage else None
+            logger.debug(f"OpenAI API call successful for model {model}")
+            return content, metadata
+        except (APITimeoutError, APIConnectionError) as e:
+            logger.warning(f"OpenAI connection/timeout on attempt {attempt + 1}: {e}")
+            metadata["error"] = str(e)
+            metadata["retries"] = attempt + 1
+        except RateLimitError as e:
+            logger.warning(f"OpenAI rate limit on attempt {attempt + 1}: {e}")
+            metadata["error"] = str(e)
+            metadata["retries"] = attempt + 1
+        except APIError as e:
+            logger.error(f"OpenAI API error on attempt {attempt + 1}: {e}")
+            metadata["error"] = str(e)
+            metadata["retries"] = attempt + 1
+        if attempt < MAX_RETRIES - 1:
+            logger.info(f"Retrying in {RETRY_DELAY} seconds...")
+            time.sleep(RETRY_DELAY)
+
+    metadata["timestamp_end"] = datetime.now().isoformat()
+    logger.error(f"All {MAX_RETRIES} OpenAI attempts failed for model {model}")
+    return None, metadata
+
+
+def call_llm_api(model: str, user_prompt: str, system_prompt: str = SYSTEM_PROMPT) -> Tuple[Optional[str], Dict[str, Any]]:
+    """
+    Call the configured LLM backend (Ollama or OpenAI) with retry logic.
+
+    Dispatches to ``_call_ollama_api`` or ``_call_openai_api`` based on
+    ``llm.provider`` in config.yaml.  For the OpenAI provider, *model* is
+    replaced by ``OPENAI_MODEL`` (the caller-supplied value is ignored so
+    that the per-CVE model-iteration loop in Phase 2 still works without
+    changes).
+
+    Args:
+        model: Ollama model name (ignored when provider="openai")
+        user_prompt: The user's prompt
+        system_prompt: System prompt for context
+
+    Returns:
+        Tuple of (response_content, metadata_dict)
+    """
+    if LLM_PROVIDER == "openai":
+        return _call_openai_api(OPENAI_MODEL, user_prompt, system_prompt)
+    return _call_ollama_api(model, user_prompt, system_prompt)
 
 # =============================================================================
 # Code Extraction & Cleaning
@@ -1853,9 +1943,13 @@ Examples:
     logger.info("Checking LLM API connectivity...")
     if not check_api_health():
         logger.error("Cannot proceed without a responsive LLM API. Please check:")
-        logger.error(f"  1. Is the server at {API_ENDPOINT} running?")
-        logger.error("  2. Are the configured models available in Ollama?")
-        logger.error(f"  3. Is there network connectivity?")
+        if LLM_PROVIDER == "openai":
+            logger.error("  1. Is OPENAI_API_KEY set correctly?")
+            logger.error("  2. Is llm.openai_model a valid model name?")
+        else:
+            logger.error(f"  1. Is the server at {API_ENDPOINT} running?")
+            logger.error("  2. Are the configured models available in Ollama?")
+            logger.error(f"  3. Is there network connectivity?")
         sys.exit(1)
     
     # Wait for GPU availability before starting generation

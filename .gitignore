@@ -53,3 +53,4 @@ pipeline/exploits
 pipeline/manual_supervision
 
 _ISSRE_2026___Almeida_
+pipeline/cve_aggregator/API-openai-key

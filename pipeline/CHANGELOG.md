@@ -4,6 +4,29 @@ All notable changes to the AI-SSD Patch Generation & Validation Pipeline will be
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project loosely adheres to Semantic Versioning principles.
 
+## [0.3.4] - 2026-04-11
+
+### Added
+
+- **OpenAI LLM provider:** Added support for OpenAI as an alternative LLM backend. New `provider`/`openai_model`/`openai_api_key` options were added to `config.yaml` and the `cve_aggregator` configs; `patch_generator.py` and `cve_aggregator/modules/poc_repair.py` dispatch between Ollama and OpenAI backends. The project now depends on `openai>=1.0.0` (recorded in `requirements.txt`).
+
+### Changed
+
+- **Provider-aware token budgeting:** PoC repair token/time estimates are now provider-aware (OpenAI uses a faster estimate), avoiding unnecessary skips for large PoCs when using OpenAI.
+- **PoC ordering:** When a CVE's primary PoC (index 0) is invalid but a secondary PoC is valid, the valid PoC is promoted to primary so downstream tools see the best exploit first; the (now secondary) invalid PoC is still queued for LLM repair. This change updates `syntax_results` and the in-memory repair queue to keep indexes consistent.
+- **LLM call refactor:** `patch_generator.py` and `poc_repair.py` were refactored to split LLM calls into `_call_ollama_api` and `_call_openai_api` with a provider dispatch layer.
+- **Reproduction detection:** `orchestrator.py` CVE-specific detection blocks no longer short-circuit to False; generic heuristics were improved (PoC diagnostic-output detection and an exit-code-1 heuristic) so environment-mismatch diagnostics still count as evidence the PoC exercised the target code path.
+
+### Fixed
+
+- **_repair_loop parameter bug:** Fixed `NameError` by adding missing `provider`, `openai_model`, and `openai_api_key` parameters to `_repair_loop` and its call sites.
+- **Removed hardcoded secrets:** Removed an accidentally committed OpenAI API key from `cve_aggregator/glibc_config.yaml`; the code now prefers `OPENAI_API_KEY` env var with YAML fallback.
+- **Dependency installation:** `openai` installed into the project's virtual environment; note the pipeline should be run with the project's `.venv` Python interpreter so the package is available.
+
+### Security
+
+- Removed sensitive API key from repository and recommend using the `OPENAI_API_KEY` environment variable.
+
 ## [0.3.3] - 2026-04-10
 
 ### Added
