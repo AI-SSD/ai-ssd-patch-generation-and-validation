@@ -103,6 +103,10 @@ def clone_or_update_repo(
 _COMMIT_URL_PATTERNS = [
     # sourceware / savannah gitweb: …;h=<hash> or …?h=<hash>
     re.compile(r"[;?&]h=([0-9a-f]{7,40})"),
+    # cgit / git.kernel.org: …/commit/?id=<hash> or …&id=<hash>
+    re.compile(r"[;?&]id=([0-9a-f]{7,40})"),
+    # git.kernel.org stable shorthand: …/stable/c/<hash>
+    re.compile(r"/stable/c/([0-9a-f]{7,40})"),
     # GitHub / GitLab: …/commit/<hash>
     re.compile(r"/commit/([0-9a-f]{7,40})"),
 ]

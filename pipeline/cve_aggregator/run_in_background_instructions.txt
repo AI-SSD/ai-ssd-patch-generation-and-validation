@@ -1,0 +1,149 @@
+Run pipeline in background — quick reference
+Date: 2026-04-12
+
+Purpose:
+Keep this file as a concise reminder for running the CVE pipeline on an Ubuntu server in a detached/backgrounded way, so you can exit SSH and let it continue.
+
+1) Setup (one-time on the server)
+
+```bash
+# adjust /path/to to your server location
+cd /path/to
+# clone repo if needed
+git clone <your-repo-url> pipeline
+cd pipeline
+# create and activate venv
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+mkdir -p logs
+```
+
+2) Environment variables (do NOT commit secrets)
+
+```bash
+# export for the current session
+export OPENAI_API_KEY="<your_openai_key>"
+export NVD_API_KEY="<your_nvd_key>"
+# or load from a file (safer):
+# export OPENAI_API_KEY="$(cat /path/to/OPENAI_KEY_FILE)"
+# export NVD_API_KEY="$(cat /path/to/NVD_API_KEY)"
+```
+
+3) Quick interactive test (always run this first)
+
+```bash
+source venv/bin/activate
+python3 pipeline.py --phases 0 --phase0-config cve_aggregator/kernel_config.yaml
+```
+
+4) Option A — tmux (recommended for manual background runs)
+
+```bash
+# install tmux if missing
+sudo apt update && sudo apt install -y tmux
+# create a new detached session running the pipeline
+tmux new-session -d -s cve_pipeline bash -lc 'cd /path/to/pipeline && source venv/bin/activate && python3 pipeline.py --phases 0 --phase0-config cve_aggregator/kernel_config.yaml > logs/kernel_run.log 2>&1'
+# detach automatically because the session was started detached (-d)
+# reattach later to inspect interactively
+tmux attach -t cve_pipeline
+# detach from an attached session: Ctrl-B then D
+```
+
+5) Option B — nohup / setsid (minimal, no extra tools)
+
+```bash
+cd /path/to/pipeline
+source venv/bin/activate
+nohup bash -lc 'python3 pipeline.py --phases 0 --phase0-config cve_aggregator/kernel_config.yaml' > logs/kernel_run.log 2>&1 &
+# or using setsid
+setsid bash -lc 'source venv/bin/activate && python3 pipeline.py --phases 0 --phase0-config cve_aggregator/kernel_config.yaml' > logs/kernel_run.log 2>&1 &
+```
+
+6) Option C — systemd service (recommended for production, automatic restart)
+
+- Create `/etc/systemd/system/cve_pipeline.service` with the following content (edit paths and `User`):
+
+```
+[Unit]
+Description=CVE Aggregator Pipeline (kernel)
+After=network.target
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/home/youruser/pipeline
+Environment=OPENAI_API_KEY=your_openai_key NVD_API_KEY=your_nvd_key
+ExecStart=/home/youruser/pipeline/venv/bin/python3 /home/youruser/pipeline/pipeline.py --phases 0 --phase0-config /home/youruser/pipeline/cve_aggregator/kernel_config.yaml
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/youruser/pipeline/logs/kernel_run.log
+StandardError=append:/home/youruser/pipeline/logs/kernel_run.err
+
+[Install]
+WantedBy=multi-user.target
+```
+
+- Alternatively place secrets into `/etc/default/cve_pipeline` and reference with `EnvironmentFile=` in the unit file for safer handling.
+
+Enable and start the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now cve_pipeline.service
+sudo systemctl status cve_pipeline.service
+sudo journalctl -u cve_pipeline.service -f
+```
+
+7) View logs & status
+
+```bash
+# file logs
+tail -f /path/to/pipeline/logs/kernel_run.log
+# if using systemd
+sudo journalctl -u cve_pipeline.service -f
+```
+
+8) Stop / restart
+
+```bash
+# tmux: attach then Ctrl-C or kill the session
+tmux attach -t cve_pipeline  # then Ctrl-C
+# kill session
+tmux kill-session -t cve_pipeline
+# nohup/setsid: kill the process by PID
+ps aux | grep pipeline.py
+kill <pid>
+# systemd
+sudo systemctl stop cve_pipeline.service
+sudo systemctl restart cve_pipeline.service
+```
+
+9) Notes & cautions
+
+- Replace `/path/to/pipeline` and `youruser` with real server paths and usernames.
+- The Linux kernel repo is large (several GB). Confirm available disk space before running phases that clone the kernel.
+- Test interactively before backgrounding to ensure config paths and env vars are correct.
+- Use `systemd` for unattended, auto-restarting runs; use `tmux` for ad-hoc interactive troubleshooting.
+- Consider log rotation (`logrotate`) for long runs to avoid filling disk with logs.
+
+Quick one-line tmux start (example):
+
+```bash
+tmux new-session -d -s cve_pipeline bash -lc 'cd /home/youruser/pipeline && source venv/bin/activate && python3 pipeline.py --phases 0 --phase0-config cve_aggregator/kernel_config.yaml > logs/kernel_run.log 2>&1'
+```
+
+If you want, I can:
+- fill a `systemd` unit with your real paths/user, or
+- produce a small wrapper script that sets env vars and runs the pipeline, or
+- add a `logrotate` config snippet for `logs/kernel_run.log`.
+
+
+
+rsync -av --exclude='.venv' --exclude='exploit-database' --exclude='linux' \
+  admin@10.17.0.151:/home/admin/pipeline/ \
+  Downloads/pipeline
+
+rsync -av --exclude='.venv' --exclude='exploit-database' --exclude='glibc' \
+  Documents/Tese/ai-ssd-patch-generation-and-validation/pipeline/ \
+  admin@10.17.0.151:/home/admin/pipeline/

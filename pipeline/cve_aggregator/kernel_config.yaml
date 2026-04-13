@@ -1,0 +1,363 @@
+# =============================================================================
+# CVE Aggregator Pipeline – Linux Kernel Configuration
+# =============================================================================
+# Production configuration for the Linux Kernel project.
+# Pass to the pipeline with:
+#   python3 pipeline.py --phases 0 --phase0-config cve_aggregator/kernel_config.yaml
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Project identity (used in dataset names, logging, etc.)
+# ---------------------------------------------------------------------------
+project:
+  name: "linux-kernel"
+  display_name: "Linux Kernel"
+  description: "CVE and PoC dataset for the Linux Kernel"
+
+# ---------------------------------------------------------------------------
+# Pipeline behaviour
+# ---------------------------------------------------------------------------
+pipeline:
+  abort_on_error: false          # Continue even if one module fails
+  skip_modules: []
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  level: "INFO"                  # DEBUG | INFO | WARNING | ERROR
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  file: "logs/kernel_cve_aggregator.log"
+
+# ---------------------------------------------------------------------------
+# Module 1: CVE Fetching & Enrichment
+# ---------------------------------------------------------------------------
+cve_fetcher:
+  # NVD API key – get one at https://nvd.nist.gov/developers/request-an-api-key
+  nvd_api_key: "043bad81-616b-445a-8e79-96e87cc96c66"
+
+  # Keywords used for NVD keyword search.
+  # These are sent as ``keywordSearch`` to the NVD 2.0 API.
+  keywords:
+    - "linux kernel"
+
+  # Strong keywords that MUST appear in a CVE description for it to be
+  # considered relevant.  Used for deduplication filtering.
+  strong_keywords:
+    - "Linux kernel"
+    - "linux kernel"
+    - "Linux Kernel"
+
+  # If the description contains ONLY a weak match (e.g. a generic library
+  # name), the presence of any of these strings causes the entry to be
+  # rejected.  Useful to exclude look-alike projects.
+  non_target_indicators:
+    # Android-specific kernel forks
+    - "Android kernel"
+    - "Qualcomm"
+    - "MediaTek"
+    - "Samsung Mobile"
+    - "Huawei"
+    - "HiSilicon"
+    # Other operating system kernels
+    - "FreeBSD"
+    - "NetBSD"
+    - "OpenBSD"
+    - "DragonflyBSD"
+    - "Solaris"
+    - "macOS"
+    - "Windows"
+    - "RTOS"
+    - "QNX"
+    - "VxWorks"
+    - "Zephyr"
+    # Userspace projects often confused with kernel
+    - "util-linux"
+    - "systemd"
+    - "glibc"
+    - "musl"
+    - "busybox"
+    - "uClibc"
+    # Virtualisation / hypervisor
+    - "Xen hypervisor"
+    - "QEMU"
+    - "KVM userspace"
+    - "VirtualBox"
+    # Hardware vendor firmware
+    - "BIOS"
+    - "UEFI"
+    - "firmware"
+
+  # Hardening knobs – require explicit kernel match in description and CPE.
+  strict_target_matching: true
+  require_project_cpe_match: false
+  project_cpe_aliases:
+    - "linux_kernel"
+    - "linux:linux_kernel"
+    - "kernel"
+
+  # Optionally enrich each CVE with CVE.org data (slower).
+  enrich_with_cve_org: false
+  cve_org_delay: 1.0             # Seconds between CVE.org requests
+
+  # Exclude CVEs published before this year.
+  # The Linux kernel git history starts around 2005 (v2.6.12).
+  min_published_year: 2005
+
+# ---------------------------------------------------------------------------
+# Module 2: Commit Discovery
+# ---------------------------------------------------------------------------
+commit_discovery:
+  # Remote URL of the source repository (will be cloned if not present).
+  # torvalds/linux is the canonical upstream tree.
+  repo_url: "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+
+  # Local path to the cloned repository (relative to CWD or absolute).
+  # WARNING: a full kernel clone is ~4-5 GB; ensure sufficient disk space.
+  repo_local_path: "./linux"
+
+  # Timeout (seconds) for the initial git clone.
+  # The Linux kernel repo is ~4-5 GB; the default 1800 s (30 min) may not
+  # suffice on slower connections.  3600 s (1 h) is a safer default.
+  clone_timeout: 3600
+
+  # Pull latest changes before searching?
+  auto_update: true
+
+  # Additional git-grep patterns to try when searching for fix commits.
+  # The pipeline always searches for CVE-ID and CVE-ID-without-dashes.
+  # Use {cve} or {cve_num} placeholders to scope a pattern to the current CVE.
+  # "Fixes:" tags reference a bug-introducing commit (NOT the CVE), so
+  # they cannot be used as search patterns here.
+  extra_grep_patterns: []
+
+  # Optional safety knobs for commit matching:
+  # - enable_bz_fallback: tries bug-tracker numeric matching (can create
+  #   false positives; kernel.org Bugzilla IDs overlap with other trackers)
+  # - allow_unscoped_extra_patterns: if false, plain patterns without
+  #   {cve}/{cve_num} are ignored (keep false for large repos like Linux)
+  enable_bz_fallback: false
+  allow_unscoped_extra_patterns: false
+
+  # File extensions considered as "source code" for content extraction.
+  # The kernel is almost exclusively C with some assembly headers.
+  source_extensions:
+    - ".c"
+    - ".h"
+    - ".S"
+
+# ---------------------------------------------------------------------------
+# Module 3: PoC Mapping & Extraction (ExploitDB)
+# ---------------------------------------------------------------------------
+poc_mapper:
+  # Local path to the ExploitDB git repository
+  exploitdb_path: "./exploit-database"
+
+  # Remote URL (for auto-clone)
+  exploitdb_remote_url: "https://gitlab.com/exploit-database/exploitdb.git"
+
+  # Pull latest ExploitDB data before mapping?
+  auto_update: true
+
+  # Deep search: grep exploit file *contents* for CVE IDs (slower but thorough).
+  # Recommended for the kernel — many exploits reference CVEs only inside
+  # source comments, not in the ExploitDB CSV metadata.
+  deep_search: true
+
+  # Extract full source code from matched exploit files?
+  extract_content: true
+
+  # Reverse search: scan ExploitDB titles/contents for your project's
+  # keywords to discover CVEs not returned by NVD keyword search.
+  reverse_search: true
+  enable_reverse_content_grep: true
+
+  # Only include verified exploits from ExploitDB?
+  # The kernel has many community PoCs; set false for broader coverage.
+  require_verified: false
+
+  # Indicators that an exploit mentioning "kernel" is actually about
+  # something else (same idea as cve_fetcher.non_target_indicators).
+  non_target_indicators:
+    - "FreeBSD"
+    - "NetBSD"
+    - "OpenBSD"
+    - "macOS"
+    - "Windows Kernel"
+    - "Solaris"
+    - "iOS"
+
+# ---------------------------------------------------------------------------
+# Module 4: Data Aggregator
+# ---------------------------------------------------------------------------
+data_aggregator:
+  # Path to the global (all-CVEs) JSON dataset
+  global_json_path: "results/kernel_cve_poc_map.json"
+
+  # When true, remove CVEs from the persisted dataset that are not present
+  # in the current run's raw_cves set.
+  prune_missing_cves: true
+
+# ---------------------------------------------------------------------------
+# Module 5: Syntax Validation
+# ---------------------------------------------------------------------------
+syntax_validator:
+  # Directory where invalid PoC files are copied for manual review
+  manual_supervision_dir: "manual_supervision"
+
+  # Path for the JSON validation report
+  report_path: "results/kernel_syntax_validation_report.json"
+
+  # When false, only PoCs belonging to CVEs that have an associated fix
+  # commit are flagged for manual review (avoids reviewing unreachable PoCs).
+  allow_manual_without_commit: false
+
+# ---------------------------------------------------------------------------
+# Module 6: LLM PoC Repair
+# ---------------------------------------------------------------------------
+poc_repair:
+  # Backend provider: "ollama" or "openai"
+  provider: "openai"
+
+  # -- OpenAI settings (used only when provider: "openai") --
+  openai_model: "gpt-4.1-mini"
+  openai_api_key: ""
+
+  # -- Ollama settings (used only when provider: "ollama") --
+  api_endpoint: "http://10.3.2.171:80/api/chat"
+  model: "devstral:32k"
+
+  # Maximum number of repair attempts per PoC before flagging for manual review
+  max_repair_attempts: 3
+
+  # Timeout for each LLM API call (seconds).
+  api_timeout: 600
+
+  # Max seconds to wait for model load into GPU VRAM.
+  model_load_timeout: 300
+
+  # Ollama context window size (options.num_ctx).
+  # Kernel PoCs can be large; use a generous context.
+  num_ctx: 32768
+
+  # Maximum characters of PoC source code included in the prompt.
+  # 0 = no truncation.
+  max_poc_chars: 0
+
+  # Sampling temperature for the LLM.
+  temperature: 0.4
+
+  # Output paths
+  report_path: "results/kernel_poc_repair_report.json"
+  manual_review_queue_path: "results/kernel_manual_review_queue.json"
+
+  # GPU availability wait timeout (seconds).
+  gpu_wait_timeout: 120
+
+# ---------------------------------------------------------------------------
+# Module 7: Output Generation
+# ---------------------------------------------------------------------------
+output:
+  # JSON output paths
+  global_json_path: "results/kernel_cve_poc_map.json"
+  filtered_json_path: "results/kernel_cve_poc_map_filtered.json"
+
+  # CSV output
+  csv_path: "results/kernel_cve_poc_complete.csv"
+
+  # Directory for saving individual PoC exploit files
+  poc_dir: "exploits"
+
+  # Filter controls for the "filtered" dataset:
+  # - filtered_require_commit: keep only CVEs with discovered fix commits
+  # - filtered_require_poc: keep only CVEs with at least one mapped PoC
+  # - filtered_require_verified_poc: require at least one PoC flagged as
+  #   verified in ExploitDB
+  filtered_require_commit: false
+  filtered_require_poc: true
+  filtered_require_verified_poc: false
+
+  # Export PoC rows/files even when commit discovery failed.
+  allow_poc_without_commit: false
+
+  # CSV column names (order matters)
+  csv_fields:
+    - "CVE"
+    - "V_COMMIT"
+    - "FilePath"
+    - "F_NAME"
+    - "UNIT_TYPE"
+    - "V_FILE"
+    - "V_FUNCTION"
+    - "CVE_Description"
+    - "CWE"
+    - "CWE_Description"
+    - "project_version"
+    - "project_version_normalized"
+    - "ubuntu_version"
+    - "poc_index"
+    - "poc_path"
+    - "poc_language"
+    - "manual_review_required"
+    - "manual_verified"
+
+# ---------------------------------------------------------------------------
+# Phase 1 (orchestrator.py) – project-specific settings
+# ---------------------------------------------------------------------------
+phase1:
+  # Local path to the project source repository (relative to pipeline base_dir)
+  project_repo_local_path: "linux"
+
+  # Remote URL used to clone the repo when it is absent locally
+  project_repo_remote_url: "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+
+  # Docker image tag prefixes
+  docker_base_image_prefix: "ai-ssd/kernel-base"
+  docker_cve_image_prefix: "ai-ssd/kernel-cve"
+
+  # Path (relative to base_dir) where the image manifest JSON is written
+  image_manifest_path: "results/kernel_image_manifest.json"
+
+  # Build system used inside the Docker container.
+  # The Linux kernel uses its own Kbuild/Makefile system.
+  # "custom" is appropriate — Phase 1 should just copy sources and
+  # rely on custom build commands (make defconfig && make).
+  build_system: "custom"
+
+  # configure flags (not used for custom build system, kept empty)
+  extra_configure_flags: []
+
+  # Install prefix inside the container for the compiled project artefacts.
+  install_prefix: "/opt/project-build"
+
+  # Name of the source directory inside the Docker build context.
+  source_dir_name: "project-src"
+
+  # Name of the build directory inside the Docker build context.
+  build_dir_name: "project-build"
+
+  # Commit-year → Ubuntu-version mapping for toolchain compatibility.
+  # The kernel needs GCC versions that match the era of the code.
+  commit_era_map:
+    2005: "14.04"
+    2006: "14.04"
+    2007: "14.04"
+    2008: "14.04"
+    2009: "14.04"
+    2010: "14.04"
+    2011: "14.04"
+    2012: "14.04"
+    2013: "14.04"
+    2014: "14.04"
+    2015: "16.04"
+    2016: "16.04"
+    2017: "18.04"
+    2018: "18.04"
+    2019: "20.04"
+    2020: "20.04"
+    2021: "22.04"
+    2022: "22.04"
+    2023: "24.04"
+    2024: "24.04"
+    2025: "24.04"
+    2026: "24.04"

@@ -52,16 +52,29 @@ class CommitDiscovery(PipelineModule):
         repo_url: str = cfg["repo_url"]
         repo_path = Path(cfg.get("repo_local_path", "./source_repo"))
         extra_patterns: List[str] = cfg.get("extra_grep_patterns", [])
+        clone_timeout: int = cfg.get("clone_timeout", 1800)
 
         # Step 1 – Ensure repo is up-to-date
         if cfg.get("auto_update", True):
             self.logger.info("Updating source repository …")
-            ok = clone_or_update_repo(repo_path, repo_url)
+            ok = clone_or_update_repo(repo_path, repo_url, clone_timeout=clone_timeout)
             if not ok:
                 self.logger.warning("Repository update failed – continuing with existing data")
 
         # Step 2 – For each CVE, discover fix/vulnerable commits
         raw_cves: List[Dict[str, Any]] = context.get("raw_cves", [])
+
+        # Abort early with a clear warning when the repo is missing.
+        if not repo_path.exists():
+            self.logger.error(
+                "Source repository not found at '%s' (clone may have failed "
+                "or timed out).  Commit discovery will be skipped entirely.  "
+                "Ensure the repository is accessible and there is sufficient "
+                "disk space for a full clone.",
+                repo_path,
+            )
+            context["raw_cves"] = raw_cves
+            return context
         commits_found = 0
 
         for idx, cve in enumerate(raw_cves, 1):

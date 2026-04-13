@@ -241,13 +241,15 @@ class OutputGenerator(PipelineModule):
         ps = entry.project_state
         meta = entry.metadata
 
-        allow_without_commit = cfg.get("allow_poc_without_commit", False)
+        require_commit = cfg.get("filtered_require_commit", True)
         require_verified_poc = cfg.get("filtered_require_verified_poc", True)
 
-        # By default, require fix commit for pipeline-ready rows.
-        # When allow_poc_without_commit is enabled, keep placeholder rows so
-        # PoC inventory can still be exported and reviewed.
-        if not ps.fix_commit_hash and not allow_without_commit:
+        # Respect the same commit requirement used when building the
+        # filtered dataset.  Previously ``allow_poc_without_commit`` was
+        # checked independently of ``filtered_require_commit``, which
+        # could silently discard every CVE that passed the filter but
+        # lacked a fix commit — producing an empty CSV.
+        if require_commit and not ps.fix_commit_hash:
             return None
 
         # Require at least a PoC
