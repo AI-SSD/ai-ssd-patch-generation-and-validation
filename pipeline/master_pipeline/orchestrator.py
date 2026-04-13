@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dataclasses import asdict
-from .config import PipelineConfig, PHASE_SCRIPTS, DEFAULT_MODELS, MAX_RETRIES, cfg_section
+from .config import PipelineConfig, PHASE_SCRIPTS, DEFAULT_MODELS, MAX_RETRIES, BASE_DIR, cfg_section
 from .models import PhaseResult, PhaseStatus, PatchStatus, FeedbackLoopResult, PipelineSummary
 from .utils import (print_banner, print_phase_header, print_summary_table,
                      format_duration, check_gpu_availability, prompt_gpu_action,
@@ -1047,10 +1047,11 @@ RECOMMENDED ACTIONS:
         """Validate prerequisites before running pipeline."""
         logger.info("Validating prerequisites...")
         
-        # Check if required scripts exist
+        # Check if required scripts exist (resolve from the pipeline root,
+        # not base_dir which may be a per-project working directory)
         for phase, script in PHASE_SCRIPTS.items():
             if phase in self.config.phases:
-                script_path = self.config.base_dir / script
+                script_path = BASE_DIR / script
                 if not script_path.exists():
                     logger.error(f"Missing script: {script_path}")
                     return False

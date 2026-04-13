@@ -15,7 +15,7 @@ phase0_config: "cve_aggregator/glibc_config.yaml"
 
 # Per-phase process timeouts (seconds) – used by the master pipeline executor
 phase_timeouts:
-  0: 7200       # Phase 0: Data aggregation (API calls + git operations)
+  0: 14400       # Phase 0: Data aggregation (API calls + git operations)
   1: 3600       # Phase 1: Vulnerability reproduction (Docker builds)
   2: 10800      # Phase 2: Patch generation (LLM API calls)
   3: 7200       # Phase 3: Patch validation (Docker builds + PoC + SAST)

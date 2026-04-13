@@ -150,8 +150,10 @@ commit_discovery:
 # Module 3: PoC Mapping & Extraction (ExploitDB)
 # ---------------------------------------------------------------------------
 poc_mapper:
-  # Local path to the ExploitDB git repository
-  exploitdb_path: "./exploit-database"
+  # Local path to the ExploitDB git repository.
+  # Points to the shared clone at the pipeline root (two levels up from
+  # the per-project working directory projects/<name>/).
+  exploitdb_path: "../../exploit-database"
 
   # Remote URL (for auto-clone)
   exploitdb_remote_url: "https://gitlab.com/exploit-database/exploitdb.git"

@@ -11,11 +11,13 @@ versions – mirroring the approach in ``extract_patches.py``.
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..models import ProjectState
 from ..utils.git_utils import (
+    build_commit_message_index,
     clone_or_update_repo,
     find_cve_fix_commit,
     get_commit_changed_files,
@@ -61,6 +63,16 @@ class CommitDiscovery(PipelineModule):
             if not ok:
                 self.logger.warning("Repository update failed – continuing with existing data")
 
+        # Step 1b – Build in-memory commit message index for fast searching.
+        # Replaces O(N×4) subprocess calls with 1 git-log + in-memory matching.
+        index_timeout: int = cfg.get("commit_index_timeout", 180)
+        commit_index = build_commit_message_index(repo_path, timeout=index_timeout)
+        if commit_index:
+            self.logger.info(
+                "Using in-memory commit index (%d commits) for fast discovery",
+                len(commit_index),
+            )
+
         # Step 2 – For each CVE, discover fix/vulnerable commits
         raw_cves: List[Dict[str, Any]] = context.get("raw_cves", [])
 
@@ -76,21 +88,38 @@ class CommitDiscovery(PipelineModule):
             context["raw_cves"] = raw_cves
             return context
         commits_found = 0
+        max_workers = cfg.get("max_workers", 4)
 
-        for idx, cve in enumerate(raw_cves, 1):
+        def _process_cve(idx_cve: Tuple[int, Dict[str, Any]]) -> Optional[Tuple[int, "ProjectState"]]:
+            idx, cve = idx_cve
             cve_id = cve.get("cve_id", "")
             if not cve_id:
-                continue
+                return None
+            ps = self._discover(
+                cve_id, repo_path, repo_url, extra_patterns, cfg,
+                reference_urls=cve.get("references", []),
+                commit_index=commit_index,
+            )
+            return idx, ps
 
-            if idx % 25 == 0:
-                self.logger.info("  Commit discovery: %d / %d …", idx, len(raw_cves))
-
-            ps = self._discover(cve_id, repo_path, repo_url, extra_patterns, cfg,
-                               reference_urls=cve.get("references", []))
-            cve["project_state"] = ps.to_dict()
-
-            if ps.fix_commit_hash:
-                commits_found += 1
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_process_cve, (i, cve)): i
+                for i, cve in enumerate(raw_cves)
+            }
+            done_count = 0
+            for future in as_completed(futures):
+                result = future.result()
+                if result is None:
+                    done_count += 1
+                    continue
+                idx, ps = result
+                raw_cves[idx]["project_state"] = ps.to_dict()
+                if ps.fix_commit_hash:
+                    commits_found += 1
+                done_count += 1
+                if done_count % 25 == 0:
+                    self.logger.info("  Commit discovery: %d / %d …", done_count, len(raw_cves))
 
         self.logger.info("Commit Discovery: found commits for %d / %d CVEs", commits_found, len(raw_cves))
         context["raw_cves"] = raw_cves
@@ -109,6 +138,7 @@ class CommitDiscovery(PipelineModule):
         cfg: Dict,
         *,
         reference_urls: Optional[List[str]] = None,
+        commit_index: Optional[List[Tuple[str, str]]] = None,
     ) -> ProjectState:
         ps = ProjectState(repository_url=repo_url)
 
@@ -123,6 +153,7 @@ class CommitDiscovery(PipelineModule):
             extra_grep_patterns=extra_patterns,
             enable_bz_fallback=cfg.get("enable_bz_fallback", True),
             allow_unscoped_extra_patterns=cfg.get("allow_unscoped_extra_patterns", False),
+            commit_index=commit_index,
         )
         if not fix:
             return ps
@@ -181,7 +212,7 @@ class CommitDiscovery(PipelineModule):
 
                 # Find changed code units by extracting from both versions
                 # and comparing (filters out comment/whitespace-only changes)
-                units = find_changed_units(vuln_content, patched_content)
+                units = find_changed_units(vuln_content, patched_content, file_path=fpath)
                 ps.changed_code_units[fpath] = units
 
                 # Also populate vulnerable_functions for backward compat

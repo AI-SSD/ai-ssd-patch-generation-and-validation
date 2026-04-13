@@ -1,10 +1,11 @@
+import os
 import subprocess
 import sys
 import logging
 from datetime import datetime
 from pathlib import Path
 from typing import List
-from .config import PipelineConfig, PHASE_SCRIPTS, cfg_section
+from .config import BASE_DIR, PipelineConfig, PHASE_SCRIPTS, cfg_section
 from .models import PhaseResult, PhaseStatus
 from .utils import format_duration
 
@@ -17,6 +18,9 @@ class PhaseExecutor:
         self.config = config
         self.python_cmd = sys.executable
         self.skipped_cves: List[str] = []  # CVEs excluded during manual verification
+        # Pipeline root: where scripts and packages live (always the repo root,
+        # even when base_dir points to a per-project working directory).
+        self._pipeline_root = BASE_DIR
     
     def execute_phase(self, phase: int) -> PhaseResult:
         """Execute a specific phase."""
@@ -39,7 +43,7 @@ class PhaseExecutor:
                 error_message=f"No script defined for phase {phase}"
             )
         
-        script_path = self.config.base_dir / script
+        script_path = self._pipeline_root / script
         if not script_path.exists():
             return PhaseResult(
                 phase=phase,
@@ -63,9 +67,19 @@ class PhaseExecutor:
         )
         
         try:
+            # Build an env that includes the pipeline root on PYTHONPATH so
+            # that ``python -m cve_aggregator`` resolves even when base_dir
+            # (the CWD) is a per-project working directory.
+            env = os.environ.copy()
+            pp = env.get("PYTHONPATH", "")
+            root_str = str(self._pipeline_root)
+            if root_str not in pp.split(os.pathsep):
+                env["PYTHONPATH"] = root_str + (os.pathsep + pp if pp else "")
+
             process = subprocess.run(
                 cmd,
                 cwd=str(self.config.base_dir),
+                env=env,
                 capture_output=True,
                 text=True,
                 timeout=self._get_timeout(phase)
@@ -129,7 +143,10 @@ class PhaseExecutor:
         
         # Phase-specific arguments
         if phase == 0:  # cve_aggregator
-            config_path = self.config.base_dir / self.config.phase0_config
+            # Resolve Phase 0 config from the pipeline root (where the YAML
+            # files live), not from base_dir which may be a project workdir.
+            p0 = Path(self.config.phase0_config)
+            config_path = p0 if p0.is_absolute() else self._pipeline_root / p0
             cmd.extend(['--config', str(config_path)])
         
         elif phase == 1:  # Orchestrator
@@ -138,7 +155,7 @@ class PhaseExecutor:
             phase0_config_path = (
                 Path(self.config.phase0_config)
                 if Path(self.config.phase0_config).is_absolute()
-                else self.config.base_dir / self.config.phase0_config
+                else self._pipeline_root / self.config.phase0_config
             )
             cmd.extend(['--phase0-config', str(phase0_config_path)])
             if self.config.verbose:

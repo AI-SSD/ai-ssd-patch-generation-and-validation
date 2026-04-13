@@ -16,7 +16,9 @@ logger = logging.getLogger(__name__)
 
 # Extensions considered as text / source code
 DEFAULT_TEXT_EXTENSIONS: Set[str] = {
-    ".c", ".h", ".py", ".rb", ".pl", ".sh", ".bash", ".java", ".js", ".ts",
+    ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx",
+    ".cs",
+    ".py", ".rb", ".pl", ".sh", ".bash", ".java", ".js", ".ts",
     ".php", ".asp", ".aspx", ".jsp", ".txt", ".md", ".rst", ".html", ".xml",
     ".json", ".yaml", ".yml", ".conf", ".cfg", ".ini", ".asm", ".s", ".go",
     ".rs", ".swift", ".kt", ".scala", ".lua", ".r", ".ps1", ".bat", ".cmd",
@@ -29,6 +31,9 @@ DEFAULT_TEXT_EXTENSIONS: Set[str] = {
 
 _EXT_TO_LANG = {
     ".c": "c", ".h": "c",
+    ".cc": "cpp", ".cpp": "cpp", ".cxx": "cpp",
+    ".hh": "cpp", ".hpp": "cpp", ".hxx": "cpp",
+    ".cs": "csharp",
     ".py": "python",
     ".rb": "ruby",
     ".pl": "perl", ".pm": "perl",
@@ -83,8 +88,47 @@ def detect_language_from_content(content: str) -> str:
         r"\bmalloc\s*\(", r"\bfree\s*\(", r"#define\s+\w+",
     ]
     if sum(1 for p in c_patterns if re.search(p, content)) >= 2:
+        # Distinguish C++ from plain C
+        cpp_patterns = [
+            r"\bclass\s+\w+", r"\bnamespace\s+\w+",
+            r"\btemplate\s*<", r"\bcout\b", r"\bcerr\b",
+            r"\bstd::", r"\busing\s+namespace\b",
+            r"#include\s*<(iostream|string|vector|map|set|algorithm|memory|fstream)>",
+            r"\bnew\s+\w+", r"\bdelete\b",
+        ]
+        if sum(1 for p in cpp_patterns if re.search(p, content)) >= 2:
+            return "cpp"
         return "c"
-    if re.search(r"\bdef\s+\w+\s*\(|import\s+\w+|from\s+\w+\s+import", content):
+
+    # C# detection (must run before Java — both use `class` and access modifiers,
+    # but C# has `using` directives and `namespace` blocks).
+    csharp_patterns = [
+        r"^\s*using\s+[\w.]+;",
+        r"^\s*namespace\s+[\w.]+",
+        r"\b(public|private|protected|internal)\s+(static\s+)?(class|struct|interface|enum)\b",
+        r"\bConsole\.Write",
+        r"\bstring\[\]\s+args",
+        r"\bvar\s+\w+\s*=",
+        r"\bawait\s+",
+        r"\basync\s+Task",
+    ]
+    if sum(1 for p in csharp_patterns if re.search(p, content, re.MULTILINE)) >= 2:
+        return "csharp"
+
+    # Java detection (must run BEFORE Python — `import pkg.Class;` also
+    # matches the generic Python `import\s+\w+` pattern).
+    java_patterns = [
+        r"^\s*(import|package)\s+[\w.]+;",
+        r"\b(public|private|protected)\s+(static\s+)?(class|interface|enum|void|int|String)",
+        r"\bpublic\s+static\s+void\s+main\s*\(",
+        r"@(Override|Test|Deprecated|SuppressWarnings)",
+        r"System\.out\.print",
+        r"\bnew\s+\w+\s*\(",
+    ]
+    if sum(1 for p in java_patterns if re.search(p, content, re.MULTILINE)) >= 2:
+        return "java"
+
+    if re.search(r"\bdef\s+\w+\s*\(|from\s+\w+\s+import|^import\s+\w+\s*$", content, re.MULTILINE):
         return "python"
     if re.search(r"<\?php|echo\s|function\s+\w+\s*\(.*\)\s*{", content):
         return "php"
@@ -99,7 +143,8 @@ def detect_language_from_content(content: str) -> str:
 def get_file_extension_for_language(language: str) -> str:
     """Map a language name to a file extension (with dot)."""
     mapping = {
-        "c": ".c", "python": ".py", "ruby": ".rb",
+        "c": ".c", "cpp": ".cpp", "csharp": ".cs",
+        "python": ".py", "ruby": ".rb",
         "perl": ".pl", "shell": ".sh", "php": ".php",
         "java": ".java", "javascript": ".js", "typescript": ".ts",
         "go": ".go", "rust": ".rs", "lua": ".lua",
@@ -132,7 +177,7 @@ def is_text_file(file_path: Path, text_extensions: Optional[Set[str]] = None) ->
 def classify_file_type(file_path: str) -> str:
     """Classify a source file path into a category (source, header, test, build, doc, other)."""
     p = file_path.lower()
-    if p.endswith((".c", ".cc", ".cpp", ".cxx", ".s", ".S", ".asm")):
+    if p.endswith((".c", ".cc", ".cpp", ".cxx", ".s", ".S", ".asm", ".java", ".cs")):
         return "source"
     if p.endswith((".h", ".hh", ".hpp", ".hxx")):
         return "header"

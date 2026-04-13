@@ -12,7 +12,7 @@ import logging
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,82 @@ def clone_or_update_repo(
 
 
 # ---------------------------------------------------------------------------
+# Commit message index (replaces repeated git-log subprocess calls)
+# ---------------------------------------------------------------------------
+
+def build_commit_message_index(
+    repo_path: Path,
+    *,
+    timeout: int = 180,
+) -> Optional[List[Tuple[str, str]]]:
+    """Build an in-memory index of all commit messages for fast searching.
+
+    Returns a list of ``(hash, full_message)`` tuples, or ``None`` on
+    failure.  This replaces repeated ``git log --all --grep=...``
+    subprocess calls with a single ``git log`` pass and in-memory
+    string matching — typically reducing commit search from minutes
+    to under a second.
+    """
+    if not repo_path.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "log", "--all", "--format=%x00%H%x01%B"],
+            cwd=repo_path, capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            logger.warning("Failed to build commit index: %s", result.stderr[:200])
+            return None
+
+        index: List[Tuple[str, str]] = []
+        for record in result.stdout.split("\x00"):
+            record = record.strip()
+            if not record:
+                continue
+            parts = record.split("\x01", 1)
+            if len(parts) != 2:
+                continue
+            commit_hash = parts[0].strip()
+            message = parts[1]
+            if len(commit_hash) >= 7:
+                index.append((commit_hash, message))
+
+        logger.info("Built commit message index: %d commits", len(index))
+        return index
+    except subprocess.TimeoutExpired:
+        logger.error("Commit index build timed out after %ds", timeout)
+        return None
+    except Exception as exc:
+        logger.error("Commit index build error: %s", exc)
+        return None
+
+
+def _search_commit_index(
+    index: List[Tuple[str, str]],
+    search_term: str,
+    *,
+    use_regex: bool = False,
+) -> Optional[str]:
+    """Search the in-memory commit index for a matching message.
+
+    Returns the first matching commit hash, or ``None``.
+    """
+    if use_regex:
+        try:
+            pattern = re.compile(search_term)
+        except re.error:
+            return None
+        for commit_hash, message in index:
+            if pattern.search(message):
+                return commit_hash
+    else:
+        for commit_hash, message in index:
+            if search_term in message:
+                return commit_hash
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Commit search
 # ---------------------------------------------------------------------------
 
@@ -163,14 +239,21 @@ def find_commit_by_message(
     *,
     use_regex: bool = False,
     timeout: int = 60,
+    commit_index: Optional[List[Tuple[str, str]]] = None,
 ) -> Optional[str]:
     """Search git history for a commit whose message contains *search_term*.
 
     Returns the full commit hash or ``None``.
 
+    When *commit_index* is provided, searches in-memory instead of
+    spawning a ``git log`` subprocess (much faster for repeated calls).
+
     When *use_regex* is True the search term is interpreted as an
     extended regular expression (``-E``) instead of a fixed string.
     """
+    # Fast path: use pre-built in-memory index
+    if commit_index is not None:
+        return _search_commit_index(commit_index, search_term, use_regex=use_regex)
     try:
         cmd = ["git", "log", "--all", f"--grep={search_term}", "--format=%H", "-n", "1"]
         if use_regex:
@@ -195,6 +278,7 @@ def find_cve_fix_commit(
     enable_bz_fallback: bool = True,
     allow_unscoped_extra_patterns: bool = False,
     timeout: int = 60,
+    commit_index: Optional[List[Tuple[str, str]]] = None,
 ) -> Optional[str]:
     """Multi-strategy search for a fix commit associated with *cve_id*.
 
@@ -216,12 +300,12 @@ def find_cve_fix_commit(
             return commit
 
     # Strategy 1 – exact CVE ID
-    commit = find_commit_by_message(repo_path, cve_id, timeout=timeout)
+    commit = find_commit_by_message(repo_path, cve_id, timeout=timeout, commit_index=commit_index)
     if commit:
         return commit
 
     # Strategy 2 – without dashes
-    commit = find_commit_by_message(repo_path, cve_id.replace("-", ""), timeout=timeout)
+    commit = find_commit_by_message(repo_path, cve_id.replace("-", ""), timeout=timeout, commit_index=commit_index)
     if commit:
         return commit
 
@@ -231,7 +315,7 @@ def find_cve_fix_commit(
     if enable_bz_fallback and cve_number:
         commit = find_commit_by_message(
             repo_path, f"BZ[^0-9]*{cve_number}([^0-9]|$)",
-            use_regex=True, timeout=timeout,
+            use_regex=True, timeout=timeout, commit_index=commit_index,
         )
         if commit:
             return commit
@@ -251,7 +335,7 @@ def find_cve_fix_commit(
             )
             continue
 
-        commit = find_commit_by_message(repo_path, scoped, timeout=timeout)
+        commit = find_commit_by_message(repo_path, scoped, timeout=timeout, commit_index=commit_index)
         if commit:
             return commit
 

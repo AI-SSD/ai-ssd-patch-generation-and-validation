@@ -151,7 +151,9 @@ class PipelineConfig:
 
         config_path = Path(self.phase0_config)
         if not config_path.is_absolute():
-            config_path = self.base_dir / self.phase0_config
+            # Resolve relative to the pipeline root (where the YAML files
+            # live), not base_dir which may be a per-project workdir.
+            config_path = BASE_DIR / self.phase0_config
 
         if config_path.exists():
             try:

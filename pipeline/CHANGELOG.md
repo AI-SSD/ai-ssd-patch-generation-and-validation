@@ -4,6 +4,50 @@ All notable changes to the AI-SSD Patch Generation & Validation Pipeline will be
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project loosely adheres to Semantic Versioning principles.
 
+## [0.3.6] - 2026-04-13
+
+### Added
+
+- C++ and C# language support across Phase 0 modules: language detection, syntax validation, and code parsing. C++ validation uses `g++ -fsyntax-only -std=c++17`; C# validation uses Mono `mcs` with a structural fallback when the compiler or project references are missing.
+- C# method extractor (`extract_csharp_methods`) and `extract_all_csharp_units` in `cve_aggregator/utils/code_parser.py`.
+- Language-specific repair guidance and comment-prefix mappings for `cpp` and `csharp` in `cve_aggregator/modules/poc_repair.py`.
+
+### Changed
+
+- `cve_aggregator/utils/file_utils.py`: added mappings and heuristics for `.cpp/.cc/.cxx/.hpp/.hxx` and `.cs` extensions and improved detection order to avoid Java/Python misclassification.
+- `cve_aggregator/modules/syntax_validator.py`: added C++ and C# validators, updated comment-prefix entries, and improved code-anchor heuristics.
+- `cve_aggregator/modules/poc_repair.py`: added C++/C# repair guidance to `_LANG_GUIDANCE` and `_COMMENT_PREFIX`.
+- `cve_aggregator/utils/code_parser.py`: added C# extractor, updated `_infer_language` and dispatch logic to support `cpp` and `csharp`; C++ reuses the existing C function/macro extractor.
+
+### Fixed
+
+- Resolved Java/Python detection edge-case by reordering detection logic and tightening the Python import regex so Java `import` lines are not misclassified as Python.
+
+### Notes
+
+- C# detection prefers realistic multi-line source files; very short single-line snippets may still be classified as `unknown`.
+- Validation continues to run on macOS for local checks; some Linux-specific headers may require small guarded stubs when compiling locally.
+
+## [0.3.5] - 2026-04-13
+
+### Added
+
+- **Config knob:** `poc_repair.allow_repair_without_commit` (default: `true`) to control whether `PoCRepairLLM` attempts repairs for CVEs without associated commits, decoupling repair gating from `SyntaxValidator`'s `allow_manual_without_commit`.
+
+### Changed
+
+- **Module 6 (PoCRepairLLM):** Now attempts repair on invalid PoCs independent of commit history when enabled, and updates `syntax_results` in-memory on success so downstream modules see fixes immediately.
+- **Manual supervision artifacts:** When the LLM cannot repair a PoC, `PoCRepairLLM` now writes the source copy and a companion validation JSON into `manual_supervision/` using the same naming convention as `SyntaxValidator` (`{cve_id}_{exploit_idx}{ext}` and `{cve_id}_{exploit_idx}.validation.json`). This ensures `OutputGenerator` and the master orchestrator can find and present manual review items.
+
+### Fixed
+
+- **Orchestrator artifact fabrication reverted:** Removed a temporary change that emitted synthetic `.validation.json` files from `master_pipeline/orchestrator.py` outside Phase 0; validation artifacts are produced by Phase 0 modules to preserve modular boundaries.
+- **Manual-review gap closed:** Fixed the mismatch where CVEs flagged for manual review by Phase 0 were not present in `manual_supervision/`, preventing orphaned reports and ensuring consistent pipeline behavior.
+
+### Notes
+
+- These changes keep Phase 0 self-contained and preserve modular separation between the `cve_aggregator` pipeline and the master orchestrator. To opt out of repairing CVEs without commits, set `poc_repair.allow_repair_without_commit: false` in your aggregator config.
+
 ## [0.3.4] - 2026-04-11
 
 ### Added
@@ -155,3 +199,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ### Changed
 
 - **Pipeline Architecture**: Successfully modularized the legacy monolithic `pipeline.py` script into the organized `master_pipeline` Python package, mirroring the modular standard set by the `cve_aggregator`.
+
+## Unreleased - 2026-04-13
+
+### Added
+
+- In-memory commit message index: added `build_commit_message_index` to `cve_aggregator/utils/git_utils.py` to avoid repeated `git log --grep` subprocesses and dramatically reduce commit-search latency on large repos.
+
+### Changed
+
+- Parallelized `CommitDiscovery`: processes CVEs using a configurable `ThreadPoolExecutor` (`commit_discovery.max_workers`) to utilize available CPU and I/O concurrency and shorten Phase 0 wall-clock time.
+- Parallelized `PoCRepairLLM`: runs independent LLM repair calls concurrently with a configurable worker pool (`poc_repair.max_repair_workers`) to avoid serial LLM call delays.
+- Made previously hardcoded values configurable: `commit_discovery.commit_index_timeout`, `poc_repair.local_token_rate`, `poc_repair.openai_token_rate`, and other LLM/timeout knobs; defaults preserved for backward compatibility.
+
+### Fixed
+
+- Bugfix: corrected a variable reference when writing failed PoC repairs to `manual_supervision/` (used `original_code` rather than undefined `content`), preventing empty manual-review artifacts.
+
+### Notes
+
+- All performance and concurrency parameters are configurable in `cve_aggregator/*_config.yaml` (or the global `config.yaml`) and have safe defaults so behavior is non-breaking by default.
+- These changes are modular and do not modify Phase I/O contracts; they aim to reduce Phase 0 runtime without reducing result quality.
+
+Files changed: `cve_aggregator/utils/git_utils.py`, `cve_aggregator/modules/commit_discovery.py`, `cve_aggregator/modules/poc_repair.py`

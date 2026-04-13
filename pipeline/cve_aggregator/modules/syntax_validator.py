@@ -110,6 +110,9 @@ class SyntaxValidator(PipelineModule):
     def _comment_prefix_for_language(language: str) -> str:
         prefixes = {
             "c": "// ",
+            "cpp": "// ",
+            "csharp": "// ",
+            "java": "// ",
             "python": "# ",
             "shell": "# ",
             "ruby": "# ",
@@ -122,12 +125,22 @@ class SyntaxValidator(PipelineModule):
         """Return True when a line strongly indicates source code for *language*."""
         if language == "c":
             return self._is_c_code_anchor(line)
+        if language == "cpp":
+            return self._is_c_code_anchor(line) or self._is_cpp_code_anchor(line)
 
         s = line.strip()
         if not s:
             return False
 
         patterns = {
+            "csharp": [
+                r"^(using|namespace)\s",
+                r"^(public|private|protected|internal|static|abstract|sealed|partial)\b",
+                r"^(class|struct|interface|enum|record)\b",
+                r"^\[\w+",
+                r"^(if|for|foreach|while|try|catch|switch|return|throw|new|var|await)\b",
+                r"^[A-Za-z_]\w*(<[^>]+>)?\s+\w+\s*[=(]",
+            ],
             "python": [
                 r"^(from|import)\b",
                 r"^(def|class)\b",
@@ -156,6 +169,14 @@ class SyntaxValidator(PipelineModule):
                 r"^<\?php",
                 r"^(function|class|if|require|include|echo)\b",
                 r"^\$[A-Za-z_]",
+            ],
+            "java": [
+                r"^(package|import)\s",
+                r"^(public|private|protected|static|final|abstract|synchronized)\b",
+                r"^(class|interface|enum|record)\b",
+                r"^@\w+",
+                r"^(if|for|while|try|catch|switch|return|throw|new)\b",
+                r"^[A-Za-z_]\w*(<[^>]+>)?\s+\w+\s*[=(]",
             ],
         }
         return any(re.search(p, s) for p in patterns.get(language, []))
@@ -229,6 +250,9 @@ class SyntaxValidator(PipelineModule):
     def _validate(self, content: str, language: str, cfg: Dict) -> SyntaxValidationResult:
         validators = {
             "c": self._validate_c,
+            "cpp": self._validate_cpp,
+            "csharp": self._validate_csharp,
+            "java": self._validate_java,
             "python": self._validate_python,
             "shell": self._validate_shell,
             "ruby": self._validate_ruby,
@@ -397,6 +421,324 @@ class SyntaxValidator(PipelineModule):
         if cleaned.count("(") != cleaned.count(")"):
             errors.append("unbalanced_parentheses")
         return (len(errors) == 0, errors)
+
+    # ------------------------------------------------------------------
+    # C++ validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_cpp_code_anchor(line: str) -> bool:
+        """Return True when a line strongly indicates C++ source code."""
+        s = line.strip()
+        if not s:
+            return False
+        if re.match(r"^(namespace|class|template|using)\b", s):
+            return True
+        if re.match(r"^(std::|cout|cerr|cin|endl)", s):
+            return True
+        return False
+
+    @staticmethod
+    def _run_cpp_syntax_check(content: str) -> Tuple[int, str]:
+        """Run C++ syntax-only compilation via ``g++`` and return ``(returncode, message)``."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False) as f:
+            f.write(content)
+            tmp = f.name
+
+        try:
+            result = subprocess.run(
+                ["g++", "-fsyntax-only", "-std=c++17", "-c", "-w", tmp],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            err_msg = (result.stderr or result.stdout).strip()
+            err_msg = re.sub(r"/tmp/tmp\w+\.cpp:", "line ", err_msg)
+            return result.returncode, err_msg
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+    def _validate_cpp(self, content: str, cfg: Dict) -> SyntaxValidationResult:
+        errors: List[str] = []
+        warnings: List[str] = []
+
+        try:
+            code, err_msg = self._run_cpp_syntax_check(content)
+
+            if code == 0:
+                return SyntaxValidationResult(True, "cpp")
+
+            # Auto-fix prose lines then retry
+            fixed_content, commented_lines = self._auto_comment_uncommented_prose_for_language(content, "cpp")
+            if commented_lines > 0:
+                fixed_code, fixed_err = self._run_cpp_syntax_check(fixed_content)
+                if fixed_code == 0:
+                    warnings.append(f"auto_commented_prose_lines:{commented_lines}")
+                    return SyntaxValidationResult(True, "cpp", warnings=warnings)
+                err_msg = fixed_err or err_msg
+                warnings.append(f"auto_commented_prose_lines:{commented_lines}")
+
+            # Environment errors (Xcode license, missing SDK…)
+            env_patterns = [r"Xcode license", r"xcrun: error", r"developer tools"]
+            if any(re.search(p, err_msg, re.I) for p in env_patterns):
+                warnings.append(f"gpp_env_issue:{err_msg[:200]}")
+                ok, serr = self._validate_c_structure(content)  # reuse C structural check
+                if not ok:
+                    errors.extend(serr)
+                    return SyntaxValidationResult(False, "cpp", errors, warnings, True)
+                return SyntaxValidationResult(True, "cpp", warnings=warnings)
+
+            # Missing-header errors (expected for library code)
+            header_patterns = [
+                r"fatal error:.*No such file",
+                r"fatal error:.*not found",
+            ]
+            if any(re.search(p, err_msg, re.I) for p in header_patterns):
+                warnings.append(f"missing_headers:{err_msg[:200]}")
+                return SyntaxValidationResult(True, "cpp", warnings=warnings)
+
+            errors.append(err_msg)
+            return SyntaxValidationResult(False, "cpp", errors, needs_manual_review=True)
+
+        except subprocess.TimeoutExpired:
+            return SyntaxValidationResult(False, "cpp", ["gpp_timeout"], needs_manual_review=True)
+        except FileNotFoundError:
+            warnings.append("gpp_not_found")
+            ok, serr = self._validate_c_structure(content)
+            if not ok:
+                return SyntaxValidationResult(False, "cpp", serr, warnings, True)
+            return SyntaxValidationResult(True, "cpp", warnings=warnings)
+        except Exception as exc:
+            return SyntaxValidationResult(False, "cpp", [str(exc)], needs_manual_review=True)
+
+    # ------------------------------------------------------------------
+    # C# validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_csharp_structure(content: str) -> Tuple[bool, List[str]]:
+        """Basic structural validation for C# without a compiler."""
+        errors: List[str] = []
+        cleaned = re.sub(r"//.*$", "", content, flags=re.MULTILINE)
+        cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r'"(?:[^"\\]|\\.)*"', '""', cleaned)
+
+        if cleaned.count("{") != cleaned.count("}"):
+            errors.append("unbalanced_braces")
+        if cleaned.count("(") != cleaned.count(")"):
+            errors.append("unbalanced_parentheses")
+
+        if not re.search(r"\b(class|struct|interface|enum|record)\s+\w+", cleaned):
+            errors.append("no_type_declaration")
+
+        return (len(errors) == 0, errors)
+
+    def _validate_csharp(self, content: str, cfg: Dict) -> SyntaxValidationResult:
+        """Validate C# syntax.
+
+        Attempts to use the Mono ``mcs`` compiler if available, otherwise
+        falls back to structural validation.  ``dotnet build`` is not
+        used because it requires a full project context.
+        """
+        errors: List[str] = []
+        warnings: List[str] = []
+
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".cs", delete=False) as f:
+                f.write(content)
+                tmp = f.name
+
+            result = subprocess.run(
+                ["mcs", "-target:library", "-nowarn:0219,0168,0414", tmp],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            err_msg = (result.stderr or result.stdout).strip()
+            err_msg = err_msg.replace(tmp, "<source>")
+            # Clean up .dll output
+            dll_path = Path(tmp).with_suffix(".dll")
+            if dll_path.exists():
+                dll_path.unlink()
+            os.unlink(tmp)
+
+            if result.returncode == 0:
+                return SyntaxValidationResult(True, "csharp")
+
+            # Auto-fix prose lines then retry
+            fixed_content, commented_lines = self._auto_comment_uncommented_prose_for_language(content, "csharp")
+            if commented_lines > 0:
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".cs", delete=False) as f:
+                    f.write(fixed_content)
+                    tmp2 = f.name
+                retry = subprocess.run(
+                    ["mcs", "-target:library", "-nowarn:0219,0168,0414", tmp2],
+                    capture_output=True, text=True, timeout=30,
+                )
+                os.unlink(tmp2)
+                dll_path2 = Path(tmp2).with_suffix(".dll")
+                if dll_path2.exists():
+                    dll_path2.unlink()
+                if retry.returncode == 0:
+                    warnings.append(f"auto_commented_prose_lines:{commented_lines}")
+                    return SyntaxValidationResult(True, "csharp", warnings=warnings)
+                err_msg = (retry.stderr or retry.stdout).strip().replace(tmp2, "<source>") or err_msg
+                warnings.append(f"auto_commented_prose_lines:{commented_lines}")
+
+            # Downgrade missing-assembly / missing-type errors to warnings
+            # (standalone PoCs won't have project-specific references)
+            symbol_patterns = [
+                r"error CS0246",    # type or namespace not found
+                r"error CS0234",    # namespace does not exist
+                r"error CS0012",    # missing assembly reference
+            ]
+            remaining_lines = []
+            for line in err_msg.splitlines():
+                if any(re.search(p, line) for p in symbol_patterns):
+                    warnings.append(f"missing_reference:{line.strip()[:200]}")
+                else:
+                    remaining_lines.append(line)
+
+            non_ref_err = "\n".join(remaining_lines).strip()
+            if not non_ref_err or all(
+                l.strip() == "" or l.strip().startswith("Compilation failed")
+                for l in remaining_lines
+            ):
+                return SyntaxValidationResult(True, "csharp", warnings=warnings)
+
+            errors.append(non_ref_err)
+            return SyntaxValidationResult(False, "csharp", errors, warnings, needs_manual_review=True)
+
+        except subprocess.TimeoutExpired:
+            return SyntaxValidationResult(False, "csharp", ["mcs_timeout"], needs_manual_review=True)
+        except FileNotFoundError:
+            # mcs not installed – structural fallback
+            warnings.append("mcs_not_found")
+            ok, serr = self._validate_csharp_structure(content)
+            if not ok:
+                return SyntaxValidationResult(False, "csharp", serr, warnings, True)
+            return SyntaxValidationResult(True, "csharp", warnings=warnings)
+        except Exception as exc:
+            return SyntaxValidationResult(False, "csharp", [str(exc)], needs_manual_review=True)
+
+    # ------------------------------------------------------------------
+    # Java validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _run_java_syntax_check(content: str) -> Tuple[int, str]:
+        """Run ``javac`` syntax-only compilation and return ``(returncode, message)``.
+
+        Uses ``-proc:none`` to skip annotation processing and
+        ``-implicit:none`` to avoid cascading errors from missing
+        dependencies.  The check validates syntax only — unresolved
+        symbols are expected for standalone PoC files.
+        """
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".java", delete=False, dir=tempfile.gettempdir(),
+        ) as f:
+            f.write(content)
+            tmp = f.name
+
+        try:
+            result = subprocess.run(
+                ["javac", "-proc:none", "-implicit:none", "-nowarn", tmp],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            err_msg = (result.stderr or result.stdout).strip()
+            # Normalise tmp path out of error messages
+            err_msg = err_msg.replace(tmp, "<source>")
+            return result.returncode, err_msg
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            # javac may produce a .class file next to the source
+            class_glob = Path(tmp).with_suffix(".class")
+            if class_glob.exists():
+                class_glob.unlink()
+
+    @staticmethod
+    def _validate_java_structure(content: str) -> Tuple[bool, List[str]]:
+        """Basic structural validation for Java without a compiler."""
+        errors: List[str] = []
+        # Strip comments and string literals
+        cleaned = re.sub(r"//.*$", "", content, flags=re.MULTILINE)
+        cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r'"(?:[^"\\]|\\.)*"', '""', cleaned)
+
+        if cleaned.count("{") != cleaned.count("}"):
+            errors.append("unbalanced_braces")
+        if cleaned.count("(") != cleaned.count(")"):
+            errors.append("unbalanced_parentheses")
+
+        # Java files should contain at least one class/interface/enum declaration
+        if not re.search(r"\b(class|interface|enum|record)\s+\w+", cleaned):
+            errors.append("no_class_declaration")
+
+        return (len(errors) == 0, errors)
+
+    def _validate_java(self, content: str, cfg: Dict) -> SyntaxValidationResult:
+        errors: List[str] = []
+        warnings: List[str] = []
+
+        try:
+            code, err_msg = self._run_java_syntax_check(content)
+
+            if code == 0:
+                return SyntaxValidationResult(True, "java")
+
+            # Auto-fix: comment prose lines then retry
+            fixed_content, commented_lines = self._auto_comment_uncommented_prose_for_language(content, "java")
+            if commented_lines > 0:
+                fixed_code, fixed_err = self._run_java_syntax_check(fixed_content)
+                if fixed_code == 0:
+                    warnings.append(f"auto_commented_prose_lines:{commented_lines}")
+                    return SyntaxValidationResult(True, "java", warnings=warnings)
+                err_msg = fixed_err or err_msg
+                warnings.append(f"auto_commented_prose_lines:{commented_lines}")
+
+            # Missing-symbol errors are expected for standalone PoC files
+            # (they import project classes that aren't available locally).
+            # Downgrade "cannot find symbol" and "package does not exist"
+            # to warnings — the syntax itself may still be valid.
+            symbol_patterns = [
+                r"cannot find symbol",
+                r"package .+ does not exist",
+                r"cannot access",
+            ]
+            remaining_lines = []
+            for line in err_msg.splitlines():
+                if any(re.search(p, line, re.I) for p in symbol_patterns):
+                    warnings.append(f"missing_symbol:{line.strip()[:200]}")
+                else:
+                    remaining_lines.append(line)
+
+            non_symbol_err = "\n".join(remaining_lines).strip()
+
+            # If ALL errors are symbol-resolution, treat as valid
+            if not non_symbol_err or all(
+                l.strip() == "" or l.strip().startswith("^") or re.match(r"^\d+ errors?$", l.strip())
+                for l in remaining_lines
+            ):
+                return SyntaxValidationResult(True, "java", warnings=warnings)
+
+            errors.append(non_symbol_err)
+            return SyntaxValidationResult(False, "java", errors, warnings, needs_manual_review=True)
+
+        except subprocess.TimeoutExpired:
+            return SyntaxValidationResult(False, "java", ["javac_timeout"], needs_manual_review=True)
+        except FileNotFoundError:
+            # javac not installed – structural fallback
+            warnings.append("javac_not_found")
+            ok, serr = self._validate_java_structure(content)
+            if not ok:
+                return SyntaxValidationResult(False, "java", serr, warnings, True)
+            return SyntaxValidationResult(True, "java", warnings=warnings)
+        except Exception as exc:
+            return SyntaxValidationResult(False, "java", [str(exc)], needs_manual_review=True)
 
     # ------------------------------------------------------------------
     # Python validation

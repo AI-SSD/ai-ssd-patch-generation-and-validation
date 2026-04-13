@@ -1,19 +1,18 @@
 # =============================================================================
-# CVE Aggregator Pipeline – glibc Configuration
+# CVE Aggregator Pipeline – Apache Tomcat Configuration
 # =============================================================================
-# Production configuration for the GNU C Library (glibc) project.
+# Production configuration for the Apache Tomcat project.
 # Pass to the pipeline with:
-#   python3 pipeline.py --phases 0 --phase0-config cve_aggregator/glibc_config.yaml
-# (this is also the default Phase 0 config when no --phase0-config is given)
+#   python3 pipeline.py --phases 0 --phase0-config cve_aggregator/tomcat_config.yaml
 # =============================================================================
 
 # ---------------------------------------------------------------------------
 # Project identity (used in dataset names, logging, etc.)
 # ---------------------------------------------------------------------------
 project:
-  name: "glibc"
-  display_name: "GNU C Library"
-  description: "CVE and PoC dataset for GNU C Library (glibc)"
+  name: "tomcat"
+  display_name: "Apache Tomcat"
+  description: "CVE and PoC dataset for Apache Tomcat"
 
 # ---------------------------------------------------------------------------
 # Pipeline behaviour
@@ -28,7 +27,7 @@ pipeline:
 logging:
   level: "INFO"                  # DEBUG | INFO | WARNING | ERROR
   format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-  file: "logs/glibc_cve_aggregator.log"
+  file: "logs/tomcat_cve_aggregator.log"
 
 # ---------------------------------------------------------------------------
 # Module 1: CVE Fetching & Enrichment
@@ -40,108 +39,100 @@ cve_fetcher:
   # Keywords used for NVD keyword search.
   # These are sent as ``keywordSearch`` to the NVD 2.0 API.
   keywords:
-    - "glibc"
-    - "GNU C Library"
-    - "eglibc"
+    - "Apache Tomcat"
+    - "tomcat"
 
   # Strong keywords that MUST appear in a CVE description for it to be
   # considered relevant.  Used for deduplication filtering.
   strong_keywords:
-    - "glibc"
-    - "GNU C Library"
-    - "GNU libc"
-    - "eglibc"
+    - "Apache Tomcat"
+    - "apache tomcat"
+    - "Tomcat"
 
-  # If the description contains ONLY a weak match (e.g. a generic library
-  # name), the presence of any of these strings causes the entry to be
-  # rejected.  Useful to exclude look-alike projects.
+  # If the description contains ONLY a weak match (e.g. a generic name),
+  # the presence of any of these strings causes the entry to be rejected.
+  # Useful to exclude look-alike or co-mentioned projects.
   non_target_indicators:
-    # BSD variants
-    - "NetBSD"
-    - "FreeBSD"
-    - "OpenBSD"
-    - "DragonflyBSD"
-    # Apple / macOS
-    - "Mac OS X"
-    - "macOS"
-    - "Apple"
-    # Commercial Unix
-    - "Solaris"
-    - "SunOS"
-    - "AIX"
-    - "HP-UX"
-    - "IRIX"
-    # Alternative C libraries
-    - "musl"
-    - "dietlibc"
-    - "uClibc"
-    - "Bionic"
-    # Pre-glibc Linux C library
-    - "libc 5."
-    - "libc5"
-    # False-positive library names
-    - "libcgi"
-    - "libcrypt"
-    - "libcurl"
-    - "libcap"
-    # Non-glibc GNU project false positives
-    - "binutils"
-    - "libbfd"
-    - "libcdio"
-    - "vmware"
-    - "mupdf"
-    - "jboss"
-    # Non-glibc software that may reference glibc in CVE descriptions
-    - "GoAhead"
-    - "Embedthis"
-    - "sudo"
+    # Other Apache projects that may co-appear in CVE descriptions
+    - "Apache HTTP Server"
+    - "Apache httpd"
+    - "Apache Struts"
+    - "Apache ActiveMQ"
+    - "Apache Kafka"
+    - "Apache Camel"
+    - "Apache CXF"
+    - "Apache Shiro"
+    - "Apache OFBiz"
+    - "Apache Geronimo"
+    # Other Java application servers / servlet containers
+    - "JBoss"
+    - "WildFly"
+    - "GlassFish"
+    - "WebLogic"
+    - "WebSphere"
+    - "Jetty"
+    - "Undertow"
+    - "Payara"
+    # Non-Java web servers sometimes confused
+    - "Nginx"
+    - "IIS"
+    - "LiteSpeed"
+    # Build / dependency tools
+    - "Maven"
+    - "Gradle"
 
-  # Hardening knobs – require explicit glibc match in description and CPE.
-  # strict_target_matching: require at least one strong keyword in description.
-  # require_project_cpe_match: require a project alias in a CPE entry.
+  # Hardening knobs – require explicit Tomcat match in description and CPE.
+  # "tomcat" is specific enough that strict matching works well.
   strict_target_matching: true
   require_project_cpe_match: false
   project_cpe_aliases:
-    - "glibc"
-    - "gnu:glibc"
-    - "eglibc"
+    - "tomcat"
+    - "apache:tomcat"
 
   # Optionally enrich each CVE with CVE.org data (slower).
   enrich_with_cve_org: false
   cve_org_delay: 1.0             # Seconds between CVE.org requests
 
-  # Exclude CVEs published before this year (commits predate git history).
-  # Set to null or remove to include all years.
-  min_published_year: 1990
+  # Exclude CVEs published before this year.
+  # Tomcat's earliest CVEs in NVD date back to ~2005.
+  min_published_year: 2005
 
 # ---------------------------------------------------------------------------
 # Module 2: Commit Discovery
 # ---------------------------------------------------------------------------
 commit_discovery:
-  # Remote URL of the source repository (will be cloned if not present)
-  repo_url: "https://sourceware.org/git/glibc.git"
+  # Remote URL of the source repository (will be cloned if not present).
+  # The official ASF mirror on GitHub is a lightweight, fast-to-clone option.
+  repo_url: "https://github.com/apache/tomcat.git"
 
-  # Local path to the cloned repository (relative to CWD or absolute)
-  repo_local_path: "./glibc"
+  # Local path to the cloned repository (relative to CWD or absolute).
+  repo_local_path: "./tomcat"
+
+  # Timeout (seconds) for the initial git clone.
+  # Tomcat repo is ~350 MB — 600 s (10 min) is generous.
+  clone_timeout: 600
 
   # Pull latest changes before searching?
   auto_update: true
 
   # Additional git-grep patterns to try when searching for fix commits.
-  # The pipeline always searches for CVE-ID and CVE-ID-without-dashes.
-  # Use {cve} or {cve_num} placeholders to scope a pattern to the current CVE.
+  # Tomcat commits often reference Bugzilla bug IDs with "BZ" prefixes.
   extra_grep_patterns: []
 
   # Optional safety knobs for commit matching:
-  # - enable_bz_fallback: tries bug-tracker numeric matching (can create false positives)
-  # - allow_unscoped_extra_patterns: if false, plain patterns without {cve}/{cve_num} are ignored
+  # - enable_bz_fallback: tries bug-tracker numeric matching
+  #   (Tomcat Bugzilla IDs are fairly unique, so this is useful)
+  # - allow_unscoped_extra_patterns: if false, plain patterns without
+  #   {cve}/{cve_num} are ignored
   enable_bz_fallback: true
   allow_unscoped_extra_patterns: false
 
-  # File extensions considered as "source code" for content extraction
+  # File extensions considered as "source code" for content extraction.
+  # Tomcat is primarily Java with some JSP and XML configuration.
   source_extensions:
-    - ".c"
-    - ".h"
+    - ".java"
+    - ".jsp"
+    - ".xml"
 
 # ---------------------------------------------------------------------------
 # Module 3: PoC Mapping & Extraction (ExploitDB)
@@ -158,8 +149,9 @@ poc_mapper:
   # Pull latest ExploitDB data before mapping?
   auto_update: true
 
-  # Deep search: grep exploit file *contents* for CVE IDs (slower but thorough)
-  deep_search: false
+  # Deep search: grep exploit file *contents* for CVE IDs (slower but thorough).
+  # Tomcat exploits in ExploitDB often reference CVEs in comments/headers.
+  deep_search: true
 
   # Extract full source code from matched exploit files?
   extract_content: true
@@ -167,26 +159,27 @@ poc_mapper:
   # Reverse search: scan ExploitDB titles/contents for your project's
   # keywords to discover CVEs not returned by NVD keyword search.
   reverse_search: true
-  enable_reverse_content_grep: false
+  enable_reverse_content_grep: true
 
   # Only include verified exploits from ExploitDB?
-  # Set to false to also include unverified community-contributed PoCs
-  # (increases recall at the cost of lower quality assurance).
+  # Tomcat has a moderate number of PoCs; verified-only keeps quality high.
   require_verified: true
 
-  # Indicators that an exploit mentioning glibc is actually about
-  # something else (same idea as cve_fetcher.non_target_indicators).
+  # Indicators that an exploit mentioning "Tomcat" is actually about
+  # something else.
   non_target_indicators:
-    - "NetBSD"
-    - "FreeBSD"
-    - "musl"
+    - "JBoss"
+    - "GlassFish"
+    - "WebLogic"
+    - "WebSphere"
+    - "Jetty"
 
 # ---------------------------------------------------------------------------
 # Module 4: Data Aggregator
 # ---------------------------------------------------------------------------
 data_aggregator:
   # Path to the global (all-CVEs) JSON dataset
-  global_json_path: "results/glibc_cve_poc_map.json"
+  global_json_path: "results/tomcat_cve_poc_map.json"
 
   # When true, remove CVEs from the persisted dataset that are not present
   # in the current run's raw_cves set.
@@ -200,7 +193,7 @@ syntax_validator:
   manual_supervision_dir: "manual_supervision"
 
   # Path for the JSON validation report
-  report_path: "results/syntax_validation_report.json"
+  report_path: "results/tomcat_syntax_validation_report.json"
 
   # When false, only PoCs belonging to CVEs that have an associated fix
   # commit are flagged for manual review (avoids reviewing unreachable PoCs).
@@ -209,67 +202,42 @@ syntax_validator:
 # ---------------------------------------------------------------------------
 # Module 6: LLM PoC Repair
 # ---------------------------------------------------------------------------
-# Attempts to auto-fix invalid PoCs using an LLM before flagging for manual
-# review.  Supports "ollama" (local GPU server) or "openai" (OpenAI API).
 poc_repair:
   # Backend provider: "ollama" or "openai"
   provider: "openai"
 
   # -- OpenAI settings (used only when provider: "openai") --
-  # Model to use.  gpt-4.1-mini is a non-reasoning model with a 10 M token/day
-  # free tier – well suited for code generation tasks.
   openai_model: "gpt-4.1-mini"
-  # API key. The OPENAI_API_KEY environment variable takes precedence.
-  # Do NOT commit a real key here; prefer the environment variable.
-  # Instead as a possibility, do something like: export OPENAI_API_KEY="$(cat /path/to/secret/key.txt)"
   openai_api_key: ""
 
   # -- Ollama settings (used only when provider: "ollama") --
-  # Ollama-compatible chat API endpoint
   api_endpoint: "http://10.3.2.171:80/api/chat"
-
-  # LLM model to use for repairs (must be available on the Ollama server).
-  # devstral is faster than qwen3-coder:30b and code-repair specialised.
   model: "devstral:32k"
 
   # Maximum number of repair attempts per PoC before flagging for manual review
   max_repair_attempts: 3
 
   # Timeout for each LLM API call (seconds).
-  # Cold-start model loading is handled by model_load_timeout (see below);
-  # this only covers the actual inference once the model is in VRAM.
-  # At ~2-3 tok/s (no flash attention) generating 1000 tokens takes ~6 min.
-  # With flash attention enabled (recommended) this can be lowered to 300.
   api_timeout: 600
 
-  # Max seconds to wait for the model to load into GPU VRAM before
-  # starting repairs.  Ollama lazy-loads on first inference, so large models
-  # (devstral ~14 GiB) can exceed api_timeout on the very first call.
+  # Max seconds to wait for model load into GPU VRAM.
   model_load_timeout: 300
 
-  # Ollama context window size passed as options.num_ctx in the API call.
-  # Must be large enough to hold the full prompt + response tokens.
-  # Prompts with PoC source typically range from 4K-15K tokens.
-  # If set to 0, Ollama falls back to its server default (often 4096),
-  # which SILENTLY TRUNCATES the prompt and causes 500 errors.
+  # Ollama context window size (options.num_ctx).
   num_ctx: 32768
 
   # Maximum characters of PoC source code included in the prompt.
-  # 0 = no truncation (recommended when running on GPU with sufficient VRAM).
+  # 0 = no truncation.
   max_poc_chars: 0
 
   # Sampling temperature for the LLM.
-  # Base temperature – the code staggers it upward on each retry.
   temperature: 0.4
 
   # Output paths
-  report_path: "results/poc_repair_report.json"
-  manual_review_queue_path: "results/manual_review_queue.json"
+  report_path: "results/tomcat_poc_repair_report.json"
+  manual_review_queue_path: "results/tomcat_manual_review_queue.json"
 
   # GPU availability wait timeout (seconds).
-  # Before starting repairs, poll /api/ps until a GPU is free.
-  # If the GPU is still busy after this many seconds, skip repairs entirely.
-  # Set to 0 to disable the check and always proceed.
   gpu_wait_timeout: 120
 
 # ---------------------------------------------------------------------------
@@ -277,11 +245,11 @@ poc_repair:
 # ---------------------------------------------------------------------------
 output:
   # JSON output paths
-  global_json_path: "results/glibc_cve_poc_map.json"
-  filtered_json_path: "results/glibc_cve_poc_map_filtered.json"
+  global_json_path: "results/tomcat_cve_poc_map.json"
+  filtered_json_path: "results/tomcat_cve_poc_map_filtered.json"
 
   # CSV output
-  csv_path: "results/glibc_cve_poc_complete.csv"
+  csv_path: "results/tomcat_cve_poc_complete.csv"
 
   # Directory for saving individual PoC exploit files
   poc_dir: "exploits"
@@ -290,13 +258,12 @@ output:
   # - filtered_require_commit: keep only CVEs with discovered fix commits
   # - filtered_require_poc: keep only CVEs with at least one mapped PoC
   # - filtered_require_verified_poc: require at least one PoC flagged as
-  #   verified in ExploitDB (mirrors poc_mapper.require_verified for output)
+  #   verified in ExploitDB
   filtered_require_commit: false
   filtered_require_poc: true
   filtered_require_verified_poc: true
 
   # Export PoC rows/files even when commit discovery failed.
-  # Useful for PoC inventory workflows; disable for strict patch-pipeline-only mode.
   allow_poc_without_commit: false
 
   # CSV column names (order matters)
@@ -323,52 +290,47 @@ output:
 # ---------------------------------------------------------------------------
 # Phase 1 (orchestrator.py) – project-specific settings
 # ---------------------------------------------------------------------------
-# All values here are read by orchestrator.py at startup via --phase0-config.
-# Changing these keys is the ONLY thing needed to adapt Phase 1 to a new project.
 phase1:
   # Local path to the project source repository (relative to pipeline base_dir)
-  project_repo_local_path: "glibc"
+  project_repo_local_path: "tomcat"
 
   # Remote URL used to clone the repo when it is absent locally
-  project_repo_remote_url: "https://sourceware.org/git/glibc.git"
+  project_repo_remote_url: "https://github.com/apache/tomcat.git"
 
-  # Docker image tag prefixes (must be valid Docker image name components)
-  docker_base_image_prefix: "ai-ssd/glibc-base"
-  docker_cve_image_prefix: "ai-ssd/glibc-cve"
+  # Docker image tag prefixes
+  docker_base_image_prefix: "ai-ssd/tomcat-base"
+  docker_cve_image_prefix: "ai-ssd/tomcat-cve"
 
   # Path (relative to base_dir) where the image manifest JSON is written
-  image_manifest_path: "results/image_manifest.json"
+  image_manifest_path: "results/tomcat_image_manifest.json"
 
   # Build system used inside the Docker container.
-  # "autotools"  → run ./configure + make (default; used for C projects like glibc)
-  # "cmake"      → run cmake + make
-  # "custom"     → just copy sources; no automated build step added by Phase 1
-  build_system: "autotools"
+  # Tomcat uses Apache Ant (build.xml) as its primary build system.
+  # "custom" is appropriate — Phase 1 copies sources and relies on
+  # custom build commands (ant deploy / ant dist).
+  build_system: "custom"
 
-  # configure flags passed during the build (autotools only).
-  # These are appended AFTER the strategy-specific flags that Phase 1 inserts.
+  # configure flags (not used for custom build system, kept empty)
   extra_configure_flags: []
 
   # Install prefix inside the container for the compiled project artefacts.
-  # Phase 1 links PoCs against libraries found here.
   install_prefix: "/opt/project-build"
 
   # Name of the source directory inside the Docker build context.
-  # Must be a single path component (no slashes).
   source_dir_name: "project-src"
 
   # Name of the build directory inside the Docker build context.
   build_dir_name: "project-build"
 
-  # Commit-year → Ubuntu-version mapping for toolchain compatibility.
-  # Format: {year: "ubuntu_version"}.  Missing years are clamped to the nearest bound.
-  # Remove or leave empty ({}) to disable era mapping (use CSV ubuntu_version as-is).
+  # Commit-year → Ubuntu-version mapping for toolchain (JDK) compatibility.
+  # Tomcat version eras roughly align with JDK requirements:
+  #   Tomcat 6.x (2007-2016) → JDK 5/6 → Ubuntu 14.04 (OpenJDK 7)
+  #   Tomcat 7.x (2011-2021) → JDK 6/7 → Ubuntu 16.04 (OpenJDK 8)
+  #   Tomcat 8.x (2014-2024) → JDK 7/8 → Ubuntu 18.04 (OpenJDK 11)
+  #   Tomcat 9.x (2018-…)    → JDK 8+  → Ubuntu 20.04 (OpenJDK 11)
+  #   Tomcat 10.x (2021-…)   → JDK 11+ → Ubuntu 22.04 (OpenJDK 17)
+  #   Tomcat 11.x (2024-…)   → JDK 17+ → Ubuntu 24.04 (OpenJDK 21)
   commit_era_map:
-    2000: "14.04"
-    2001: "14.04"
-    2002: "14.04"
-    2003: "14.04"
-    2004: "14.04"
     2005: "14.04"
     2006: "14.04"
     2007: "14.04"
@@ -378,7 +340,7 @@ phase1:
     2011: "14.04"
     2012: "14.04"
     2013: "14.04"
-    2014: "14.04"
+    2014: "16.04"
     2015: "16.04"
     2016: "16.04"
     2017: "18.04"

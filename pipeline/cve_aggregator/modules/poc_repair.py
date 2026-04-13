@@ -36,7 +36,8 @@ logger = logging.getLogger(__name__)
 
 # --- Comment-prefix per language (used in retry prompts) ---
 _COMMENT_PREFIX: Dict[str, str] = {
-    "c": "//", "python": "#", "shell": "#", "ruby": "#",
+    "c": "//", "cpp": "//", "csharp": "//", "java": "//",
+    "python": "#", "shell": "#", "ruby": "#",
     "perl": "#", "php": "//",
 }
 
@@ -66,6 +67,32 @@ _LANG_GUIDANCE: Dict[str, str] = {
         "    #define PAGE_MASK (~(PAGE_SIZE - 1))\n"
         "    #endif\n"
         "  This preserves compilation on both macOS and Linux."
+    ),
+    "cpp": (
+        "C++-SPECIFIC RULES:\n"
+        "  • All C rules apply (preprocessor, prose, undeclared identifiers, etc.)\n"
+        "  • Missing namespace qualifiers (std::) — add 'using namespace std;' or qualify names\n"
+        "  • Missing C++ standard headers (<iostream>, <string>, <vector>, <memory>, etc.)\n"
+        "  • Template syntax errors from HTML entity corruption (e.g. &lt; → <)\n"
+        "  • C++11/14/17 features that may need 'auto', 'nullptr', range-for, etc.\n"
+        "  • Class/struct declarations with missing closing braces or semicolons\n"
+        "  • Do NOT downgrade C++ to C — preserve the original coding style\n"
+        "  • Validation uses g++ with -std=c++17"
+    ),
+    "csharp": (
+        "C#-SPECIFIC RULES:\n"
+        "  • Prose/description lines embedded in code — comment them out with '//'\n"
+        "  • Missing 'using' directives for standard namespaces\n"
+        "    (e.g. using System; using System.IO; using System.Net;) — add them\n"
+        "  • Unresolved project-specific references (e.g. custom NuGet packages)\n"
+        "    are expected for standalone PoC files — do NOT remove the using directives\n"
+        "  • Missing semicolons at end of statements stripped during scraping\n"
+        "  • Truncated class/method declarations from line-wrap during extraction\n"
+        "  • Unbalanced braces from incomplete class or method bodies\n"
+        "  • Attribute syntax errors ([Attribute]) — ensure they are on their own line\n"
+        "  • String interpolation syntax ($\"...\") that may have been corrupted\n"
+        "  • Do NOT change the namespace or class name\n"
+        "  • Validation uses the Mono mcs compiler if available"
     ),
     "python": (
         "PYTHON-SPECIFIC RULES:\n"
@@ -103,6 +130,24 @@ _LANG_GUIDANCE: Dict[str, str] = {
         "  • Prose lines inside code blocks — comment out with '//'\n"
         "  • HTML entity artefacts (&lt; &gt; &amp;) that should be < > &\n"
         "  • Missing semicolons at end of PHP statements"
+    ),
+    "java": (
+        "JAVA-SPECIFIC RULES:\n"
+        "  • Prose/description lines embedded in code — comment them out with '//'\n"
+        "  • Missing import statements for standard JDK classes\n"
+        "    (e.g. java.io.*, java.net.*, java.util.*) — add them\n"
+        "  • Unresolved project-specific imports (e.g. org.apache.*, javax.servlet.*)\n"
+        "    are expected for standalone PoC files — do NOT remove them\n"
+        "  • Missing semicolons at end of statements stripped during scraping\n"
+        "  • Truncated class/method declarations from line-wrap during extraction\n"
+        "  • Unbalanced braces from incomplete class or method bodies\n"
+        "  • Annotation syntax errors (@Override, @Test) — ensure they are on\n"
+        "    their own line before the method or class declaration\n"
+        "  • If the file has no public class matching the filename, that is OK —\n"
+        "    standalone PoC files are compiled with javac directly\n"
+        "  • Generics syntax errors from HTML entity corruption\n"
+        "    (e.g. List&lt;String&gt; → List<String>)\n"
+        "  • Do NOT change the package declaration or class name\n"
     ),
 }
 
@@ -452,13 +497,18 @@ class PoCRepairLLM(PipelineModule):
             self.logger.info("No syntax results found – skipping PoC repair.")
             return context
 
-        # Identify invalid PoCs that need repair — respect the same
-        # commit-gating filter that Module 5 uses to flag for review.
-        sv_allow = self.config.get("syntax_validator", {}).get(
-            "allow_manual_without_commit", True
+        # Identify invalid PoCs that need repair.
+        # By default, PoCRepairLLM attempts repair on ALL invalid PoCs
+        # regardless of whether the CVE has commits.  The commit-gating
+        # in SyntaxValidator controls which files are *copied* to
+        # manual_supervision/ for human review; it should not prevent
+        # LLM repair attempts.  Use poc_repair.allow_repair_without_commit
+        # (default True) to control this independently.
+        repair_allow = cfg.get(
+            "allow_repair_without_commit", True
         )
         invalid_pocs = self._collect_invalid_pocs(
-            syntax_results, dataset, allow_without_commit=sv_allow
+            syntax_results, dataset, allow_without_commit=repair_allow
         )
         if not invalid_pocs:
             self.logger.info("All PoCs passed validation – nothing to repair.")
@@ -574,6 +624,10 @@ class PoCRepairLLM(PipelineModule):
                 elif item_swap["exploit_idx"] == valid_idx:
                     item_swap["exploit_idx"] = 0
 
+        # ── Phase A: Pre-checks (fast, sequential) ──
+        # Separate items into those that need LLM repair vs those skipped.
+        items_to_repair: List[Dict[str, Any]] = []
+
         for item in invalid_pocs:
             cve_id = item["cve_id"]
             exploit_idx = item["exploit_idx"]
@@ -583,15 +637,14 @@ class PoCRepairLLM(PipelineModule):
             key = f"{cve_id}:{exploit_idx}"
 
             # ── Pre-check: estimate token budget ──
-            # If the PoC is too large for the model to regenerate within the
-            # timeout, skip it early rather than burning 3×2 API calls.
-            # For Ollama (local GPU): ~3 tok/s; for OpenAI: effectively unlimited
-            # (API responses arrive in seconds, so this check is skipped).
             est_output_tokens = len(original_code) // 4
+            # Token generation rates (tok/s) — configurable per provider
+            local_tok_rate = cfg.get("local_token_rate", 3)
+            openai_tok_rate = cfg.get("openai_token_rate", 150)
             if provider != "openai":
-                est_generation_secs = est_output_tokens / 3  # conservative: 3 tok/s
+                est_generation_secs = est_output_tokens / local_tok_rate
             else:
-                est_generation_secs = est_output_tokens / 150  # OpenAI API is fast
+                est_generation_secs = est_output_tokens / openai_tok_rate
             if est_generation_secs > api_timeout * 0.8:
                 skip_msg = (
                     f"PoC too large for LLM repair (~{est_output_tokens} output "
@@ -651,28 +704,74 @@ class PoCRepairLLM(PipelineModule):
                 })
                 continue
 
-            self.logger.info(
-                "Repairing PoC %s (lang=%s, errors=%d) …",
-                key, language, len(errors),
-            )
+            items_to_repair.append(item)
 
-            result = self._repair_loop(
-                original_code=original_code,
-                language=language,
-                errors=errors,
-                max_attempts=max_attempts,
-                api_endpoint=api_endpoint,
-                model=model,
-                api_timeout=api_timeout,
-                num_ctx=num_ctx,
-                max_poc_chars=max_poc_chars,
-                temperature=temperature,
-                syntax_validator=syntax_validator,
-                sv_cfg=sv_cfg,
-                provider=provider,
-                openai_model=openai_model,
-                openai_api_key=openai_api_key,
-            )
+        # ── Phase B: Parallel LLM repair (I/O-bound) ──
+        max_repair_workers = cfg.get("max_repair_workers", 3)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _run_repair(item: Dict[str, Any]) -> Dict[str, Any]:
+            """Run a single repair loop — safe to call from a worker thread."""
+            return {
+                "item": item,
+                "result": self._repair_loop(
+                    original_code=item["content"],
+                    language=item["language"],
+                    errors=item["errors"],
+                    max_attempts=max_attempts,
+                    api_endpoint=api_endpoint,
+                    model=model,
+                    api_timeout=api_timeout,
+                    num_ctx=num_ctx,
+                    max_poc_chars=max_poc_chars,
+                    temperature=temperature,
+                    syntax_validator=syntax_validator,
+                    sv_cfg=sv_cfg,
+                    provider=provider,
+                    openai_model=openai_model,
+                    openai_api_key=openai_api_key,
+                ),
+            }
+
+        self.logger.info(
+            "Starting LLM repair for %d PoC(s) with %d worker(s) …",
+            len(items_to_repair), max_repair_workers,
+        )
+
+        repair_results: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=max_repair_workers) as executor:
+            futures = {
+                executor.submit(_run_repair, item): item
+                for item in items_to_repair
+            }
+            for future in as_completed(futures):
+                try:
+                    repair_results.append(future.result())
+                except Exception as exc:
+                    failed_item = futures[future]
+                    key = f"{failed_item['cve_id']}:{failed_item['exploit_idx']}"
+                    self.logger.error("Repair thread failed for %s: %s", key, exc)
+                    repair_results.append({
+                        "item": failed_item,
+                        "result": {
+                            "repaired": False,
+                            "fixed_code": None,
+                            "attempts": 0,
+                            "last_errors": failed_item["errors"],
+                            "attempt_history": [],
+                        },
+                    })
+
+        # ── Phase C: Apply results (sequential) ──
+        for rr in repair_results:
+            item = rr["item"]
+            result = rr["result"]
+            cve_id = item["cve_id"]
+            exploit_idx = item["exploit_idx"]
+            original_code = item["content"]
+            language = item["language"]
+            errors = item["errors"]
+            key = f"{cve_id}:{exploit_idx}"
 
             repair_report[key] = result
 
@@ -684,7 +783,6 @@ class PoCRepairLLM(PipelineModule):
                 entry = dataset.cves.get(cve_id)
                 if entry and exploit_idx < len(entry.exploits):
                     entry.exploits[exploit_idx].source_code_content = fixed_code
-                    # Also update the language if it was originally misidentified
                     if entry.exploits[exploit_idx].language in ("unknown", "text"):
                         entry.exploits[exploit_idx].language = language
 
@@ -711,14 +809,10 @@ class PoCRepairLLM(PipelineModule):
 
                 # ── Remove stale manual_supervision/ files for this PoC ──
                 if manual_dir.exists():
-                    # Remove exact files created by SyntaxValidator
                     stale_candidates = [
                         manual_dir / f"{cve_id}_{exploit_idx}{ext}",
                         manual_dir / f"{cve_id}_{exploit_idx}.validation.json",
                     ]
-                    # Also remove files created by master pipeline's
-                    # _generate_syntax_report (uses exploit filename without
-                    # index suffix, e.g. CVE-2011-2702.c)
                     stale_candidates.extend(manual_dir.glob(f"{cve_id}{ext}"))
                     stale_candidates.extend(manual_dir.glob(f"{cve_id}_syntax_report.txt"))
                     stale_candidates.extend(manual_dir.glob(f"{cve_id}.ok"))
@@ -737,7 +831,6 @@ class PoCRepairLLM(PipelineModule):
                                 )
             else:
                 failed_count += 1
-                # ── Flag for manual supervision
                 manual_queue.append({
                     "cve_id": cve_id,
                     "exploit_idx": exploit_idx,
@@ -747,6 +840,29 @@ class PoCRepairLLM(PipelineModule):
                     "attempts": result["attempts"],
                     "flagged_at": datetime.now().isoformat(),
                 })
+
+                if manual_dir.exists():
+                    ext = get_file_extension_for_language(language)
+                    src_dest = manual_dir / f"{cve_id}_{exploit_idx}{ext}"
+                    meta_dest = manual_dir / f"{cve_id}_{exploit_idx}.validation.json"
+                    try:
+                        src_dest.write_text(original_code, encoding="utf-8")
+                        meta_dest.write_text(json.dumps({
+                            "is_valid": False,
+                            "language": language,
+                            "errors": result.get("last_errors", errors),
+                            "warnings": [
+                                f"llm_repair_failed_after_{result['attempts']}_attempts"
+                            ],
+                            "needs_manual_review": True,
+                        }, indent=2), encoding="utf-8")
+                        self.logger.debug(
+                            "Flagged failed repair for manual review: %s", src_dest,
+                        )
+                    except Exception as exc:
+                        self.logger.warning(
+                            "Could not flag %s for manual review: %s", cve_id, exc,
+                        )
 
         # ── Persist reports ──
         self._save_report(repair_report, report_path)
