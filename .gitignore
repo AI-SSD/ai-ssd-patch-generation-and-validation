@@ -55,3 +55,4 @@ pipeline/manual_supervision
 _ISSRE_2026___Almeida_
 pipeline/cve_aggregator/API-openai-key
 pipeline/cve_aggregator/API-nvd-key
+pipeline/documentation/server.md
