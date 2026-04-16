@@ -1273,12 +1273,36 @@ RECOMMENDED ACTIONS:
         llm_cfg = cfg_section("llm", self.config.base_dir)
         return str(llm_cfg.get("endpoint", "http://localhost:11434/api/chat"))
 
+    def _resolve_provider_for_phase(self, phase: int) -> str:
+        """Return the LLM provider configured for *phase*.
+
+        Phase 0 reads ``poc_repair.provider`` from the Phase 0 config YAML
+        (e.g. ``glibc_config.yaml``).  All other phases read
+        ``llm.provider`` from the global ``config.yaml``.
+        """
+        if phase == 0:
+            from .config import _load_yaml, BASE_DIR
+            config_path = Path(self.config.phase0_config)
+            if not config_path.is_absolute():
+                config_path = BASE_DIR / self.config.phase0_config
+            p0_cfg = _load_yaml(config_path)
+            return str(p0_cfg.get("poc_repair", {}).get("provider", "ollama")).lower()
+        # Phases 2+ use the global config
+        llm_cfg = cfg_section("llm", self.config.base_dir)
+        return str(llm_cfg.get("provider", "ollama")).lower()
+
     def _check_gpu_before_phase(self, phase: int) -> str:
         """Check GPU availability before an LLM-dependent phase.
 
         Returns ``"proceed"`` (GPU is free or user chose to continue),
         or ``"skip"`` (user chose to skip the phase).
         """
+        # GPU check is only relevant for local Ollama inference.
+        provider = self._resolve_provider_for_phase(phase)
+        if provider != "ollama":
+            logger.info("Phase %d uses provider '%s' — skipping GPU check.", phase, provider)
+            return "proceed"
+
         endpoint = self._resolve_llm_endpoint()
         free, detail = check_gpu_availability(endpoint)
 

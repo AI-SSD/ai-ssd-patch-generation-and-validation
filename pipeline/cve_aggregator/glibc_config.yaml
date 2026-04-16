@@ -124,6 +124,10 @@ commit_discovery:
   # Local path to the cloned repository (relative to CWD or absolute)
   repo_local_path: "./glibc"
 
+  # Timeout (seconds) for the initial git clone.
+  # The glibc repo is ~1.5 GB; sourceware.org can be slow.
+  clone_timeout: 3600
+
   # Pull latest changes before searching?
   auto_update: true
 

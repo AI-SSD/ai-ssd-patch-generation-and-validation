@@ -4,6 +4,20 @@ All notable changes to the AI-SSD Patch Generation & Validation Pipeline will be
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project loosely adheres to Semantic Versioning principles.
 
+## [0.3.7] - 2026-04-14
+
+### Fixed
+
+- `cve_aggregator/modules/poc_mapper.py`: strict CVE parsing when reading ExploitDB CSVs — the CSV `codes` field is now parsed using the regex match group (`m.group(0)`) and the extracted value is used as the canonical CVE identifier. This prevents malformed keys from dirty CSV tokens (for example, `CVE-2017-18344.`) and avoids creating duplicate filenames such as `CVE-2017-18344..c`.
+
+### Reverted
+
+- Reverted a proposed tightening of reverse-search content filtering that could have excluded legitimate dual-project CVEs. Reverse-search behavior remains permissive so CVEs that legitimately affect multiple projects are preserved.
+
+### Notes
+
+- This update is defensive: it corrects parsing of noisy ExploitDB CSV entries without changing PoC-to-CVE attribution or cross-project mappings.
+
 ## [0.3.6] - 2026-04-13
 
 ### Added

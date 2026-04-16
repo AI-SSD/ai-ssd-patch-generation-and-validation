@@ -21,6 +21,17 @@ logger = logging.getLogger(__name__)
 # Repository management
 # ---------------------------------------------------------------------------
 
+def _cleanup_failed_clone(local_path: Path) -> None:
+    """Remove a partially-cloned directory so the next run starts fresh."""
+    import shutil
+    if local_path.exists():
+        try:
+            shutil.rmtree(local_path)
+            logger.info("Removed incomplete clone at %s", local_path)
+        except Exception as exc:
+            logger.warning("Could not remove %s: %s", local_path, exc)
+
+
 def clone_or_update_repo(
     local_path: Path,
     remote_url: str,
@@ -43,21 +54,49 @@ def clone_or_update_repo(
             )
             if result.returncode != 0:
                 logger.error("Clone failed: %s", result.stderr)
+                # Remove the partially-cloned directory so the next run
+                # starts fresh instead of finding a broken repo.
+                _cleanup_failed_clone(local_path)
                 return False
 
             logger.info("Full clone successful")
             return True
         except subprocess.TimeoutExpired:
             logger.error("Clone timed out after %ds", clone_timeout)
+            _cleanup_failed_clone(local_path)
             return False
         except Exception as exc:
             logger.error("Clone error: %s", exc)
+            _cleanup_failed_clone(local_path)
             return False
 
     # Existing repo – pull
     if not (local_path / ".git").exists():
         logger.error("Path is not a git repository: %s", local_path)
         return False
+
+    # Detect a broken clone (e.g. interrupted clone left an unborn branch).
+    # In this state ``git pull`` will always fail with "Updating an unborn
+    # branch …", so we remove the directory and fall through to a fresh clone.
+    try:
+        head_check = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=local_path, capture_output=True, text=True, timeout=10,
+        )
+        if head_check.returncode != 0:
+            logger.warning(
+                "Repository at %s appears corrupted (HEAD unresolvable). "
+                "Removing and re-cloning …",
+                local_path,
+            )
+            import shutil
+            shutil.rmtree(local_path)
+            return clone_or_update_repo(
+                local_path, remote_url,
+                clone_timeout=clone_timeout, pull_timeout=pull_timeout,
+            )
+    except Exception as exc:
+        logger.warning("HEAD check failed (%s) – attempting pull anyway", exc)
 
     try:
         # Stash any local/unstaged changes so pull --rebase can proceed
@@ -117,7 +156,8 @@ def build_commit_message_index(
     try:
         result = subprocess.run(
             ["git", "log", "--all", "--format=%x00%H%x01%B"],
-            cwd=repo_path, capture_output=True, text=True, timeout=timeout,
+            cwd=repo_path, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
         )
         if result.returncode != 0:
             logger.warning("Failed to build commit index: %s", result.stderr[:200])
@@ -198,7 +238,8 @@ def _validate_commit_in_repo(
     try:
         result = subprocess.run(
             ["git", "cat-file", "-t", commit_hash],
-            cwd=repo_path, capture_output=True, text=True, timeout=timeout,
+            cwd=repo_path, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
         )
         return result.returncode == 0 and result.stdout.strip() == "commit"
     except Exception:
@@ -260,7 +301,8 @@ def find_commit_by_message(
             cmd.insert(3, "-E")  # enable extended regex before --grep
         result = subprocess.run(
             cmd,
-            cwd=repo_path, capture_output=True, text=True, timeout=timeout,
+            cwd=repo_path, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip().split("\n")[0]
@@ -350,7 +392,8 @@ def get_parent_commit(repo_path: Path, commit_hash: str, *, timeout: int = 30) -
     try:
         result = subprocess.run(
             ["git", "rev-parse", f"{commit_hash}^1"],
-            cwd=repo_path, capture_output=True, text=True, timeout=timeout,
+            cwd=repo_path, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
@@ -370,7 +413,8 @@ def get_commit_metadata(repo_path: Path, commit_hash: str, *, timeout: int = 30)
     try:
         result = subprocess.run(
             ["git", "log", "-1", "--format=%H|%ai|%an|%s", commit_hash],
-            cwd=repo_path, capture_output=True, text=True, timeout=timeout,
+            cwd=repo_path, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
         )
         if result.returncode == 0 and result.stdout.strip():
             parts = result.stdout.strip().split("|", 3)
@@ -394,7 +438,8 @@ def get_commit_changed_files(repo_path: Path, commit_hash: str, *, timeout: int 
     try:
         result = subprocess.run(
             ["git", "diff-tree", "--no-commit-id", "-r", "--name-status", commit_hash],
-            cwd=repo_path, capture_output=True, text=True, timeout=timeout,
+            cwd=repo_path, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
         )
         if result.returncode == 0:
             for line in result.stdout.strip().splitlines():
@@ -455,7 +500,8 @@ def get_changed_functions_in_commit(
     try:
         result = subprocess.run(
             ["git", "log", "-1", "-p", "-U0", "--format=", commit_hash, "--", file_path],
-            cwd=repo_path, capture_output=True, text=True, timeout=timeout,
+            cwd=repo_path, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
         )
         if result.returncode == 0:
             for line in result.stdout.splitlines():

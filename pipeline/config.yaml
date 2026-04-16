@@ -82,7 +82,7 @@ llm:
   # -------------------------------------------------------------------------
   # Backend provider: "ollama" (local GPU server) or "openai" (OpenAI API)
   # -------------------------------------------------------------------------
-  provider: "ollama"
+  provider: "openai"
 
   # -------------------------------------------------------------------------
   # Ollama settings (used only when provider: "ollama")

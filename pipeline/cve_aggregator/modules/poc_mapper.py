@@ -133,9 +133,11 @@ class PoCMapper(PipelineModule):
                     codes_str = row.get("codes", "")
                     for code in codes_str.split(";"):
                         code = code.strip()
-                        if re.match(r"CVE-\d{4}-\d+", code):
+                        m = re.match(r"CVE-\d{4}-\d+", code)
+                        if m:
+                            cve_id = m.group(0)
                             info = self._row_to_info(row, edb_path)
-                            mapping.setdefault(code, []).append(info)
+                            mapping.setdefault(cve_id, []).append(info)
                             count += 1
         except Exception as exc:
             self.logger.warning("Error parsing %s: %s", csv_path, exc)

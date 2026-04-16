@@ -87,6 +87,29 @@ class CommitDiscovery(PipelineModule):
             )
             context["raw_cves"] = raw_cves
             return context
+
+        # Abort early when the repo exists but has no usable history
+        # (e.g. corrupted clone that was not auto-recovered).
+        if not commit_index or len(commit_index) == 0:
+            # Double-check: is the repo actually functional?
+            import subprocess as _sp
+            try:
+                rev = _sp.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                if rev.returncode != 0:
+                    self.logger.error(
+                        "Repository at '%s' has no usable commit history "
+                        "(HEAD unresolvable).  Commit discovery will be "
+                        "skipped entirely.  Delete the directory and re-run "
+                        "to trigger a fresh clone.",
+                        repo_path,
+                    )
+                    context["raw_cves"] = raw_cves
+                    return context
+            except Exception:
+                pass  # git not available; fall through and try anyway
         commits_found = 0
         max_workers = cfg.get("max_workers", 4)
 
