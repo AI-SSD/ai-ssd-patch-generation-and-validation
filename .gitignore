@@ -53,7 +53,8 @@ pipeline/exploits
 pipeline/manual_supervision
 
 _ISSRE_2026___Almeida_
-ExploitForge
+ExploitForge_anon
+/ExploitForge_anon.zip
 
 pipeline/cve_aggregator/API-openai-key
 pipeline/cve_aggregator/API-nvd-key
