@@ -219,7 +219,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ### Added
 
 - Phase 0 now records vulnerable commit metadata and exports `V_COMMIT_TIMESTAMP` and `V_COMMIT_YEAR` in the generated CSV so later phases can reuse commit-era information without re-querying git.
-- Setup utilities were reorganized under `pipeline/setup/` (`setup.sh`, `verify_setup.sh`, and `fix_containerd.sh`).
+- Setup utilities were reorganized under `pipeline/setup/` (`setup.sh`, `verify_setup.sh`, and `fix_containerd.sh`), and the scripts now resolve the pipeline root correctly after the move.
 - API key loading now falls back to repo-root secret files (`pipeline/API-openai-key` and `pipeline/API-nvd-key`) when environment variables or YAML config values are not set.
 - In-memory commit message index: added `build_commit_message_index` to `cve_aggregator/utils/git_utils.py` to avoid repeated `git log --grep` subprocesses and dramatically reduce commit-search latency on large repos.
 

@@ -14,6 +14,9 @@
 
 set -e  # Exit on any error
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PIPELINE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -543,26 +546,25 @@ install_utilities() {
 # Setup API Keys
 setup_api_keys() {
     log_info "Setting up API keys files..."
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     
-    if [ ! -f "$SCRIPT_DIR/API-nvd-key" ]; then
-        touch "$SCRIPT_DIR/API-nvd-key"
-        chmod 600 "$SCRIPT_DIR/API-nvd-key"
+    if [ ! -f "$PIPELINE_ROOT/API-nvd-key" ]; then
+        touch "$PIPELINE_ROOT/API-nvd-key"
+        chmod 600 "$PIPELINE_ROOT/API-nvd-key"
         if [ -n "$SUDO_USER" ]; then
-            chown "$SUDO_USER:$SUDO_USER" "$SCRIPT_DIR/API-nvd-key"
+            chown "$SUDO_USER:$SUDO_USER" "$PIPELINE_ROOT/API-nvd-key"
         fi
-        log_info "Created empty API-nvd-key file at $SCRIPT_DIR/API-nvd-key. Please populate it with your NVD API key."
+        log_info "Created empty API-nvd-key file at $PIPELINE_ROOT/API-nvd-key. Please populate it with your NVD API key."
     else
         log_info "API-nvd-key already exists."
     fi
 
-    if [ ! -f "$SCRIPT_DIR/API-openai-key" ]; then
-        touch "$SCRIPT_DIR/API-openai-key"
-        chmod 600 "$SCRIPT_DIR/API-openai-key"
+    if [ ! -f "$PIPELINE_ROOT/API-openai-key" ]; then
+        touch "$PIPELINE_ROOT/API-openai-key"
+        chmod 600 "$PIPELINE_ROOT/API-openai-key"
         if [ -n "$SUDO_USER" ]; then
-            chown "$SUDO_USER:$SUDO_USER" "$SCRIPT_DIR/API-openai-key"
+            chown "$SUDO_USER:$SUDO_USER" "$PIPELINE_ROOT/API-openai-key"
         fi
-        log_info "Created empty API-openai-key file at $SCRIPT_DIR/API-openai-key. Please populate it with your OpenAI API key."
+        log_info "Created empty API-openai-key file at $PIPELINE_ROOT/API-openai-key. Please populate it with your OpenAI API key."
     else
         log_info "API-openai-key already exists."
     fi
@@ -633,30 +635,27 @@ verify_installations() {
 # Create project directory structure
 setup_project_structure() {
     log_info "Setting up project directory structure..."
-    
-    # Get the directory where the script is located
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    
+
     # Create necessary directories for Phase 1
-    mkdir -p "$SCRIPT_DIR/exploits"
-    mkdir -p "$SCRIPT_DIR/docker_builds"
-    mkdir -p "$SCRIPT_DIR/results"
-    mkdir -p "$SCRIPT_DIR/logs"
+    mkdir -p "$PIPELINE_ROOT/exploits"
+    mkdir -p "$PIPELINE_ROOT/docker_builds"
+    mkdir -p "$PIPELINE_ROOT/results"
+    mkdir -p "$PIPELINE_ROOT/logs"
     
     # Create necessary directories for Phase 2
-    mkdir -p "$SCRIPT_DIR/patches"
+    mkdir -p "$PIPELINE_ROOT/patches"
     
     # Create necessary directories for Phase 3
-    mkdir -p "$SCRIPT_DIR/validation_builds"
-    mkdir -p "$SCRIPT_DIR/validation_results"
+    mkdir -p "$PIPELINE_ROOT/validation_builds"
+    mkdir -p "$PIPELINE_ROOT/validation_results"
     
     # Create necessary directories for Phase 4
-    mkdir -p "$SCRIPT_DIR/reports"
+    mkdir -p "$PIPELINE_ROOT/reports"
     
     # Clone ExploitDB repository if not present (required for Phase 0 PoC matching)
-    if [ ! -d "$SCRIPT_DIR/exploit-database" ]; then
+    if [ ! -d "$PIPELINE_ROOT/exploit-database" ]; then
         log_info "Cloning ExploitDB repository (required for Phase 0)..."
-        git clone --depth=1 https://gitlab.com/exploit-database/exploitdb.git "$SCRIPT_DIR/exploit-database" || {
+        git clone --depth=1 https://gitlab.com/exploit-database/exploitdb.git "$PIPELINE_ROOT/exploit-database" || {
             log_warn "ExploitDB clone failed. Phase 0 will attempt to clone it at runtime."
         }
     else
@@ -665,10 +664,10 @@ setup_project_structure() {
     
     # Ensure directories have proper ownership if running with sudo
     if [ -n "$SUDO_USER" ]; then
-        chown -R "$SUDO_USER:$SUDO_USER" "$SCRIPT_DIR/exploits" "$SCRIPT_DIR/docker_builds" "$SCRIPT_DIR/results" "$SCRIPT_DIR/logs" "$SCRIPT_DIR/patches" "$SCRIPT_DIR/validation_builds" "$SCRIPT_DIR/validation_results" "$SCRIPT_DIR/reports" 2>/dev/null || true
+        chown -R "$SUDO_USER:$SUDO_USER" "$PIPELINE_ROOT/exploits" "$PIPELINE_ROOT/docker_builds" "$PIPELINE_ROOT/results" "$PIPELINE_ROOT/logs" "$PIPELINE_ROOT/patches" "$PIPELINE_ROOT/validation_builds" "$PIPELINE_ROOT/validation_results" "$PIPELINE_ROOT/reports" 2>/dev/null || true
     fi
     
-    log_info "Project structure created at $SCRIPT_DIR"
+    log_info "Project structure created at $PIPELINE_ROOT"
 }
 
 # Main execution

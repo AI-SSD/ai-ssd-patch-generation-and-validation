@@ -19,6 +19,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PIPELINE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 echo ""
 echo "============================================="
@@ -108,19 +109,19 @@ echo -e "${BLUE}--- API Keys ---${NC}"
 
 # Check NVD API Key
 echo -n "Checking NVD API Key... "
-if [ -s "$SCRIPT_DIR/API-nvd-key" ]; then
+if [ -s "$PIPELINE_ROOT/API-nvd-key" ]; then
     echo -e "${GREEN}✓${NC} Found and not empty"
 else
-    echo -e "${YELLOW}⚠${NC} Not found or empty at $SCRIPT_DIR/API-nvd-key"
+    echo -e "${YELLOW}⚠${NC} Not found or empty at $PIPELINE_ROOT/API-nvd-key"
     WARNINGS=$((WARNINGS + 1))
 fi
 
 # Check OpenAI API Key
 echo -n "Checking OpenAI API Key... "
-if [ -s "$SCRIPT_DIR/API-openai-key" ]; then
+if [ -s "$PIPELINE_ROOT/API-openai-key" ]; then
     echo -e "${GREEN}✓${NC} Found and not empty"
 else
-    echo -e "${YELLOW}⚠${NC} Not found or empty at $SCRIPT_DIR/API-openai-key"
+    echo -e "${YELLOW}⚠${NC} Not found or empty at $PIPELINE_ROOT/API-openai-key"
     WARNINGS=$((WARNINGS + 1))
 fi
 
@@ -129,8 +130,8 @@ echo -e "${BLUE}--- Phase 1: Vulnerability Reproduction ---${NC}"
 
 # Check CSV file
 echo -n "Checking file-function.csv... "
-if [ -f "$SCRIPT_DIR/documentation/file-function.csv" ]; then
-    COUNT=$(tail -n +2 "$SCRIPT_DIR/documentation/file-function.csv" | grep -c "CVE-" || true)
+if [ -f "$PIPELINE_ROOT/documentation/file-function.csv" ]; then
+    COUNT=$(tail -n +2 "$PIPELINE_ROOT/documentation/file-function.csv" | grep -c "CVE-" || true)
     echo -e "${GREEN}✓${NC} Found ($COUNT CVE entries)"
 else
     echo -e "${RED}✗ Not found at documentation/file-function.csv${NC}"
@@ -139,13 +140,13 @@ fi
 
 # Check exploits directory
 echo -n "Checking exploits directory... "
-if [ -d "$SCRIPT_DIR/exploits" ]; then
-    POC_COUNT=$(find "$SCRIPT_DIR/exploits" -name "CVE-*.c" | wc -l | tr -d ' ')
+if [ -d "$PIPELINE_ROOT/exploits" ]; then
+    POC_COUNT=$(find "$PIPELINE_ROOT/exploits" -name "CVE-*.c" | wc -l | tr -d ' ')
     echo -e "${GREEN}✓${NC} Found ($POC_COUNT PoC files)"
     
     # List available PoCs
     echo "  Available PoCs:"
-    for poc in "$SCRIPT_DIR/exploits"/CVE-*.c; do
+    for poc in "$PIPELINE_ROOT/exploits"/CVE-*.c; do
         if [ -f "$poc" ]; then
             echo "    - $(basename "$poc")"
         fi
@@ -157,7 +158,7 @@ fi
 
 # Check orchestrator.py
 echo -n "Checking orchestrator.py... "
-if [ -f "$SCRIPT_DIR/orchestrator.py" ]; then
+if [ -f "$PIPELINE_ROOT/orchestrator.py" ]; then
     echo -e "${GREEN}✓${NC} Found"
 else
     echo -e "${RED}✗ Not found${NC}"
@@ -169,7 +170,7 @@ echo -e "${BLUE}--- Phase 2: Patch Generation ---${NC}"
 
 # Check patch_generator.py
 echo -n "Checking patch_generator.py... "
-if [ -f "$SCRIPT_DIR/patch_generator.py" ]; then
+if [ -f "$PIPELINE_ROOT/patch_generator.py" ]; then
     echo -e "${GREEN}✓${NC} Found"
 else
     echo -e "${RED}✗ Not found${NC}"
@@ -178,7 +179,7 @@ fi
 
 # Check patches directory
 echo -n "Checking patches directory... "
-if [ -d "$SCRIPT_DIR/patches" ]; then
+if [ -d "$PIPELINE_ROOT/patches" ]; then
     echo -e "${GREEN}✓${NC} Found"
 else
     echo -e "${YELLOW}⚠${NC} Not found (will be created on first run)"
@@ -187,8 +188,8 @@ fi
 
 # Check config.yaml
 echo -n "Checking config.yaml... "
-if [ -f "$SCRIPT_DIR/config.yaml" ]; then
-    if grep -q "llm:" "$SCRIPT_DIR/config.yaml"; then
+if [ -f "$PIPELINE_ROOT/config.yaml" ]; then
+    if grep -q "llm:" "$PIPELINE_ROOT/config.yaml"; then
         echo -e "${GREEN}✓${NC} Found (with LLM config)"
     else
         echo -e "${YELLOW}⚠${NC} Found (missing LLM config)"
@@ -201,7 +202,7 @@ fi
 
 # Check LLM endpoint connectivity
 echo -n "Checking LLM API connectivity... "
-LLM_ENDPOINT=$(grep -A1 "llm:" "$SCRIPT_DIR/config.yaml" 2>/dev/null | grep "endpoint:" | sed 's/.*endpoint: *"\([^"]*\)".*/\1/' | tr -d '"' | head -1)
+LLM_ENDPOINT=$(grep -A1 "llm:" "$PIPELINE_ROOT/config.yaml" 2>/dev/null | grep "endpoint:" | sed 's/.*endpoint: *"\([^"]*\)".*/\1/' | tr -d '"' | head -1)
 if [ -z "$LLM_ENDPOINT" ]; then
     LLM_ENDPOINT="http://10.3.2.171:80/api/chat"
 fi
@@ -219,7 +220,7 @@ echo -e "${BLUE}--- Phase 3: Patch Validation ---${NC}"
 
 # Check patch_validator.py
 echo -n "Checking patch_validator.py... "
-if [ -f "$SCRIPT_DIR/patch_validator.py" ]; then
+if [ -f "$PIPELINE_ROOT/patch_validator.py" ]; then
     echo -e "${GREEN}✓${NC} Found"
 else
     echo -e "${RED}✗ Not found${NC}"
@@ -246,7 +247,7 @@ fi
 
 # Check validation_builds directory
 echo -n "Checking validation_builds directory... "
-if [ -d "$SCRIPT_DIR/validation_builds" ]; then
+if [ -d "$PIPELINE_ROOT/validation_builds" ]; then
     echo -e "${GREEN}✓${NC} Found"
 else
     echo -e "${YELLOW}⚠${NC} Not found (will be created on first run)"
@@ -255,9 +256,9 @@ fi
 
 # Check validation results directory
 echo -n "Checking validation_results directory... "
-if [ -d "$SCRIPT_DIR/validation_results" ]; then
+if [ -d "$PIPELINE_ROOT/validation_results" ]; then
     # Count existing validation results
-    RESULT_COUNT=$(find "$SCRIPT_DIR/validation_results" -name "*_validation.json" -type f 2>/dev/null | wc -l | tr -d ' ')
+    RESULT_COUNT=$(find "$PIPELINE_ROOT/validation_results" -name "*_validation.json" -type f 2>/dev/null | wc -l | tr -d ' ')
     if [ "$RESULT_COUNT" -gt 0 ]; then
         echo -e "${GREEN}✓${NC} Found ($RESULT_COUNT validation results)"
     else
@@ -270,9 +271,9 @@ fi
 
 # Check generated patches for validation
 echo -n "Checking patches for validation... "
-if [ -d "$SCRIPT_DIR/patches" ]; then
-    PATCH_COUNT=$(find "$SCRIPT_DIR/patches" -name "*.c" -type f 2>/dev/null | wc -l | tr -d ' ')
-    MODEL_COUNT=$(find "$SCRIPT_DIR/patches" -mindepth 1 -maxdepth 1 -type d ! -name ".*" 2>/dev/null | wc -l | tr -d ' ')
+if [ -d "$PIPELINE_ROOT/patches" ]; then
+    PATCH_COUNT=$(find "$PIPELINE_ROOT/patches" -name "*.c" -type f 2>/dev/null | wc -l | tr -d ' ')
+    MODEL_COUNT=$(find "$PIPELINE_ROOT/patches" -mindepth 1 -maxdepth 1 -type d ! -name ".*" 2>/dev/null | wc -l | tr -d ' ')
     if [ "$PATCH_COUNT" -gt 0 ]; then
         echo -e "${GREEN}✓${NC} $PATCH_COUNT patches from $MODEL_COUNT models ready for validation"
     else
@@ -289,7 +290,7 @@ echo -e "${BLUE}--- Phase 4: Automated Reporting ---${NC}"
 
 # Check reporter.py
 echo -n "Checking reporter.py... "
-if [ -f "$SCRIPT_DIR/reporter.py" ]; then
+if [ -f "$PIPELINE_ROOT/reporter.py" ]; then
     echo -e "${GREEN}✓${NC} Found"
 else
     echo -e "${RED}✗ Not found${NC}"
@@ -298,8 +299,8 @@ fi
 
 # Check reports directory
 echo -n "Checking reports directory... "
-if [ -d "$SCRIPT_DIR/reports" ]; then
-    REPORT_COUNT=$(find "$SCRIPT_DIR/reports" -name "*.md" -type f 2>/dev/null | wc -l | tr -d ' ')
+if [ -d "$PIPELINE_ROOT/reports" ]; then
+    REPORT_COUNT=$(find "$PIPELINE_ROOT/reports" -name "*.md" -type f 2>/dev/null | wc -l | tr -d ' ')
     if [ "$REPORT_COUNT" -gt 0 ]; then
         echo -e "${GREEN}✓${NC} Found ($REPORT_COUNT reports generated)"
     else
@@ -315,7 +316,7 @@ echo -e "${BLUE}--- Master Pipeline & Utilities ---${NC}"
 
 # Check pipeline.py
 echo -n "Checking pipeline.py (master orchestrator)... "
-if [ -f "$SCRIPT_DIR/pipeline.py" ]; then
+if [ -f "$PIPELINE_ROOT/pipeline.py" ]; then
     echo -e "${GREEN}✓${NC} Found"
 else
     echo -e "${RED}✗ Not found${NC}"
@@ -324,7 +325,7 @@ fi
 
 # Check cleanup.py
 echo -n "Checking cleanup.py... "
-if [ -f "$SCRIPT_DIR/cleanup.py" ]; then
+if [ -f "$PIPELINE_ROOT/cleanup.py" ]; then
     echo -e "${GREEN}✓${NC} Found"
 else
     echo -e "${YELLOW}⚠${NC} Not found (optional utility)"
@@ -336,7 +337,7 @@ echo -e "${BLUE}--- System Resources ---${NC}"
 
 # Check disk space
 echo -n "Checking available disk space... "
-AVAILABLE=$(df -BG "$SCRIPT_DIR" | tail -1 | awk '{print $4}' | sed 's/G//')
+AVAILABLE=$(df -BG "$PIPELINE_ROOT" | tail -1 | awk '{print $4}' | sed 's/G//')
 if [ "$AVAILABLE" -gt 20 ]; then
     echo -e "${GREEN}✓${NC} ${AVAILABLE}GB available"
 else
@@ -411,7 +412,7 @@ echo ""
 
 if [ $ERRORS -gt 0 ]; then
     echo "Please fix the issues above before running the pipeline."
-    echo "Run 'sudo ./setup.sh' to install missing dependencies."
+    echo "Run 'sudo ./setup/setup.sh' to install missing dependencies."
 fi
 
 echo "============================================="
