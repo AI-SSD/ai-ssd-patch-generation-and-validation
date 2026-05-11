@@ -214,21 +214,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - **Pipeline Architecture**: Successfully modularized the legacy monolithic `pipeline.py` script into the organized `master_pipeline` Python package, mirroring the modular standard set by the `cve_aggregator`.
 
-## Unreleased - 2026-04-13
+## Unreleased - 2026-05-11
 
 ### Added
 
+- Phase 0 now records vulnerable commit metadata and exports `V_COMMIT_TIMESTAMP` and `V_COMMIT_YEAR` in the generated CSV so later phases can reuse commit-era information without re-querying git.
+- Setup utilities were reorganized under `pipeline/setup/` (`setup.sh`, `verify_setup.sh`, and `fix_containerd.sh`).
+- API key loading now falls back to repo-root secret files (`pipeline/API-openai-key` and `pipeline/API-nvd-key`) when environment variables or YAML config values are not set.
 - In-memory commit message index: added `build_commit_message_index` to `cve_aggregator/utils/git_utils.py` to avoid repeated `git log --grep` subprocesses and dramatically reduce commit-search latency on large repos.
 
 ### Changed
 
+- Phase 2 and Phase 3 now consume the Phase 0 CSV path resolved from the active configuration instead of hardcoded `documentation/file-function.csv` paths, including the master pipeline and feedback-loop wiring.
+- `Phase0CSVParser` and `resolve_build_ubuntu_version()` now use commit-year metadata from Phase 0 when available, improving Ubuntu-era selection; `commit_era_map` was extended back to 1995.
+- Cleanup coverage now includes Phase 0 artifacts and project workspaces, with updated Docker image prefixes for the new project layout.
+- Manual review flow in the master pipeline now offers a continue/skip-all option for remaining pending CVEs.
 - Parallelized `CommitDiscovery`: processes CVEs using a configurable `ThreadPoolExecutor` (`commit_discovery.max_workers`) to utilize available CPU and I/O concurrency and shorten Phase 0 wall-clock time.
 - Parallelized `PoCRepairLLM`: runs independent LLM repair calls concurrently with a configurable worker pool (`poc_repair.max_repair_workers`) to avoid serial LLM call delays.
 - Made previously hardcoded values configurable: `commit_discovery.commit_index_timeout`, `poc_repair.local_token_rate`, `poc_repair.openai_token_rate`, and other LLM/timeout knobs; defaults preserved for backward compatibility.
 
 ### Fixed
 
+- NVD/OpenAI key loading now works from the relocated root secret files in addition to environment variables and config values.
+- Master pipeline preflight checks no longer require the legacy CSV path when Phase 0 is part of the current run.
+- Documentation was refreshed to match the relocated setup scripts and project-agnostic pipeline layout.
 - Bugfix: corrected a variable reference when writing failed PoC repairs to `manual_supervision/` (used `original_code` rather than undefined `content`), preventing empty manual-review artifacts.
+
+### Security
+
+- `pipeline/API-openai-key` and `pipeline/API-nvd-key` are now ignored in version control and loaded from the pipeline root when present, keeping sensitive credentials out of tracked source.
 
 ### Notes
 

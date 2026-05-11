@@ -56,6 +56,10 @@ MODELS = [str(m) for m in _llm.get("models", [
 OPENAI_MODEL = str(_llm.get("openai_model", "gpt-4.1-mini"))
 # API key: env var takes precedence over config file value
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or str(_llm.get("openai_api_key", ""))
+if not OPENAI_API_KEY:
+    _key_file = BASE_DIR / "API-openai-key"
+    if _key_file.exists():
+        OPENAI_API_KEY = _key_file.read_text().strip()
 
 # Shared request settings
 API_TIMEOUT = int(_llm.get("timeout", 600))

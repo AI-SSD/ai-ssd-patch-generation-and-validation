@@ -174,6 +174,9 @@ class PhaseExecutor:
         
         elif phase == 2:  # Patch Generator
             cmd.extend(['--base-dir', str(self.config.base_dir)])
+            phase0_csv = self.config.resolve_phase0_outputs().get("csv_path")
+            if phase0_csv:
+                cmd.extend(['--csv', str(phase0_csv)])
             if self.config.verbose:
                 cmd.append('--verbose')
             if self.config.cves:
@@ -185,6 +188,9 @@ class PhaseExecutor:
         
         elif phase == 3:  # Patch Validator
             cmd.extend(['--base-dir', str(self.config.base_dir)])
+            phase0_csv = self.config.resolve_phase0_outputs().get("csv_path")
+            if phase0_csv:
+                cmd.extend(['--csv-file', str(phase0_csv)])
             if self.config.verbose:
                 cmd.append('--verbose')
             if self.config.cves:

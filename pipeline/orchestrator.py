@@ -212,7 +212,8 @@ def get_commit_year(project_repo_path: Path, commit_hash: str, logger: logging.L
 def resolve_build_ubuntu_version(vuln_ubuntu_version: str, commit_hash: str,
                                   project_repo_path: Path, cve: str,
                                   logger: logging.Logger,
-                                  commit_era_map: dict = None) -> str:
+                                  commit_era_map: dict = None,
+                                  commit_year: Optional[int] = None) -> str:
     """Determine the best Ubuntu version for building a specific project commit.
 
     The CSV-provided ubuntu_version reflects which Ubuntu ships the vulnerable
@@ -221,7 +222,7 @@ def resolve_build_ubuntu_version(vuln_ubuntu_version: str, commit_hash: str,
     commit date and a caller-supplied commit_era_map.
 
     Strategy:
-    1. Get the commit year from git history
+    1. Get the commit year from git history (or provided argument)
     2. Look up the era-appropriate Ubuntu version from commit_era_map
     3. If the commit year is unknown, fall back to the CVE year as a proxy
     4. Apply UBUNTU_FALLBACK_MAP if the resolved version is unavailable on Docker Hub
@@ -232,8 +233,9 @@ def resolve_build_ubuntu_version(vuln_ubuntu_version: str, commit_hash: str,
     if not era_map:
         return vuln_ubuntu_version
 
-    # Step 1: Try to get commit year from git
-    commit_year = get_commit_year(project_repo_path, commit_hash, logger)
+    # Step 1: Try to get commit year from git (if not provided)
+    if commit_year is None:
+        commit_year = get_commit_year(project_repo_path, commit_hash, logger)
 
     # Step 2: Fallback - extract year from CVE ID
     if commit_year is None:
@@ -248,6 +250,7 @@ def resolve_build_ubuntu_version(vuln_ubuntu_version: str, commit_hash: str,
 
     if commit_year is None:
         logger.warning(f"{cve}: Cannot determine commit era, using CSV ubuntu_version={vuln_ubuntu_version}")
+
         return vuln_ubuntu_version
 
     # Step 3: Map commit year to era-appropriate Ubuntu version
@@ -445,15 +448,23 @@ class Phase0CSVParser:
                     else:
                         # Fallback 2: infer from commit year via commit_era_map
                         commit_hash_fb = row.get('V_COMMIT', '').strip()
+                        v_commit_year_str = row.get('V_COMMIT_YEAR', '').strip()
+                        year = None
+                        if v_commit_year_str.isdigit():
+                            year = int(v_commit_year_str)
+                        
                         inferred = None
-                        if commit_hash_fb and self.project_repo_path and self.commit_era_map:
-                            year = get_commit_year(self.project_repo_path, commit_hash_fb, self.logger)
+                        if (commit_hash_fb or year) and self.commit_era_map:
+                            if year is None and self.project_repo_path:
+                                year = get_commit_year(self.project_repo_path, commit_hash_fb, self.logger)
+                            
                             if year is None:
                                 # Try CVE year as last resort
                                 try:
                                     year = int(cve.split('-')[1][:4])
                                 except (IndexError, ValueError):
                                     pass
+                            
                             if year is not None:
                                 inferred = self.commit_era_map.get(year)
                                 if inferred is None and self.commit_era_map:
@@ -483,10 +494,13 @@ class Phase0CSVParser:
                 # The CSV ubuntu_version reflects which Ubuntu ships the vulnerable release,
                 # but building old code from source needs an era-appropriate compiler toolchain.
                 commit_hash = row.get('V_COMMIT', '').strip()
+                v_commit_year_str = row.get('V_COMMIT_YEAR', '').strip()
+                commit_year = int(v_commit_year_str) if v_commit_year_str.isdigit() else None
+
                 if commit_hash and self.project_repo_path:
                     build_ubuntu = resolve_build_ubuntu_version(
                         ubuntu_version, commit_hash, self.project_repo_path, cve,
-                        self.logger, commit_era_map=self.commit_era_map
+                        self.logger, commit_era_map=self.commit_era_map, commit_year=commit_year
                     )
                     ubuntu_version = build_ubuntu
 

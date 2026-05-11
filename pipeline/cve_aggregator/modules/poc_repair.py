@@ -475,6 +475,12 @@ class PoCRepairLLM(PipelineModule):
         # API key: env var takes precedence over config value
         import os as _os
         openai_api_key: str = _os.environ.get("OPENAI_API_KEY") or str(cfg.get("openai_api_key", ""))
+        if not openai_api_key:
+            _key_file = Path("API-openai-key")
+            if _key_file.exists():
+                openai_api_key = _key_file.read_text().strip()
+            elif (Path(__file__).parent.parent.parent / "API-openai-key").exists():
+                openai_api_key = (Path(__file__).parent.parent.parent / "API-openai-key").read_text().strip()
         max_attempts: int = cfg.get("max_repair_attempts", 3)
         api_timeout: int = cfg.get("api_timeout", 600)
         num_ctx: int = cfg.get("num_ctx", 0)          # 0 = use server default

@@ -55,6 +55,7 @@ class ProjectState:
     fix_commit_hash: Optional[str] = None
     vulnerable_commit_hash: Optional[str] = None
     fix_commit_metadata: Optional[Dict[str, str]] = None
+    vulnerable_commit_metadata: Optional[Dict[str, str]] = None
     changed_files: Optional[List[Dict[str, str]]] = None
     vulnerable_files_content: Optional[Dict[str, str]] = None
     patched_files_content: Optional[Dict[str, str]] = None

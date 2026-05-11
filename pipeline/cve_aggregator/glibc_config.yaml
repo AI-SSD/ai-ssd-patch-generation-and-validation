@@ -217,7 +217,7 @@ syntax_validator:
 # review.  Supports "ollama" (local GPU server) or "openai" (OpenAI API).
 poc_repair:
   # Backend provider: "ollama" or "openai"
-  provider: "openai"
+  provider: "ollama"
 
   # -- OpenAI settings (used only when provider: "openai") --
   # Model to use.  gpt-4.1-mini is a non-reasoning model with a 10 M token/day
@@ -364,10 +364,15 @@ phase1:
   # Name of the build directory inside the Docker build context.
   build_dir_name: "project-build"
 
-  # Commit-year → Ubuntu-version mapping for toolchain compatibility.
+  # Commit-year → Ubuntu-version era map.
   # Format: {year: "ubuntu_version"}.  Missing years are clamped to the nearest bound.
   # Remove or leave empty ({}) to disable era mapping (use CSV ubuntu_version as-is).
   commit_era_map:
+    1995: "12.04"
+    1996: "12.04"
+    1997: "12.04"
+    1998: "12.04"
+    1999: "12.04"
     2000: "14.04"
     2001: "14.04"
     2002: "14.04"
@@ -395,3 +400,4 @@ phase1:
     2024: "24.04"
     2025: "24.04"
     2026: "24.04"
+

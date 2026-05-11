@@ -19,7 +19,7 @@ Automated vulnerability reproduction pipeline for glibc CVEs. The pipeline is co
 pip install -r requirements.txt
 
 # Verify Docker, glibc repo, etc.
-bash verify_setup.sh
+bash setup/verify_setup.sh
 ```
 
 ### Run the full pipeline (all phases)
@@ -104,8 +104,10 @@ pipeline/
 ├── cleanup.py                   # Artifact cleanup utility
 ├── config.yaml                  # Pipeline configuration
 ├── requirements.txt             # Python dependencies
-├── setup.sh                     # Environment setup
-├── verify_setup.sh              # Setup verification
+├── setup/                       # Environment setup utilities
+│   ├── setup.sh                 # Environment setup
+│   ├── verify_setup.sh          # Setup verification
+│   └── fix_containerd.sh        # Docker/containerd recovery helper
 ├── glibc/                       # Local glibc repository
 ├── exploit-database/            # Local ExploitDB clone
 ├── exploits/                    # PoC exploit files (approved from manual_supervision)

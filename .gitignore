@@ -56,7 +56,8 @@ _ISSRE_2026___Tiago_Almeida_
 ExploitForge_anon
 /ExploitForge_anon.zip
 
-pipeline/cve_aggregator/API-openai-key
-pipeline/cve_aggregator/API-nvd-key
+pipeline/API-openai-key
+pipeline/API-nvd-key
 pipeline/documentation/server.md
 pipeline/*projects/
+pipeline/project-runs/

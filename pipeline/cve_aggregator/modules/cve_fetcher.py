@@ -68,7 +68,16 @@ class CVEFetcher(PipelineModule):
 
     def _fetch_nvd(self, cfg: Dict) -> List[Dict[str, Any]]:
         keywords: List[str] = cfg.get("keywords", [])
-        api_key: str = cfg.get("nvd_api_key", "")
+        import os
+        from pathlib import Path
+        api_key: str = os.environ.get("NVD_API_KEY") or str(cfg.get("nvd_api_key", ""))
+        if not api_key:
+            _key_file = Path("API-nvd-key")
+            if _key_file.exists():
+                api_key = _key_file.read_text().strip()
+            elif (Path(__file__).parent.parent.parent.parent / "API-nvd-key").exists():
+                api_key = (Path(__file__).parent.parent.parent.parent / "API-nvd-key").read_text().strip()
+
         delay = 0.6 if api_key else 6.0
         headers = {"apiKey": api_key} if api_key else {}
         results_per_page = 100

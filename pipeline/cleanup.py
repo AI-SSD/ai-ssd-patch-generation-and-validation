@@ -6,10 +6,12 @@ This script removes all generated artifacts from the AI-SSD pipeline,
 allowing for a clean slate to re-run the pipeline from scratch.
 
 Cleans:
+  - Phase 0: Aggregator results, manual supervision, and exploits
   - Phase 1: Docker builds, results, and container images
   - Phase 2: Generated patches and summaries
   - Phase 3: Validation builds, results, and container images
   - Phase 4: Reports and visualizations
+  - Projects: Project-specific workspaces
   - Logs: All log files
 
 Author: AI-SSD Project
@@ -33,6 +35,16 @@ BASE_DIR = Path(__file__).parent.resolve()
 
 # Directories to clean (relative to BASE_DIR)
 CLEANUP_TARGETS = {
+    'phase0': {
+        'description': 'Phase 0: Data Aggregation',
+        'directories': [
+            'manual_supervision',
+            'exploits',
+            'results',
+        ],
+        'files': [],
+        'docker_images': [],
+    },
     'phase1': {
         'description': 'Phase 1: Vulnerability Reproduction',
         'directories': [
@@ -40,7 +52,7 @@ CLEANUP_TARGETS = {
             'results',
         ],
         'files': [],
-        'docker_images': ['glibc-vuln/', 'ai-ssd-cve-', 'glibc-cve-'],
+        'docker_images': ['glibc-vuln/', 'glibc-cve-', 'ai-ssd/glibc-', 'ai-ssd/tomcat-', 'ai-ssd/kernel-', 'ai-ssd/project-'],
     },
     'phase2': {
         'description': 'Phase 2: Patch Generation',
@@ -57,12 +69,20 @@ CLEANUP_TARGETS = {
             'validation_results',
         ],
         'files': [],
-        'docker_images': ['glibc-patch/', 'validation-', 'ai-ssd-validation-'],
+        'docker_images': ['glibc-patch/', 'validation-', 'sast-'],
     },
     'phase4': {
         'description': 'Phase 4: Automated Reporting',
         'directories': [
             'reports',
+        ],
+        'files': [],
+        'docker_images': [],
+    },
+    'projects': {
+        'description': 'Project Workspaces',
+        'directories': [
+            'projects',
         ],
         'files': [],
         'docker_images': [],
@@ -585,10 +605,12 @@ def parse_arguments() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Targets:
+  phase0    - Aggregator results, manual supervision, and exploits
   phase1    - Docker builds, results (Phase 1: Vulnerability Reproduction)
   phase2    - Generated patches (Phase 2: Patch Generation)
   phase3    - Validation builds and results (Phase 3: Patch Validation)
   phase4    - Reports and charts (Phase 4: Automated Reporting)
+  projects  - Project-specific workspaces
   logs      - All log files
   all       - Everything (default)
 
@@ -628,7 +650,7 @@ Examples:
         '--targets',
         type=str,
         nargs='+',
-        choices=['phase1', 'phase2', 'phase3', 'phase4', 'logs', 'all'],
+        choices=['phase0', 'phase1', 'phase2', 'phase3', 'phase4', 'projects', 'logs', 'all'],
         default=['all'],
         help='Specific targets to clean (default: all)'
     )

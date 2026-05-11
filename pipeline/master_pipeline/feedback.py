@@ -301,7 +301,11 @@ class IterativeFeedbackLoop:
         class ValidatorArgs:
             def __init__(self, config: PipelineConfig):
                 self.base_dir = str(config.base_dir)
-                self.csv_file = str(config.base_dir / "documentation" / "file-function.csv")
+                phase0_csv = config.resolve_phase0_outputs().get("csv_path")
+                if phase0_csv and phase0_csv.exists():
+                    self.csv_file = str(phase0_csv)
+                else:
+                    self.csv_file = str(config.base_dir / "documentation" / "file-function.csv")
                 self.patches_dir = str(config.base_dir / "patches")
                 self.exploits_dir = str(config.base_dir / "exploits")
                 self.build_timeout = config.build_timeout

@@ -162,6 +162,7 @@ install_python() {
         colorama \
         jinja2 \
         requests \
+        openai \
         typing-extensions \
         matplotlib \
         numpy 2>/dev/null || \
@@ -172,6 +173,270 @@ install_python() {
         colorama \
         jinja2 \
         requests \
+        openai \
+        typing-extensions \
+        matplotlib \
+        numpy 2>/dev/null || true
+
+    log_info "Python 3 installed successfully"
+    log_info "Note: For production use, create a virtual environment:"
+    log_info "  python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt"
+}
+
+# Install build dependencies for glibc
+install_build_deps() {
+    log_info "Installing build dependencies..."
+    
+    apt-get install -y \
+        build-essential \
+        git \
+        wget \
+        gawk \
+        bison \
+        texinfo \
+        autoconf \
+        libtool \
+        pkg-config \
+        libgmp-dev \
+        libmpfr-dev \
+        libmpc-dev \
+        flex \
+        gettext \
+        make \
+        gcc \
+        g++ \
+        binutils
+
+    log_info "Build dependencies installed successfully"
+}
+
+# Install SAST (Static Application Security Testing) tools for Phase 3
+install_sast_tools() {
+    log_info "Installing SAST tools for Phase 3 validation..."
+    
+    # Install Cppcheck
+    log_info "Installing Cppcheck..."
+    apt-get install -y cppcheck || {
+        log_warn "Cppcheck not in apt, attempting manual install..."
+        # Install from source if apt fails
+        cd /tmp
+        git clone https://github.com/danmar/cppcheck.git
+        cd cppcheck
+        make MATCHCOMPILER=yes FILESDIR=/usr/share/cppcheck HAVE_RULES=yes -j$(nproc)
+        make install FILESDIR=/usr/share/cppcheck
+        cd /
+        rm -rf /tmp/cppcheck
+    }
+    
+    # Verify Cppcheck installation
+    if command -v cppcheck &> /dev/null; then
+        log_info "Cppcheck installed: $(cppcheck --version)"
+    else
+        log_error "Cppcheck installation failed"
+    fi
+    
+    # Install Flawfinder
+    log_info "Installing Flawfinder..."
+    pip3 install flawfinder --break-system-packages 2>/dev/null || \
+        pip3 install flawfinder 2>/dev/null || \
+        apt-get install -y flawfinder 2>/dev/null || {
+            log_warn "Flawfinder installation via pip/apt failed, trying alternative..."
+            # Download and install manually
+            cd /tmp
+            wget https://github.com/david-a-wheeler/flawfinder/archive/refs/heads/master.zip -O flawfinder.zip
+            unzip flawfinder.zip
+            cd flawfinder-master
+            python3 setup.py install 2>/dev/null || pip3 install . --break-system-packages 2>/dev/null
+            cd /
+            rm -rf /tmp/flawfinder*
+        }
+    
+    # Verify Flawfinder installation
+    if command -v flawfinder &> /dev/null; then
+        log_info "Flawfinder installed: $(flawfinder --version 2>&1 | head -1)"
+    else
+        log_error "Flawfinder installation failed"
+    fi
+    
+    log_info "SAST tools installation completed"
+}
+
+#!/bin/bash
+# =============================================================================
+# AI-SSD Project - Server Setup Script
+# Phase 1: Vulnerability ID & Setup
+# Phase 2: Automated Patch Generation
+# Phase 3: Multi-Layered Validation
+# Phase 4: Automated Reporting
+# Master Pipeline Orchestrator
+# =============================================================================
+# This script prepares a fresh Ubuntu server with all dependencies needed
+# to run the complete AI-SSD pipeline (vulnerability reproduction, patch 
+# generation, validation including SAST tools, and automated reporting).
+# =============================================================================
+
+set -e  # Exit on any error
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Check if running as root or with sudo
+check_privileges() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root or with sudo"
+        exit 1
+    fi
+}
+
+# Update system packages
+update_system() {
+    log_info "Updating system packages..."
+    apt-get update -y
+    apt-get upgrade -y
+}
+
+# Install Docker
+install_docker() {
+    log_info "Installing Docker..."
+    
+    # Remove old versions if present
+    apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+    
+    # Clean up any leftover Docker data that might cause conflicts
+    log_info "Cleaning up previous Docker installations..."
+    rm -rf /var/lib/docker 2>/dev/null || true
+    rm -rf /var/lib/containerd 2>/dev/null || true
+    
+    # Try Docker's official repo first, fall back to Ubuntu's docker.io if it fails
+    if install_docker_official; then
+        log_info "Docker installed from official repository"
+    else
+        log_warn "Official Docker repo failed, falling back to Ubuntu's docker.io package..."
+        install_docker_ubuntu
+    fi
+
+    # Start and enable Docker service
+    log_info "Starting Docker service..."
+    systemctl daemon-reload
+    systemctl start docker || {
+        log_warn "Docker service failed to start, attempting recovery..."
+        # Try to fix common issues
+        rm -rf /var/lib/docker/network 2>/dev/null || true
+        systemctl start docker || {
+            log_error "Docker service failed to start. Run 'journalctl -xeu docker.service' for details."
+            log_info "You may need to reboot and run the setup again."
+        }
+    }
+    systemctl enable docker
+
+    # Add current user to docker group (if not root)
+    if [ -n "$SUDO_USER" ]; then
+        usermod -aG docker "$SUDO_USER"
+        log_info "Added $SUDO_USER to docker group. Please log out and back in for this to take effect."
+    fi
+
+    log_info "Docker installed successfully"
+}
+
+# Try installing Docker from official repository
+install_docker_official() {
+    log_info "Attempting to install Docker from official repository..."
+    
+    # Install dependencies
+    apt-get install -y \
+        ca-certificates \
+        curl \
+        gnupg \
+        lsb-release || return 1
+
+    # Add Docker's official GPG key
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+
+    # Set up repository
+    echo \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+        $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+        tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    # Install Docker Engine
+    apt-get update -y
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    
+    return $?
+}
+
+# Fallback: Install Docker from Ubuntu repositories
+install_docker_ubuntu() {
+    log_info "Installing Docker from Ubuntu repositories (docker.io)..."
+    
+    # Remove Docker official repo if it exists (might be broken)
+    rm -f /etc/apt/sources.list.d/docker.list 2>/dev/null || true
+    
+    apt-get update -y
+    apt-get install -y docker.io docker-compose
+    
+    if ! command -v docker &> /dev/null; then
+        log_error "Failed to install Docker"
+        exit 1
+    fi
+}
+
+# Install Python 3 and pip
+install_python() {
+    log_info "Installing Python 3 and dependencies..."
+    
+    apt-get install -y \
+        python3 \
+        python3-pip \
+        python3-venv \
+        python3-dev \
+        python3-full
+    
+    # For Ubuntu 24.04+ which uses python3.12
+    apt-get install -y python3.12-venv 2>/dev/null || true
+
+    # Install required Python packages (system-wide for root, or use pip with break-system-packages)
+    # Using --break-system-packages for Ubuntu 23.04+ which enforces PEP 668
+    python3 -m pip install --break-system-packages --upgrade pip 2>/dev/null || \
+        python3 -m pip install --upgrade pip 2>/dev/null || true
+
+    # Phase 1 + Phase 2 + Phase 3 + Phase 4 dependencies
+    python3 -m pip install --break-system-packages \
+        docker \
+        pandas \
+        pyyaml \
+        colorama \
+        jinja2 \
+        requests \
+        openai \
+        typing-extensions \
+        matplotlib \
+        numpy 2>/dev/null || \
+    python3 -m pip install \
+        docker \
+        pandas \
+        pyyaml \
+        colorama \
+        jinja2 \
+        requests \
+        openai \
         typing-extensions \
         matplotlib \
         numpy 2>/dev/null || true
@@ -275,6 +540,34 @@ install_utilities() {
     log_info "Utilities installed successfully"
 }
 
+# Setup API Keys
+setup_api_keys() {
+    log_info "Setting up API keys files..."
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    
+    if [ ! -f "$SCRIPT_DIR/API-nvd-key" ]; then
+        touch "$SCRIPT_DIR/API-nvd-key"
+        chmod 600 "$SCRIPT_DIR/API-nvd-key"
+        if [ -n "$SUDO_USER" ]; then
+            chown "$SUDO_USER:$SUDO_USER" "$SCRIPT_DIR/API-nvd-key"
+        fi
+        log_info "Created empty API-nvd-key file at $SCRIPT_DIR/API-nvd-key. Please populate it with your NVD API key."
+    else
+        log_info "API-nvd-key already exists."
+    fi
+
+    if [ ! -f "$SCRIPT_DIR/API-openai-key" ]; then
+        touch "$SCRIPT_DIR/API-openai-key"
+        chmod 600 "$SCRIPT_DIR/API-openai-key"
+        if [ -n "$SUDO_USER" ]; then
+            chown "$SUDO_USER:$SUDO_USER" "$SCRIPT_DIR/API-openai-key"
+        fi
+        log_info "Created empty API-openai-key file at $SCRIPT_DIR/API-openai-key. Please populate it with your OpenAI API key."
+    else
+        log_info "API-openai-key already exists."
+    fi
+}
+
 # Verify installations
 verify_installations() {
     log_info "Verifying installations..."
@@ -370,18 +663,9 @@ setup_project_structure() {
         log_info "ExploitDB repository already present"
     fi
     
-    # Clone glibc repository if not present (required for commit discovery)
-    if [ ! -d "$SCRIPT_DIR/glibc" ]; then
-        log_info "Cloning glibc repository (required for commit discovery)..."
-        git clone --depth=1000 https://github.com/bminor/glibc.git "$SCRIPT_DIR/glibc" && {
-            log_info "Fetching full git history for glibc..."
-            cd "$SCRIPT_DIR/glibc" && git fetch --unshallow || true
-            cd "$SCRIPT_DIR"
-        } || {
-            log_warn "glibc clone failed. Phase 0 will attempt to clone it at runtime."
-        }
-    else
-        log_info "glibc repository already present"
+    # Ensure directories have proper ownership if running with sudo
+    if [ -n "$SUDO_USER" ]; then
+        chown -R "$SUDO_USER:$SUDO_USER" "$SCRIPT_DIR/exploits" "$SCRIPT_DIR/docker_builds" "$SCRIPT_DIR/results" "$SCRIPT_DIR/logs" "$SCRIPT_DIR/patches" "$SCRIPT_DIR/validation_builds" "$SCRIPT_DIR/validation_results" "$SCRIPT_DIR/reports" 2>/dev/null || true
     fi
     
     log_info "Project structure created at $SCRIPT_DIR"
@@ -392,6 +676,7 @@ main() {
     echo ""
     echo "============================================="
     echo "AI-SSD Complete Pipeline Setup"
+    echo "Phase 0: Data Aggregation"
     echo "Phase 1: Vulnerability Reproduction"
     echo "Phase 2: Automated Patch Generation"
     echo "Phase 3: Multi-Layered Validation"
@@ -408,13 +693,16 @@ main() {
     install_sast_tools
     install_utilities
     setup_project_structure
+    setup_api_keys
     verify_installations
     
     log_info "Setup completed successfully!"
     log_info "You may need to log out and back in for Docker group changes to take effect."
+    log_warn "Please ensure you add your API keys to pipeline/API-nvd-key and pipeline/API-openai-key"
     echo ""
     echo "Next steps:"
     echo "  Full Pipeline:  python3 pipeline.py --verbose"
+    echo "  Phase 0: python3 pipeline.py --phases 0 --verbose"
     echo "  Phase 1: python3 orchestrator.py --verbose"
     echo "  Phase 2: python3 patch_generator.py --verbose"
     echo "  Phase 3: python3 patch_validator.py --verbose"

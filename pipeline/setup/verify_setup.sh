@@ -67,6 +67,15 @@ else
     ERRORS=$((ERRORS + 1))
 fi
 
+# Check Python openai package (Phase 2)
+echo -n "Checking Python openai package... "
+if python3 -c "import openai" &> /dev/null; then
+    echo -e "${GREEN}✓${NC} Installed"
+else
+    echo -e "${RED}✗ Not installed (run: pip3 install openai)${NC}"
+    ERRORS=$((ERRORS + 1))
+fi
+
 # Check Python yaml package
 echo -n "Checking Python pyyaml package... "
 if python3 -c "import yaml" &> /dev/null; then
@@ -91,6 +100,27 @@ if python3 -c "import numpy" &> /dev/null; then
     echo -e "${GREEN}✓${NC} Installed"
 else
     echo -e "${YELLOW}⚠${NC} Not installed (run: pip3 install numpy) - needed for Phase 4"
+    WARNINGS=$((WARNINGS + 1))
+fi
+
+echo ""
+echo -e "${BLUE}--- API Keys ---${NC}"
+
+# Check NVD API Key
+echo -n "Checking NVD API Key... "
+if [ -s "$SCRIPT_DIR/API-nvd-key" ]; then
+    echo -e "${GREEN}✓${NC} Found and not empty"
+else
+    echo -e "${YELLOW}⚠${NC} Not found or empty at $SCRIPT_DIR/API-nvd-key"
+    WARNINGS=$((WARNINGS + 1))
+fi
+
+# Check OpenAI API Key
+echo -n "Checking OpenAI API Key... "
+if [ -s "$SCRIPT_DIR/API-openai-key" ]; then
+    echo -e "${GREEN}✓${NC} Found and not empty"
+else
+    echo -e "${YELLOW}⚠${NC} Not found or empty at $SCRIPT_DIR/API-openai-key"
     WARNINGS=$((WARNINGS + 1))
 fi
 

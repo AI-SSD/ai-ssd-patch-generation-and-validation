@@ -90,8 +90,8 @@ VENV_ACTIVATE="source ${VENV_DIR}/bin/activate"
 # Build the pipeline command
 # ---------------------------------------------------------------------------
 # Export API keys from secret files before running the pipeline
-OPENAI_KEY_FILE="${PIPELINE_ROOT}/cve_aggregator/API-openai-key"
-NVD_KEY_FILE="${PIPELINE_ROOT}/cve_aggregator/API-nvd-key"
+OPENAI_KEY_FILE="${PIPELINE_ROOT}/API-openai-key"
+NVD_KEY_FILE="${PIPELINE_ROOT}/API-nvd-key"
 
 EXPORT_API_KEYS=""
 if [[ -f "${OPENAI_KEY_FILE}" ]]; then
@@ -131,3 +131,4 @@ echo "  Attach with : tmux attach -t ${PROJECT}"
 echo "  Detach      : Ctrl-B then D"
 
 tmux new-session -d -s "$PROJECT" bash -lc "${PIPELINE_CMD}; echo '--- Pipeline finished (exit \$?) ---'; exec bash"
+

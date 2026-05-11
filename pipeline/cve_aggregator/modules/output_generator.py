@@ -166,7 +166,7 @@ class OutputGenerator(PipelineModule):
 
         # Column names (customisable via config)
         default_fields = [
-            "CVE", "V_COMMIT", "FilePath", "F_NAME", "UNIT_TYPE",
+            "CVE", "V_COMMIT", "V_COMMIT_TIMESTAMP", "V_COMMIT_YEAR", "FilePath", "F_NAME", "UNIT_TYPE",
             "V_FILE", "V_FUNCTION",
             "CVE_Description", "CWE", "CWE_Description",
             "project_version", "project_version_normalized", "ubuntu_version",
@@ -174,6 +174,11 @@ class OutputGenerator(PipelineModule):
             "manual_review_required", "manual_verified",
         ]
         fieldnames = cfg.get("csv_fields", default_fields)
+
+        # Make sure V_COMMIT_TIMESTAMP and V_COMMIT_YEAR are in fieldnames if we are going to provide them
+        for f in ["V_COMMIT_TIMESTAMP", "V_COMMIT_YEAR"]:
+            if f not in fieldnames:
+                fieldnames.insert(2, f)  # Insert after V_COMMIT
 
         rows: List[Dict[str, Any]] = []
         total = 0
@@ -349,6 +354,13 @@ class OutputGenerator(PipelineModule):
         )
         ubuntu_version = get_ubuntu_version(project_version_normalized)
 
+        # Get vulnerable commit date/year if available
+        v_commit_timestamp = ""
+        v_commit_year = ""
+        if ps.vulnerable_commit_metadata and "date" in ps.vulnerable_commit_metadata:
+            v_commit_timestamp = ps.vulnerable_commit_metadata["date"]
+            v_commit_year = v_commit_timestamp[:4]
+
         # ---- Collect code-unit rows (without PoC info yet) ----
         base_rows: List[Dict[str, Any]] = []
         changed_units_map = ps.changed_code_units or {}
@@ -360,6 +372,8 @@ class OutputGenerator(PipelineModule):
                 base_rows.append({
                     "CVE": cve_id,
                     "V_COMMIT": ps.vulnerable_commit_hash or "",
+                    "V_COMMIT_TIMESTAMP": v_commit_timestamp,
+                    "V_COMMIT_YEAR": v_commit_year,
                     "FilePath": fpath,
                     "F_NAME": unit["name"],
                     "UNIT_TYPE": unit["unit_type"],
@@ -384,6 +398,8 @@ class OutputGenerator(PipelineModule):
                 base_rows.append({
                     "CVE": cve_id,
                     "V_COMMIT": ps.vulnerable_commit_hash or "",
+                    "V_COMMIT_TIMESTAMP": v_commit_timestamp,
+                    "V_COMMIT_YEAR": v_commit_year,
                     "FilePath": fpath,
                     "F_NAME": "",
                     "UNIT_TYPE": "",
@@ -405,6 +421,8 @@ class OutputGenerator(PipelineModule):
             base_rows.append({
                 "CVE": cve_id,
                 "V_COMMIT": ps.vulnerable_commit_hash or "",
+                "V_COMMIT_TIMESTAMP": v_commit_timestamp,
+                "V_COMMIT_YEAR": v_commit_year,
                 "FilePath": first_file,
                 "F_NAME": "",
                 "UNIT_TYPE": "",
@@ -432,3 +450,4 @@ class OutputGenerator(PipelineModule):
                 rows.append(row)
 
         return rows
+

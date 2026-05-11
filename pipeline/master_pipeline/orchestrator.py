@@ -202,7 +202,7 @@ class MasterPipeline:
             print(f"  [E] Exclude CVE(s) from the pipeline run and continue")
             print(f"  [V] View syntax report for a CVE")
             print(f"  [R] Refresh (re-check for .ok marker files)")
-            print(f"  [Q] Quit pipeline")
+            print(f"  [S] Continue (skip all remaining pending CVEs)")
             
             try:
                 choice = input("\nSelect option: ").strip().upper()
@@ -251,8 +251,8 @@ class MasterPipeline:
                 print(f"Refreshed - {len(pending_cves)} CVE(s) still pending")
                 continue
             
-            elif choice == 'Q':
-                logger.warning("User chose to quit pipeline during manual verification")
+            elif choice == 'S':
+                logger.info("Skipping all remaining pending CVEs and continuing pipeline.")
                 self.skipped_cves = set(pending_cves)
                 return
             
@@ -1071,13 +1071,14 @@ RECOMMENDED ACTIONS:
             except Exception as e:
                 logger.error(f"Docker check failed: {e}")
                 return False
-        
         # Check CSV file for phases 1-3
         if any(p in self.config.phases for p in [1, 2, 3]):
-            csv_file = self.config.base_dir / "documentation" / "file-function.csv"
-            if not csv_file.exists():
-                logger.error(f"Missing CSV file: {csv_file}")
-                return False
+            if 0 not in self.config.phases:
+                csv_file = self._phase0_outputs.get("csv_path")
+                if not csv_file or not csv_file.exists():
+                    logger.error(f"Missing CSV file: {csv_file}")
+                    return False
+
         
         # Pre-flight LLM API health check for Phase 2
         if 2 in self.config.phases:

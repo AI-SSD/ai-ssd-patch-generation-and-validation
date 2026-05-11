@@ -187,6 +187,9 @@ class CommitDiscovery(PipelineModule):
         # Vulnerable commit (parent of fix)
         vuln = get_parent_commit(repo_path, fix)
         ps.vulnerable_commit_hash = vuln
+        
+        if vuln:
+            ps.vulnerable_commit_metadata = get_commit_metadata(repo_path, vuln)
 
         # Changed files
         changed = get_commit_changed_files(repo_path, fix)
@@ -253,3 +256,4 @@ class CommitDiscovery(PipelineModule):
                 )
 
         return ps
+
