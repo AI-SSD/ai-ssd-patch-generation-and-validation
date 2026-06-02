@@ -61,3 +61,4 @@ pipeline/API-nvd-key
 pipeline/documentation/server.md
 pipeline/*projects/
 pipeline/project-runs/
+pipeline/CLAUDE.md

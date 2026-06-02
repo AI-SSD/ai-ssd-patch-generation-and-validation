@@ -16,6 +16,7 @@ import logging
 import argparse
 import subprocess
 import tempfile
+import hashlib
 
 # Increase CSV field size limit to handle large PoC content fields
 csv.field_size_limit(sys.maxsize)
@@ -24,6 +25,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
+from poc_analyzer import PoCAnalyzer
 
 # Try to import docker, provide helpful error if not installed
 try:
@@ -673,19 +675,21 @@ ENV DEBIAN_FRONTEND=noninteractive
 {eol_repo_fix}
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y \\
-    build-essential \\
-    git \\
-    gawk \\
-    bison \\
-    texinfo \\
-    autoconf \\
-    libtool \\
-    gettext \\
-    wget \\
-    python3 \\
-    linux-headers-generic 2>/dev/null || true && \\
-    apt-get install -y linux-libc-dev 2>/dev/null || true && \\
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    git \
+    gawk \
+    bison \
+    texinfo \
+    autoconf \
+    libtool \
+    gettext \
+    wget \
+    python3 \
+    locales \
+    linux-headers-generic 2>/dev/null || true && \
+    apt-get install -y linux-libc-dev 2>/dev/null || true && \
+    (locale-gen en_US.UTF-8 en_GB.UTF-8 2>/dev/null || true) && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy project source from host (pre-updated by Phase 1)
@@ -845,6 +849,7 @@ RUN sed -i -re 's/([a-z]{{2}}\\.)?archive\\.ubuntu\\.com|security\\.ubuntu\\.com
 
 class CVEImageBuilder:
     """Builds CVE-specific images derived from base images."""
+    WRAPPER_CONTRACT_VERSION = "phase1-wrapper-v3"
     
     # Common Dockerfile header: checkout vulnerable commit, configure and build glibc
     # Uses a multi-strategy approach to handle toolchain version mismatches:
@@ -856,6 +861,7 @@ class CVEImageBuilder:
 # Derived from base image for Ubuntu {ubuntu_version}
 # Commit: {commit_hash}
 # PoC Language: {poc_language}
+# PoC Signature: {poc_signature}
 # =============================================================================
 FROM {base_image_tag}
 
@@ -865,6 +871,7 @@ LABEL cve="{cve}"
 LABEL commit="{commit_hash}"
 LABEL ai-ssd.ubuntu_version="{ubuntu_version}"
 LABEL ai-ssd.poc_language="{poc_language}"
+LABEL ai-ssd.poc_signature="{poc_signature}"
 LABEL ai-ssd.platform="{docker_platform}"
 
 # Checkout the vulnerable commit
@@ -873,9 +880,13 @@ LABEL ai-ssd.platform="{docker_platform}"
 # fetch/checkout may have left behind, then checkout locally.
 WORKDIR /build/{source_dir}
 RUN rm -f .git/index.lock .git/refs/heads/*.lock 2>/dev/null; \\
-    git checkout --force {commit_hash} || \\
-    (echo "ERROR: git checkout {commit_hash} failed — listing available refs:" && \\
-     git log --oneline -5 && exit 1)
+    if [ -n "{commit_hash}" ]; then \\
+        git checkout --force {commit_hash} || \\
+        (echo "ERROR: git checkout {commit_hash} failed — listing available refs:" && \\
+         git log --oneline -5 && exit 1); \\
+    else \\
+        echo "No commit hash provided, using current HEAD"; \\
+    fi
 
 # Relax tool-version checks in old glibc configure scripts.
 # Old configure scripts reject newer binutils/make/sed with "too old" because
@@ -1102,19 +1113,13 @@ RUN chmod +x /poc/exploit.rb
 # If so, warn but don't fail (some PoCs are MSF modules)
 RUN if grep -q "msf/core\\|Msf::\\|MetasploitModule" /poc/exploit.rb; then \\
         echo "WARNING: This PoC requires Metasploit Framework."; \\
-        echo "Creating standalone wrapper that exercises the vulnerability..."; \\
+        echo "Phase 1 cannot auto-verify this module without a real Metasploit execution path."; \\
         mv /poc/exploit.rb /poc/exploit_msf.rb; \\
         echo '#!/usr/bin/env ruby' > /poc/exploit.rb; \\
-        echo '# Standalone wrapper - extracts vulnerability logic from MSF module' >> /poc/exploit.rb; \\
-        echo 'puts "PoC is a Metasploit module - extracting exploit logic..."' >> /poc/exploit.rb; \\
-        echo 'msf_code = File.read("/poc/exploit_msf.rb")' >> /poc/exploit.rb; \\
-        echo '# Extract key vulnerability-triggering code patterns' >> /poc/exploit.rb; \\
-        echo 'if msf_code =~ /gethostbyname|getaddrinfo|buffer|overflow|exploit/' >> /poc/exploit.rb; \\
-        echo '  puts "Vulnerability pattern identified in MSF module"' >> /poc/exploit.rb; \\
-        echo '  # Try to require the socket library for network-based exploits' >> /poc/exploit.rb; \\
-        echo '  require "socket" rescue nil' >> /poc/exploit.rb; \\
-        echo 'end' >> /poc/exploit.rb; \\
-        echo 'puts "MSF module loaded for analysis (full exploitation requires MSF framework)"' >> /poc/exploit.rb; \\
+        echo '# Auto-generated failure wrapper for unsupported Metasploit module' >> /poc/exploit.rb; \\
+        echo 'warn "Metasploit module detected: /poc/exploit_msf.rb"' >> /poc/exploit.rb; \\
+        echo 'warn "Phase 1 requires an explicit shell/session proof, which this wrapper cannot produce."' >> /poc/exploit.rb; \\
+        echo 'exit 43' >> /poc/exploit.rb; \\
     fi
 
 ENV LD_LIBRARY_PATH={install_prefix}/lib
@@ -1199,9 +1204,25 @@ CMD ["php", "/poc/exploit.php"]
         self.docker_platform = docker_platform
         self.built_images: Dict[str, str] = {}  # cve -> image_tag
 
+    def _compute_poc_signature(self, poc_path: Path, poc_language: str, poc_metadata: dict) -> str:
+        """Create a rebuild fingerprint for the CVE image wrapper contract."""
+        hasher = hashlib.sha256()
+        hasher.update(self.WRAPPER_CONTRACT_VERSION.encode("utf-8"))
+        hasher.update((poc_language or "").encode("utf-8"))
+        if poc_path and poc_path.exists():
+            hasher.update(poc_path.read_bytes())
+        hasher.update(json.dumps(
+            poc_metadata or {},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8"))
+        return hasher.hexdigest()
+
     def _generate_dockerfile(self, vuln: VulnerabilityInfo, base_image_tag: str,
                               poc_filename: str, poc_language: str,
-                              alt_poc_filenames: List[str] = None) -> str:
+                              alt_poc_filenames: List[str] = None, poc_metadata: dict = None,
+                              poc_signature: str = "") -> str:
         """Generate a language-aware Dockerfile for the CVE image.
 
         Args:
@@ -1234,6 +1255,7 @@ CMD ["php", "/poc/exploit.php"]
             ubuntu_version=vuln.ubuntu_version,
             base_image_tag=base_image_tag,
             poc_language=lang,
+            poc_signature=poc_signature,
             source_dir=self.source_dir_name,
             build_dir=self.build_dir_name,
             install_prefix=self.install_prefix,
@@ -1263,9 +1285,122 @@ CMD ["php", "/poc/exploit.php"]
             idx = body.rfind(env_marker)
             if idx != -1:
                 body = body[:idx] + '\n' + alt_section + body[idx:]
-
         self.logger.info(f"Generated {lang} Dockerfile for {vuln.cve}")
+
+        # Determine the base execution command from the original CMD to pass context if needed
+        import re
+        cmd_match = re.search(r'CMD \["(.*?)\"(?:, \"(.*?)\")?\]', body)
+        base_cmd = "./exploit"
+        if cmd_match:
+            if cmd_match.group(2):
+                base_cmd = f"{cmd_match.group(1)} {cmd_match.group(2)}"
+            else:
+                base_cmd = cmd_match.group(1)
+            # Remove original CMD
+            body = re.sub(r'CMD \[.*?\]\n?', '', body)
+
+        # Get dynamic wrapper parameters from LLM analysis
+        poc_category = poc_metadata.get("poc_category", "OTHER") if poc_metadata else "OTHER"
+        setup_cmd = poc_metadata.get("setup_command", "") if poc_metadata else ""
+
+        # Resolve execution wrapper: the heuristic fallback always returns
+        # "./exploit …" which is only valid for compiled C PoCs.  For interpreted
+        # languages (shell, python, ruby, perl, php) use the base_cmd extracted
+        # from the language-specific Dockerfile CMD instead.
+        _ew_meta = poc_metadata.get("execution_wrapper", "") if poc_metadata else ""
+        if _ew_meta and (lang == "c" or not _ew_meta.startswith("./exploit")):
+            exec_wrap = _ew_meta
+        else:
+            exec_wrap = f"{base_cmd} > /tmp/out 2>&1"
+        verify_cmd = poc_metadata.get(
+            "verification_command",
+            "grep -qiE 'uid=0\\(root\\)|meterpreter|session opened|root shell|vulnerable|success|pwned|exploit worked' /tmp/out"
+        ) if poc_metadata else "grep -qiE 'uid=0\\(root\\)|meterpreter|session opened|root shell|vulnerable|success|pwned|exploit worked' /tmp/out"
+
+        # Build the dynamic wrapper script.
+        # Multi-probe design: filesystem artifact checks run alongside the
+        # LLM/heuristic verify_cmd so that "silent success" PoCs (e.g.
+        # SUID droppers that produce no stdout) are correctly detected.
+        # A structured SSD_PROOF line is emitted to stdout for host-side parsing.
+        wrapper_sh = [
+            "#!/bin/bash",
+            "set -o pipefail 2>/dev/null || true",
+            f"CATEGORY='{poc_category}'",
+            "_PASS_COUNT=0",
+            "_PROOF_CHECKS=''",
+            # shellcheck: the function body uses double-quote expansion intentionally
+            '_record_pass() { _PASS_COUNT=$((_PASS_COUNT + 1)); _PROOF_CHECKS="${_PROOF_CHECKS}|$1"; }',
+            "",
+            f"echo '--- Executing dynamic wrapper for category: {poc_category} ---'",
+            "",
+            "# 1. Setup",
+            setup_cmd,
+            "",
+            "# 2. Execution",
+            "echo '--- Running exploit ---'",
+            exec_wrap,
+            "exit_code=$?",
+            'echo "--- Exploit finished (exit=$exit_code) ---"',
+            "",
+            "# 3. Filesystem artifact probes — runs regardless of stdout content",
+            'for _p in /tmp/xp /tmp/r00t /tmp/rootshell /tmp/kidd0 /tmp/backdoor /var/tmp/.nothing /var/tmp/rootshell; do',
+            '    if [ -u "$_p" ] 2>/dev/null; then',
+            '        echo "SUID_ARTIFACT_FOUND: $_p"',
+            '        _record_pass "suid_artifact:$_p"',
+            '    fi',
+            'done',
+            '_FOUND_SUID=$(find /tmp /var/tmp -perm /4000 2>/dev/null | head -3)',
+            'if [ -n "$_FOUND_SUID" ]; then',
+            '    echo "SUID_FIND_RESULT: $_FOUND_SUID"',
+            '    _record_pass "suid_find"',
+            'fi',
+            "",
+            "# 4. Category-specific crash acceptance (DOS / FORMAT_STRING only)",
+            "# Benign POSIX signals (SIGHUP=129, SIGINT=130, SIGPIPE=141, SIGTERM=143) are excluded.",
+            f"if [ \"$CATEGORY\" = 'DOS' ] || [ \"$CATEGORY\" = 'FORMAT_STRING' ]; then",
+            '    if [ "$exit_code" -eq 139 ] || [ "$exit_code" -eq 134 ]; then',
+            '        _record_pass "crash_signal:$exit_code"',
+            '    elif [ "$exit_code" -ge 132 ] && [ "$exit_code" -le 159 ] \\',
+            '         && [ "$exit_code" -ne 141 ] && [ "$exit_code" -ne 143 ]; then',
+            '        _record_pass "crash_signal_generic:$exit_code"',
+            '    fi',
+            'fi',
+            "",
+            "# 5. LPE setup-crash guard: SIGSEGV with no output = environment failure",
+            "if [ \"$CATEGORY\" = 'LPE' ] && [ \"$exit_code\" -eq 139 ]; then",
+            '    _output_lines=0',
+            '    [ -f /tmp/out ] && _output_lines=$(wc -l < /tmp/out 2>/dev/null || echo 0)',
+            '    if [ "$_output_lines" -lt 2 ]; then',
+            '        echo "CRASH_LIKELY_SETUP: SIGSEGV with only $_output_lines output lines"',
+            '    fi',
+            'fi',
+            "",
+            "# 6. Original verify_cmd (LLM/heuristic generated)",
+            f'if eval "{verify_cmd}" 2>/dev/null; then',
+            '    _record_pass "verify_cmd"',
+            'fi',
+            "",
+            "# 7. Emit structured proof record for host-side interpreter",
+            'echo "SSD_PROOF: category=$CATEGORY exit_code=$exit_code pass_count=$_PASS_COUNT checks=$_PROOF_CHECKS"',
+            "",
+            "# 8. Final verdict",
+            'if [ "$_PASS_COUNT" -gt 0 ]; then',
+            "    echo '--- VERIFICATION SUCCESS: Vulnerability Confirmed ---'",
+            '    exit 42',
+            'else',
+            "    echo '--- VERIFICATION FAILED: Not Reproduced ---'",
+            '    exit $exit_code',
+            'fi',
+        ]
+
+        import base64
+        wrapper_script = "\n".join(wrapper_sh)
+        wrapper_b64 = base64.b64encode(wrapper_script.encode('utf-8')).decode('utf-8')
+        body += f'\nRUN echo "{wrapper_b64}" | base64 -d > /poc/wrapper.sh && chmod +x /poc/wrapper.sh\n'
+        body += 'CMD ["/bin/bash", "/poc/wrapper.sh"]\n'
+
         return header + body
+
 
     def _generate_alt_poc_section(self, alt_poc_filenames: List[str]) -> str:
         """Generate Dockerfile snippet that tries alternative PoC files if the
@@ -1306,7 +1441,7 @@ CMD ["php", "/poc/exploit.php"]
         return '\n'.join(lines) + '\n'
     
     def build_cve_image(self, vuln: VulnerabilityInfo, base_image_tag: str,
-                        poc_path: Path, poc_language: str = None) -> Tuple[bool, Optional[str]]:
+                        poc_path: Path, poc_language: str = None, poc_metadata: dict = None) -> Tuple[bool, Optional[str]]:
         """
         Build a CVE-specific image derived from the base image.
         
@@ -1320,6 +1455,12 @@ CMD ["php", "/poc/exploit.php"]
             Tuple of (success, build_logs_or_error)
         """
         tag = vuln.cve_image_tag
+
+        # Detect language from file extension if not provided
+        if not poc_language or poc_language in ('unknown', ''):
+            poc_language = EXTENSION_TO_LANGUAGE.get(poc_path.suffix.lower(), 'c')
+
+        poc_signature = self._compute_poc_signature(poc_path, poc_language, poc_metadata)
         
         # Check if already built
         if vuln.cve in self.built_images:
@@ -1332,10 +1473,11 @@ CMD ["php", "/poc/exploit.php"]
             labels = existing.labels or {}
             expected_platform = self.docker_platform or ''
             img_platform = labels.get('ai-ssd.platform', '')
-            if img_platform != expected_platform:
+            cached_signature = labels.get('ai-ssd.poc_signature', '')
+            if img_platform != expected_platform or cached_signature != poc_signature:
                 self.logger.info(
                     f"Stale CVE image detected (platform '{img_platform}' != "
-                    f"'{expected_platform}') — rebuilding: {tag}"
+                    f"'{expected_platform}' or poc_signature mismatch) — rebuilding: {tag}"
                 )
                 try:
                     self.client.images.remove(tag, force=True)
@@ -1347,10 +1489,6 @@ CMD ["php", "/poc/exploit.php"]
                 return True, "Image already exists"
         except ImageNotFound:
             pass
-        
-        # Detect language from file extension if not provided
-        if not poc_language or poc_language in ('unknown', ''):
-            poc_language = EXTENSION_TO_LANGUAGE.get(poc_path.suffix.lower(), 'c')
         
         self.logger.info(f"Building CVE image: {tag} (from {base_image_tag}, lang={poc_language})")
         
@@ -1385,6 +1523,8 @@ CMD ["php", "/poc/exploit.php"]
             dockerfile_content = self._generate_dockerfile(
                 vuln, base_image_tag, poc_filename, poc_language,
                 alt_poc_filenames=alt_poc_filenames,
+                poc_metadata=poc_metadata,
+                poc_signature=poc_signature,
             )
             (build_context / "Dockerfile").write_text(dockerfile_content)
             
@@ -2062,21 +2202,63 @@ class DockerManager:
             self.logger.error(f"Failed to run container for {vuln.cve}: {e}")
             return False, -1, str(e)
     
+    def _extract_proof_record(self, logs: str) -> Optional[dict]:
+        """Parse the SSD_PROOF line written by the enhanced wrapper.sh.
+
+        Returns a dict with at minimum ``category``, ``exit_code``, and
+        ``pass_count`` keys, or None if no proof line was found.
+        """
+        for line in reversed(logs.splitlines()):
+            line = line.strip()
+            if not line.startswith("SSD_PROOF:"):
+                continue
+            payload = line[len("SSD_PROOF:"):].strip()
+            record: dict = {}
+            for token in payload.split():
+                if "=" in token:
+                    k, _, v = token.partition("=")
+                    record[k] = v
+            if record:
+                try:
+                    record["pass_count"] = int(record.get("pass_count", 0))
+                except ValueError:
+                    record["pass_count"] = 0
+                return record
+        return None
+
     def _interpret_exit_code(self, vuln: VulnerabilityInfo, exit_code: int, logs: str) -> bool:
         """Interpret container exit code and logs to determine if vulnerability was triggered.
-        
+
         This method distinguishes between:
         1. True vulnerability reproduction (crash, overflow, corruption)
         2. Environment/setup failures (missing libs, wrong arch, missing deps)
         3. Inconclusive results (PoC ran but can't confirm vuln was triggered)
         """
         logs_lower = logs.lower()
-        
+
+        if exit_code == 42:
+            self.logger.info(f"{vuln.cve}: PoC wrapper exited with 42 - vulnerability confirmed")
+            return True
+        if exit_code == 43:
+            self.logger.warning(f"{vuln.cve}: PoC wrapper exited with 43 - vulnerability NOT reproduced")
+            return False
+
+        # ── Structured proof record (written by enhanced wrapper.sh) ─────────
+        # If the wrapper completed but no check passed, treat as not reproduced
+        # rather than falling through to the generic crash-signal heuristics.
+        proof = self._extract_proof_record(logs)
+        if proof is not None and proof.get("pass_count", 0) == 0:
+            self.logger.warning(
+                f"{vuln.cve}: SSD_PROOF present but pass_count=0 — wrapper ran, "
+                f"no check passed (category={proof.get('category')}, exit={exit_code})"
+            )
+            return False
+
         # =====================================================================
         # PHASE 1: Reject known environment/setup failures
         # These indicate the test infrastructure failed, NOT the vulnerability
         # =====================================================================
-        
+
         # Binary not found or can't execute
         if "no such file or directory" in logs_lower and exit_code == 127:
             self.logger.error(f"{vuln.cve}: Environment error - binary not found (exit 127)")
@@ -2122,7 +2304,15 @@ class DockerManager:
         # =====================================================================
         # PHASE 2: Detect clear vulnerability reproduction signals
         # =====================================================================
-        
+
+        # Guard: wrapper detected SIGSEGV with no output → env/setup failure
+        if "crash_likely_setup" in logs_lower:
+            self.logger.warning(
+                f"{vuln.cve}: Wrapper flagged CRASH_LIKELY_SETUP (SIGSEGV with <2 output "
+                "lines) — treating as environment failure, not reproduction"
+            )
+            return False
+
         # Segmentation fault (139 = 128 + 11 SIGSEGV)
         if exit_code == 139 or "segmentation fault" in logs_lower or "sigsegv" in logs_lower:
             self.logger.info(f"{vuln.cve}: Segmentation fault detected - vulnerability likely triggered")
@@ -2143,11 +2333,22 @@ class DockerManager:
             self.logger.info(f"{vuln.cve}: Floating point exception - vulnerability likely triggered")
             return True
         
-        # Killed by signal (any signal-based exit 128+N where N > 0)
+        # Killed by signal (any signal-based exit 128+N where N > 0).
+        # Benign POSIX signals that fire routinely in containers are excluded:
+        #   SIGHUP(1)=129, SIGINT(2)=130, SIGQUIT(3)=131, SIGPIPE(13)=141,
+        #   SIGTERM(15)=143, SIGCHLD(17)=145
         if exit_code > 128 and exit_code < 192:
             signal_num = exit_code - 128
-            self.logger.info(f"{vuln.cve}: Killed by signal {signal_num} (exit {exit_code}) - vulnerability likely triggered")
-            return True
+            _BENIGN_SIGNALS = {1, 2, 3, 13, 15, 17}
+            if signal_num in _BENIGN_SIGNALS:
+                self.logger.debug(
+                    f"{vuln.cve}: Exit {exit_code} is benign signal {signal_num} "
+                    "(SIGHUP/SIGINT/SIGQUIT/SIGPIPE/SIGTERM/SIGCHLD) — not a crash"
+                )
+                # Fall through to Phase 3 CVE-specific checks
+            else:
+                self.logger.info(f"{vuln.cve}: Killed by signal {signal_num} (exit {exit_code}) - vulnerability likely triggered")
+                return True
         
         # Stack smashing detected
         if "stack smashing" in logs_lower or "stack buffer overflow" in logs_lower:
@@ -2218,46 +2419,40 @@ class DockerManager:
                 self.logger.info(f"{vuln.cve}: PoC exercised __gconv_translit_find code path")
                 return True
             # Fall through to Phase 4 generic detection.
-        
+
+        # For CVE-2017-1000366 (ld.so hwcap / hwcaps path)
+        if vuln.cve == "CVE-2017-1000366":
+            if any(marker in logs_lower for marker in [
+                "num_important_hwcaps",
+                "probability 1/",
+                "ld_hwcap_mask=",
+                "target 0 ",
+                "target 1 ",
+                "executing new program: /bin/sh",
+                "/bin/dash",
+            ]):
+                self.logger.info(f"{vuln.cve}: Diagnostic exploit output detected - vulnerable code path exercised")
+                return True
+            if "usage:" in logs_lower or "target binary" in logs_lower:
+                self.logger.warning(
+                    f"{vuln.cve}: PoC printed usage/help text - likely missing required execution arguments or target binary"
+                )
+                return False
+
+        if "usage:" in logs_lower and exit_code in (0, 1):
+            self.logger.warning(
+                f"{vuln.cve}: PoC only printed usage/help text - likely missing required execution arguments or target context"
+            )
+            return False
+
         # =====================================================================
         # PHASE 4: Default interpretation
         # =====================================================================
-        
-        # PoC self-reported error/fatal messages (common pattern in C PoCs
-        # that call _exit(EXIT_FAILURE) after printing a diagnostic).
-        # These indicate the PoC *ran* and exercised the target code, even
-        # if the environment prevented full exploitation.
-        if exit_code == 1 and logs.strip():
-            # Look for PoC-internal diagnostics that prove code execution
-            poc_diagnostic_patterns = [
-                'cve-', 'exploit', 'vulnerability', 'trigger',
-                'proof of concept', 'poc', 'heap', 'overflow',
-                'corrupt', 'crash', 'fatal', 'attempting',
-            ]
-            if any(pat in logs_lower for pat in poc_diagnostic_patterns):
-                self.logger.info(
-                    f"{vuln.cve}: PoC exited 1 with diagnostic output - "
-                    f"vulnerability code path likely exercised"
-                )
-                return True
-        
-        # Exit code 0 with meaningful output (not just warnings) could mean the
-        # vulnerable code path was exercised without crashing
-        if exit_code == 0 and logs.strip():
-            # Filter out purely informational/warning messages
-            meaningful_lines = [l for l in logs.strip().split('\n') 
-                              if l.strip() and not l.strip().startswith('WARNING')]
-            if meaningful_lines:
-                self.logger.info(f"{vuln.cve}: PoC exited 0 with output - marking as reproduced")
-                return True
-        
-        # Non-zero exit that isn't an environment error suggests the PoC
-        # at least exercised the code path
-        if exit_code != 0 and exit_code not in (126, 127):
-            self.logger.info(f"{vuln.cve}: PoC exited with non-zero code {exit_code} - vulnerability likely triggered")
-            return True
-        
-        self.logger.warning(f"{vuln.cve}: Could not confirm vulnerability reproduction (exit {exit_code})")
+
+        self.logger.warning(
+            f"{vuln.cve}: Could not confirm vulnerability reproduction (exit {exit_code}). "
+            "No explicit success proof matched the wrapper or logs."
+        )
         return False
     
     def cleanup_image(self, vuln: VulnerabilityInfo):
@@ -2605,6 +2800,7 @@ class PipelineOrchestrator:
             docker_platform=self._p1.get("docker_platform"),
         )
         self._manifest = ImageManifest(self._p1["image_manifest_path"], self.logger)
+        self.poc_analyzer = PoCAnalyzer(self.logger)
     
     def run(self):
         """Execute the full pipeline"""
@@ -2795,15 +2991,52 @@ class PipelineOrchestrator:
                 result.status = ExecutionStatus.POC_NOT_FOUND.value
                 result.error_message = "No PoC found"
                 return result
-            
+
+            # Step 1b: Static pre-flight validation (Phase 1.3 gate)
+            preflight = self.poc_analyzer.validate_poc_static(poc_path, vuln.cve)
+            self.logger.info(
+                f"  Static validation: valid={preflight['is_valid']} "
+                f"type={preflight['file_type']} intent={preflight['has_exploit_intent']} "
+                f"entrypoint={preflight['has_entrypoint']} cve_match={preflight['cve_match']} "
+                f"reason={preflight['reason']!r}"
+            )
+            if not preflight["is_valid"]:
+                result.status = ExecutionStatus.POC_NOT_FOUND.value
+                result.error_message = f"Pre-flight validation failed: {preflight['reason']}"
+                self.logger.warning(
+                    f"  {vuln.cve}: Skipping PoC execution — {preflight['reason']}"
+                )
+                return result
+
             # Step 2: Build CVE image (derived from base)
-            # Detect PoC language from CSV or file extension
+            # Detect PoC language from CSV or file extension, then reconcile
+            # against the content-aware type from pre-flight validation.
             poc_language = vuln.poc_language or self.poc_mgr.detect_language(poc_path)
+
+            # Defense-in-depth: if pre-flight found a different file type via
+            # shebang/content inspection, trust that over the extension/CSV value.
+            # Handles EDB mislabeled files (e.g. tcsh script saved as .php).
+            _FILETYPE_TO_LANGUAGE = {
+                "shell": "shell", "ruby_msf": "ruby", "ruby": "ruby",
+                "python": "python", "php": "php", "c": "c",
+            }
+            preflight_lang = _FILETYPE_TO_LANGUAGE.get(preflight.get("file_type", ""), "")
+            if preflight_lang and preflight_lang != poc_language:
+                self.logger.info(
+                    f"  Correcting poc_language: '{poc_language}' → '{preflight_lang}' "
+                    f"(content-based, file_type={preflight['file_type']!r})"
+                )
+                poc_language = preflight_lang
+
             self.logger.info(f"  PoC language: {poc_language} ({poc_path.name})")
-            
+
+            # Extract PoC metadata via LLM (or heuristics)
+            poc_metadata = self.poc_analyzer.analyze_poc(poc_path)
+            self.logger.info(f"  PoC category: {poc_metadata.get('poc_category', 'UNKNOWN')}")
+
             base_tag = vuln.base_image_tag
             success, build_logs = self._cve_builder.build_cve_image(
-                vuln, base_tag, poc_path, poc_language
+                vuln, base_tag, poc_path, poc_language, poc_metadata
             )
             
             if not success:

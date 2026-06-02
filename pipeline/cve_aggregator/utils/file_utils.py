@@ -76,7 +76,7 @@ def detect_language_from_content(content: str) -> str:
             return "perl"
         if "php" in first_line:
             return "php"
-        if "bash" in first_line or "/sh" in first_line:
+        if any(sh in first_line for sh in ("bash", "/sh", "tcsh", "/csh", "ksh", "zsh", "dash", "fish")):
             return "shell"
         if "node" in first_line:
             return "javascript"

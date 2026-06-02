@@ -281,8 +281,20 @@ class OutputGenerator(PipelineModule):
                 continue
 
             poc_lang = exploit.language
+            content_lang = detect_language_from_content(content)
             if poc_lang in ("unknown", "text"):
-                poc_lang = detect_language_from_content(content)
+                # Extension gave nothing useful — trust content detection
+                poc_lang = content_lang
+            elif content_lang not in ("unknown",) and content_lang != poc_lang:
+                # Content disagrees with the extension-derived label.
+                # Trust content: handles files mislabeled by Exploit-DB
+                # (e.g. a tcsh script saved as .php).
+                self.logger.info(
+                    "Language mismatch for %s: extension says %r but content says %r"
+                    " — using content detection",
+                    cve_id, poc_lang, content_lang,
+                )
+                poc_lang = content_lang
 
             content, _ = clean_poc_content(content)
             ext = get_file_extension_for_language(poc_lang)

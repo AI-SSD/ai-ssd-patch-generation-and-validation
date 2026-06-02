@@ -72,6 +72,15 @@ When Phase 0's CSV (`glibc_cve_poc_complete.csv`) is detected, Phase 1 uses an o
 
 If Phase 0 CSV is not found, Phase 1 falls back to the legacy per-CVE Dockerfile workflow.
 
+Phase 1 only counts a PoC as successful when the generated wrapper gets an explicit proof signal:
+
+1. **Setup** — prepare the target-specific runtime context, inputs, or helper files.
+2. **Execute** — run the PoC inside the container.
+3. **Verify** — match a category-specific success condition such as `uid=0(root)`, a SUID file bit, a crash signal, or a concrete leak pattern.
+4. **Confirm** — the wrapper exits `42` only after verification passes; `43` means the PoC ran but did not prove exploitation.
+
+This means a PoC that merely exits cleanly, prints generic text, or loads a Metasploit module without an actual session/shell proof is not treated as a successful reproduction.
+
 ### Run Phase 1 standalone
 
 ```bash
