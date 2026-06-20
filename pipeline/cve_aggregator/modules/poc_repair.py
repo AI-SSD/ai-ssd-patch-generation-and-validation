@@ -249,11 +249,16 @@ YOUR RULES:
   1. Fix ALL errors reported by the validator so the code compiles cleanly.
   2. Treat the EXPLOIT LOGIC as sacred — never change what the script does.
   3. Do NOT rewrite, optimise, or modernise the code beyond what is needed.
-  4. You MAY add standard library #include headers if the errors clearly show\
+  4. MINIMAL CHANGE: the repaired file must stay roughly its original length.\
+ Make the smallest edit that fixes the errors — comment out prose, add a\
+ missing header or declaration, fix a stray character. Do NOT invent new\
+ functions, structs, or large blocks of code; a file that balloons in size\
+ will be rejected as a hallucination.
+  5. You MAY add standard library #include headers if the errors clearly show\
  they are missing (e.g. <unistd.h> for environ, <fcntl.h> for O_RDONLY).\
  Do NOT add third-party dependencies.
-  5. Comment out (do NOT delete) any prose lines that cannot be valid code.
-  6. Return ONLY the complete, corrected source code — no markdown fences,\
+  6. Comment out (do NOT delete) any prose lines that cannot be valid code.
+  7. Return ONLY the complete, corrected source code — no markdown fences,\
  no explanations, no preamble, no leading comment about what you fixed.
 
 OUTPUT FORMAT:
@@ -295,6 +300,9 @@ CRITICAL — DO NOT REPEAT THESE COMMON MISTAKES:
   • Do NOT generate code in a DIFFERENT language than requested.\
  If the file is labelled C, output only C code.
   • Do NOT hallucinate new functionality — only fix what is broken.
+  • Do NOT balloon the file. The repair must stay roughly the original length;\
+ adding many new #includes, functions, or invented code is the most common\
+ failure and will be rejected. Make the smallest change that compiles.
 
 OUTPUT FORMAT:
 Start directly with the first line of the source file.\
@@ -472,6 +480,9 @@ class PoCRepairLLM(PipelineModule):
         api_endpoint: str = cfg.get("api_endpoint", "http://10.3.2.171:80/api/chat")
         model: str = cfg.get("model", "qwen2.5-coder:7b")
         openai_model: str = cfg.get("openai_model", "gpt-4.1-mini")
+        # Base model for the active provider; the per-attempt schedule below can
+        # override it with any model family on whatever backend `provider` picks.
+        base_model: str = openai_model if provider == "openai" else model
         # API key: env var takes precedence over config value
         import os as _os
         openai_api_key: str = _os.environ.get("OPENAI_API_KEY") or str(cfg.get("openai_api_key", ""))
@@ -486,6 +497,21 @@ class PoCRepairLLM(PipelineModule):
         num_ctx: int = cfg.get("num_ctx", 0)          # 0 = use server default
         max_poc_chars: int = cfg.get("max_poc_chars", 0)  # 0 = no truncation
         temperature: float = cfg.get("temperature", 0.2)
+
+        # Per-attempt model escalation (mirrors Phase 2's
+        # feedback_loop.models_by_attempt). Keys are attempt numbers (1 = first
+        # repair, 2 = first retry, …), values are model ids. An attempt not
+        # listed falls back to the provider's base model (model / openai_model).
+        # Empty ⇒ every attempt uses the base model (legacy behaviour).
+        models_by_attempt: Dict[str, str] = {
+            str(k): str(v)
+            for k, v in (cfg.get("models_by_attempt") or {}).items()
+            if v
+        }
+        if models_by_attempt:
+            self.logger.info(
+                "PoC repair per-attempt model schedule: %s", models_by_attempt
+            )
         report_path = Path(cfg.get("report_path", "poc_repair_report.json"))
         manual_queue_path = Path(cfg.get("manual_review_queue_path", "manual_review_queue.json"))
         poc_dir = Path(self.config.get("output", {}).get("poc_dir", "exploits"))
@@ -523,6 +549,13 @@ class PoCRepairLLM(PipelineModule):
         self.logger.info(
             "Found %d invalid PoC(s) to attempt LLM repair.", len(invalid_pocs)
         )
+
+        # Promote a valid PoC to primary BEFORE any LLM/API work. This is a pure
+        # dataset operation (no LLM) and must run even when repair is later
+        # skipped (no API key / GPU unavailable), otherwise a runnable standalone
+        # PoC would never displace an unrunnable primary (e.g. a Metasploit
+        # module flagged invalid above).
+        self._promote_valid_poc_to_primary(dataset, syntax_results, invalid_pocs)
 
         # Pre-flight: check API health
         if not self._check_api_health(
@@ -578,57 +611,6 @@ class PoCRepairLLM(PipelineModule):
         manual_queue: List[Dict[str, Any]] = []
         repaired_count = 0
         failed_count = 0
-
-        # Build a set of CVE IDs that already have at least one valid PoC.
-        cves_with_valid_poc: set = set()
-        for sr_key, sr_val in syntax_results.items():
-            if sr_val.get("is_valid"):
-                sr_cve, _, _ = sr_key.partition(":")
-                cves_with_valid_poc.add(sr_cve)
-
-        # ── Promote valid PoC to primary position ──
-        # If a CVE's primary PoC (index 0) is invalid but a secondary PoC is
-        # valid, swap them so downstream tools always see the best exploit
-        # first.  The swapped (invalid) PoC is still queued for LLM repair.
-        for cve_id_swap in list(cves_with_valid_poc):
-            entry_swap = dataset.cves.get(cve_id_swap)
-            if not entry_swap or not entry_swap.exploits:
-                continue
-            primary_key = f"{cve_id_swap}:0"
-            if syntax_results.get(primary_key, {}).get("is_valid"):
-                continue  # Primary is already valid — nothing to do
-            # Find the first valid secondary PoC
-            valid_idx: Optional[int] = None
-            for idx in range(1, len(entry_swap.exploits)):
-                if syntax_results.get(f"{cve_id_swap}:{idx}", {}).get("is_valid"):
-                    valid_idx = idx
-                    break
-            if valid_idx is None:
-                continue
-            # Swap exploits in the dataset
-            entry_swap.exploits[0], entry_swap.exploits[valid_idx] = (
-                entry_swap.exploits[valid_idx], entry_swap.exploits[0]
-            )
-            self.logger.info(
-                "CVE %s: promoted valid PoC (idx %d) to primary — "
-                "invalid PoC moved to idx %d.",
-                cve_id_swap, valid_idx, valid_idx,
-            )
-            # Swap the corresponding syntax_results entries
-            sr_primary = dict(syntax_results.get(primary_key, {}))
-            sr_valid = dict(syntax_results.get(f"{cve_id_swap}:{valid_idx}", {}))
-            if primary_key in syntax_results:
-                syntax_results[primary_key] = sr_valid
-            if f"{cve_id_swap}:{valid_idx}" in syntax_results:
-                syntax_results[f"{cve_id_swap}:{valid_idx}"] = sr_primary
-            # Update exploit_idx in the already-collected invalid_pocs list
-            for item_swap in invalid_pocs:
-                if item_swap["cve_id"] != cve_id_swap:
-                    continue
-                if item_swap["exploit_idx"] == 0:
-                    item_swap["exploit_idx"] = valid_idx
-                elif item_swap["exploit_idx"] == valid_idx:
-                    item_swap["exploit_idx"] = 0
 
         # ── Phase A: Pre-checks (fast, sequential) ──
         # Separate items into those that need LLM repair vs those skipped.
@@ -726,7 +708,7 @@ class PoCRepairLLM(PipelineModule):
                     errors=item["errors"],
                     max_attempts=max_attempts,
                     api_endpoint=api_endpoint,
-                    model=model,
+                    base_model=base_model,
                     api_timeout=api_timeout,
                     num_ctx=num_ctx,
                     max_poc_chars=max_poc_chars,
@@ -734,8 +716,8 @@ class PoCRepairLLM(PipelineModule):
                     syntax_validator=syntax_validator,
                     sv_cfg=sv_cfg,
                     provider=provider,
-                    openai_model=openai_model,
                     openai_api_key=openai_api_key,
+                    models_by_attempt=models_by_attempt,
                 ),
             }
 
@@ -883,6 +865,62 @@ class PoCRepairLLM(PipelineModule):
         return context
 
     # ------------------------------------------------------------------
+    # Promote a valid PoC to primary position
+    # ------------------------------------------------------------------
+
+    def _promote_valid_poc_to_primary(self, dataset, syntax_results, invalid_pocs) -> None:
+        """If a CVE's primary PoC (index 0) is invalid but a secondary PoC is
+        valid, swap them so downstream tools always see the best (runnable)
+        exploit first. The swapped-out (invalid) PoC keeps its place in the
+        repair queue. No LLM involved — safe to run before any API work.
+        """
+        cves_with_valid_poc: set = set()
+        for sr_key, sr_val in syntax_results.items():
+            if sr_val.get("is_valid"):
+                sr_cve, _, _ = sr_key.partition(":")
+                cves_with_valid_poc.add(sr_cve)
+
+        for cve_id_swap in list(cves_with_valid_poc):
+            entry_swap = dataset.cves.get(cve_id_swap)
+            if not entry_swap or not entry_swap.exploits:
+                continue
+            primary_key = f"{cve_id_swap}:0"
+            if syntax_results.get(primary_key, {}).get("is_valid"):
+                continue  # Primary is already valid — nothing to do
+            # Find the first valid secondary PoC
+            valid_idx: Optional[int] = None
+            for idx in range(1, len(entry_swap.exploits)):
+                if syntax_results.get(f"{cve_id_swap}:{idx}", {}).get("is_valid"):
+                    valid_idx = idx
+                    break
+            if valid_idx is None:
+                continue
+            # Swap exploits in the dataset
+            entry_swap.exploits[0], entry_swap.exploits[valid_idx] = (
+                entry_swap.exploits[valid_idx], entry_swap.exploits[0]
+            )
+            self.logger.info(
+                "CVE %s: promoted valid PoC (idx %d) to primary — "
+                "invalid PoC moved to idx %d.",
+                cve_id_swap, valid_idx, valid_idx,
+            )
+            # Swap the corresponding syntax_results entries
+            sr_primary = dict(syntax_results.get(primary_key, {}))
+            sr_valid = dict(syntax_results.get(f"{cve_id_swap}:{valid_idx}", {}))
+            if primary_key in syntax_results:
+                syntax_results[primary_key] = sr_valid
+            if f"{cve_id_swap}:{valid_idx}" in syntax_results:
+                syntax_results[f"{cve_id_swap}:{valid_idx}"] = sr_primary
+            # Update exploit_idx in the already-collected invalid_pocs list
+            for item_swap in invalid_pocs:
+                if item_swap["cve_id"] != cve_id_swap:
+                    continue
+                if item_swap["exploit_idx"] == 0:
+                    item_swap["exploit_idx"] = valid_idx
+                elif item_swap["exploit_idx"] == valid_idx:
+                    item_swap["exploit_idx"] = 0
+
+    # ------------------------------------------------------------------
     # Collect invalid PoCs from syntax results
     # ------------------------------------------------------------------
 
@@ -934,9 +972,11 @@ class PoCRepairLLM(PipelineModule):
             language = sr.get("language", exploit.language)
             errors = sr.get("errors", [])
 
-            # Skip PoCs whose only error is "unrecognised_language" — no point
-            # in asking the LLM to fix something we can't validate.
-            if errors == ["unrecognised_language"]:
+            # Skip PoCs the LLM cannot meaningfully fix: an unvalidatable
+            # language, or a Metasploit module (a framework plugin that is not
+            # standalone-runnable — repairing its Ruby syntax would not make it
+            # executable, and a runnable sibling PoC is promoted instead).
+            if errors in (["unrecognised_language"], ["metasploit_module"]):
                 continue
 
             invalid.append({
@@ -996,6 +1036,15 @@ class PoCRepairLLM(PipelineModule):
         if non_blank == 0:
             return None
 
+        # If >80% of non-blank lines are // comments the file is an advisory document,
+        # not executable C — regardless of what's inside those comments.
+        comment_lines = sum(1 for l in lines if l.strip().startswith("//"))
+        comment_ratio = comment_lines / non_blank
+        if comment_ratio > 0.80:
+            return (
+                f"Content is {comment_ratio:.0%} // comments — advisory document, not C source"
+            )
+
         # If <5% of lines look like C and >30% look like prose/shell, it's mislabeled
         c_ratio = c_anchors / non_blank
         prose_shell_ratio = (prose_lines + shell_lines) / non_blank
@@ -1004,6 +1053,21 @@ class PoCRepairLLM(PipelineModule):
             return (
                 f"Content appears to be prose/shell (C anchors: {c_ratio:.0%}, "
                 f"prose+shell: {prose_shell_ratio:.0%}) — likely mislabeled as C"
+            )
+
+        # A substantial file with ZERO C structural anchors (no #include, no
+        # type/function keyword, no control-flow keyword) is not a C program.
+        # Security advisories / write-ups quote code snippets that contain
+        # punctuation (so they evade the prose counter above) yet still have no
+        # line that *starts* a C construct.  If such a file also carries some
+        # prose/shell it is an advisory mislabeled as C (e.g. CVE-2017-1000409,
+        # the Qualys ld.so write-up).  Requiring c_anchors == 0 keeps this safe:
+        # any file containing real C code has at least one anchor.
+        if c_anchors == 0 and non_blank >= 15 and prose_shell_ratio > 0.20:
+            return (
+                f"No C structural anchors (no #include/type/control-flow lines) "
+                f"with {prose_shell_ratio:.0%} prose/shell — advisory/write-up "
+                f"mislabeled as C"
             )
         return None
 
@@ -1019,7 +1083,7 @@ class PoCRepairLLM(PipelineModule):
         errors: List[str],
         max_attempts: int,
         api_endpoint: str,
-        model: str,
+        base_model: str,
         api_timeout: int,
         num_ctx: int = 0,
         max_poc_chars: int = 0,
@@ -1027,14 +1091,19 @@ class PoCRepairLLM(PipelineModule):
         syntax_validator: "SyntaxValidator",
         sv_cfg: Dict,
         provider: str = "ollama",
-        openai_model: str = "",
         openai_api_key: str = "",
+        models_by_attempt: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Try up to *max_attempts* LLM repairs, re-validating each time.
+
+        When *models_by_attempt* maps an attempt number to a model id, that
+        attempt escalates to the stronger/different model (mirrors Phase 2's
+        feedback-loop escalation); otherwise the provider's base model is used.
 
         Returns a dict with keys: repaired, fixed_code, attempts, last_errors,
         and attempt_history.
         """
+        models_by_attempt = models_by_attempt or {}
         current_errors = list(errors)
         previous_attempt: Optional[str] = None
         attempt_history: List[Dict[str, Any]] = []
@@ -1076,17 +1145,27 @@ class PoCRepairLLM(PipelineModule):
             # This encourages slight exploration without hallucination.
             attempt_temperature = min(temperature + (attempt - 1) * 0.1, 0.5)
 
+            # Per-attempt model escalation (provider-agnostic): the scheduled id
+            # — any model family, on whatever backend `provider` selects —
+            # overrides the base model. Falls back to the base model when this
+            # attempt number is not in the schedule.
+            escalated = models_by_attempt.get(str(attempt))
+            effective_model = escalated or base_model
+            if escalated:
+                self.logger.info(
+                    "  Attempt %d escalating to model '%s'", attempt, effective_model
+                )
+
             # Call the LLM
             raw_response, api_meta = self._call_llm(
                 api_endpoint=api_endpoint,
-                model=model,
+                model=effective_model,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 timeout=api_timeout,
                 temperature=attempt_temperature,
                 num_ctx=num_ctx,
                 provider=provider,
-                openai_model=openai_model,
                 openai_api_key=openai_api_key,
             )
 
@@ -1096,6 +1175,7 @@ class PoCRepairLLM(PipelineModule):
                 )
                 attempt_history.append({
                     "attempt": attempt,
+                    "model": effective_model,
                     "api_success": False,
                     "api_error": api_meta.get("error"),
                 })
@@ -1108,10 +1188,51 @@ class PoCRepairLLM(PipelineModule):
                 self.logger.warning("  LLM returned empty code on attempt %d.", attempt)
                 attempt_history.append({
                     "attempt": attempt,
+                    "model": effective_model,
                     "api_success": True,
                     "validation_passed": False,
                     "errors": ["empty_response"],
                 })
+                continue
+
+            # ── Hallucination guard: reject runaway expansion ──
+            # A genuine syntax fix (comment out prose, add a missing include,
+            # declare an identifier) keeps the file roughly the same size.  When
+            # the model instead *fabricates* code it balloons the file — e.g. the
+            # 386-line CVE-2014-5119 exploit was rewritten to 2104 lines with 26
+            # invented #includes (incl. the Linux-incompatible <sys/event.h>),
+            # which then failed to compile.  Treat such output as a failed attempt.
+            orig_nonblank = sum(1 for l in original_code.splitlines() if l.strip())
+            new_nonblank = sum(1 for l in cleaned_code.splitlines() if l.strip())
+            if orig_nonblank and new_nonblank > orig_nonblank * 1.5 + 50:
+                self.logger.warning(
+                    "  ✗ Rejecting attempt %d — output expanded %d → %d non-blank "
+                    "lines (likely hallucinated code), retrying …",
+                    attempt, orig_nonblank, new_nonblank,
+                )
+                attempt_history.append({
+                    "attempt": attempt,
+                    "model": effective_model,
+                    "api_success": True,
+                    "validation_passed": False,
+                    "errors": [
+                        f"hallucinated_expansion ({orig_nonblank}->{new_nonblank} lines)"
+                    ],
+                })
+                # Feed the failure forward instead of resetting blind: make the
+                # size violation the error to fix so the retry is explicitly told
+                # to shrink rather than repeating the runaway expansion. Do NOT
+                # echo the ballooned output back (it would bloat the prompt and
+                # risk exceeding the context window) — the instruction suffices.
+                current_errors = [
+                    f"Your previous attempt expanded the file from {orig_nonblank} to "
+                    f"{new_nonblank} non-blank lines. This is forbidden — a syntax "
+                    f"repair must keep the file roughly its original size. Make the "
+                    f"SMALLEST possible change: comment out prose, add missing "
+                    f"#include/declarations, fix stray characters. Do NOT add new "
+                    f"functions, includes, or logic."
+                ]
+                previous_attempt = None
                 continue
 
             # ── Re-validate using Module 5 logic ──
@@ -1121,6 +1242,7 @@ class PoCRepairLLM(PipelineModule):
 
             attempt_history.append({
                 "attempt": attempt,
+                "model": effective_model,
                 "api_success": True,
                 "validation_passed": vr.is_valid,
                 "errors": vr.errors,
@@ -1171,18 +1293,18 @@ class PoCRepairLLM(PipelineModule):
         max_retries: int = 2,
         retry_delay: int = 5,
         provider: str = "ollama",
-        openai_model: str = "",
         openai_api_key: str = "",
     ) -> Tuple[Optional[str], Dict[str, Any]]:
         """Call the configured LLM backend (Ollama or OpenAI) with retry logic.
 
         Dispatches to the Ollama-compatible implementation or to the OpenAI
-        client based on *provider*.  Mirrors ``call_llm_api`` in
-        ``patch_generator.py`` (Phase 2 of the master pipeline).
+        client based on *provider*, using the single resolved *model* for either
+        backend.  Mirrors ``call_llm_api`` in ``patch_generator.py`` (Phase 2 of
+        the master pipeline).
         """
         if provider == "openai":
             return self._call_openai_api(
-                model=openai_model,
+                model=model,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 timeout=timeout,

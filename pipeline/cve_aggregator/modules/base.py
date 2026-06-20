@@ -13,6 +13,17 @@ import logging
 from typing import Any, Dict
 
 
+class FatalPipelineError(RuntimeError):
+    """A module failure that must stop the whole pipeline.
+
+    The orchestrator continues past ordinary module exceptions when
+    ``pipeline.abort_on_error`` is false. Raising this instead signals a
+    condition that invalidates the entire run (e.g. the CVE source is
+    unreachable, so any downstream output would be hollow) and must halt the
+    pipeline regardless of that setting.
+    """
+
+
 class PipelineModule(abc.ABC):
     """Base class for all pipeline stages.
 

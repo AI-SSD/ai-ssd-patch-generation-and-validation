@@ -12,12 +12,12 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 from ..models import CVEMetadata
-from .base import PipelineModule
+from .base import PipelineModule, FatalPipelineError
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +36,10 @@ class CVEFetcher(PipelineModule):
 
     def validate_config(self) -> bool:
         cfg = self.config.get("cve_fetcher", {})
-        if not cfg.get("keywords"):
-            self.logger.error("cve_fetcher.keywords must be a non-empty list")
+        if not cfg.get("keywords") and not cfg.get("cpe_match"):
+            self.logger.error(
+                "cve_fetcher needs a non-empty 'keywords' or 'cpe_match' list"
+            )
             return False
         return True
 
@@ -48,7 +50,32 @@ class CVEFetcher(PipelineModule):
 
         # Step 1 – Fetch from NVD
         self.logger.info("Fetching CVEs from NVD API …")
+        self._nvd_all_failed = False
+        self._nvd_unreachable = False
         raw_cves = self._fetch_nvd(cfg)
+
+        # Fast pre-flight gate: if NVD could not be reached at all up front, stop
+        # the run immediately with a clear warning rather than letting downstream
+        # phases proceed on an empty dataset.
+        if getattr(self, "_nvd_unreachable", False):
+            raise FatalPipelineError(
+                "NVD is not reachable (pre-flight probe failed: connection errors "
+                "or persistent 503/timeout). Aborting the run — check network "
+                "connectivity and NVD status (https://services.nvd.nist.gov), then "
+                "re-run when NVD is reachable."
+            )
+
+        # Abort loudly on a total NVD outage rather than proceeding with a
+        # degraded dataset (e.g. reverse-search-only CVEs with no fixing commit),
+        # which would silently overwrite previously-good results and report
+        # "success". A non-empty keyword/cpe config that returns NOTHING because
+        # every request failed is an infrastructure error, not an empty result.
+        if getattr(self, "_nvd_all_failed", False):
+            raise FatalPipelineError(
+                "NVD fetch failed for ALL configured queries (e.g. 503 outage / "
+                "unreachable). Aborting Phase 0 to avoid overwriting good data with "
+                "a degraded dataset — re-run when NVD is reachable."
+            )
 
         # Step 2 – De-duplicate & filter
         raw_cves = self._deduplicate(raw_cves, cfg)
@@ -73,66 +100,173 @@ class CVEFetcher(PipelineModule):
         api_key: str = os.environ.get("NVD_API_KEY") or str(cfg.get("nvd_api_key", ""))
         if not api_key:
             _key_file = Path("API-nvd-key")
+            # Fallback file lives in the pipeline root (pipeline/API-nvd-key),
+            # mirroring how poc_repair.py resolves API-openai-key.
+            _pipeline_key = Path(__file__).parent.parent.parent / "API-nvd-key"
             if _key_file.exists():
                 api_key = _key_file.read_text().strip()
-            elif (Path(__file__).parent.parent.parent.parent / "API-nvd-key").exists():
-                api_key = (Path(__file__).parent.parent.parent.parent / "API-nvd-key").read_text().strip()
+            elif _pipeline_key.exists():
+                api_key = _pipeline_key.read_text().strip()
+
+        # CPE matching (cpe_match) selects CVEs that NVD records as genuinely
+        # AFFECTING the product (cpe:2.3:a:gnu:glibc) — far more precise than a
+        # keyword (which also matches CVEs that merely mention the project). It
+        # is project-agnostic: the CPE lives in the per-project YAML.
+        cpe_matches: List[str] = cfg.get("cpe_match", [])
 
         delay = 0.6 if api_key else 6.0
         headers = {"apiKey": api_key} if api_key else {}
+
+        # Pre-flight: confirm NVD is actually reachable before issuing the full
+        # set of (potentially many) keyword/CPE queries. Fail fast if it is not.
+        if not self._preflight_nvd(headers):
+            self._nvd_unreachable = True
+            return []
+
         results_per_page = 100
         all_cves: List[Dict[str, Any]] = []
 
+        queries_total = 0
+        queries_failed = 0
+
         for keyword in keywords:
             self.logger.info("  NVD keyword: '%s'", keyword)
-            start_index = 0
+            cves, ok = self._fetch_nvd_query(
+                {"keywordSearch": keyword}, f"keyword '{keyword}'",
+                headers, delay, results_per_page,
+            )
+            all_cves.extend(cves)
+            queries_total += 1
+            queries_failed += 0 if ok else 1
 
-            while True:
-                params = {
-                    "keywordSearch": keyword,
-                    "startIndex": start_index,
-                    "resultsPerPage": results_per_page,
-                }
+        for cpe in cpe_matches:
+            self.logger.info("  NVD CPE match: '%s'", cpe)
+            cves, ok = self._fetch_nvd_query(
+                {"virtualMatchString": cpe}, f"cpe '{cpe}'",
+                headers, delay, results_per_page,
+            )
+            all_cves.extend(cves)
+            queries_total += 1
+            queries_failed += 0 if ok else 1
+
+        # Surface a total NVD outage to the caller: when every configured query
+        # failed at the transport level, the dataset is not merely "empty" — the
+        # source was unreachable. run() turns this into a hard failure so a
+        # transient 503 can't silently overwrite a good dataset with a degraded one.
+        self._nvd_all_failed = queries_total > 0 and queries_failed >= queries_total
+        return all_cves
+
+    # Retryable HTTP statuses: 429 (rate limit), 403 (NVD's rate-limit code),
+    # and 5xx (transient server outages — NVD returns 503 routinely).
+    _RETRYABLE_STATUS = frozenset({403, 429, 500, 502, 503, 504})
+    # NVD (behind Cloudflare) 503s/times-out intermittently — individual requests
+    # fail then succeed seconds later. Retry generously so a flaky window doesn't
+    # collapse the whole fetch; most requests still succeed on the first try.
+    _MAX_TRIES = 6
+
+    # Pre-flight probe: a small number of quick attempts with short backoff.
+    # Kept independent of the per-query retry budget so the gate fails fast.
+    _PREFLIGHT_TRIES = 3
+    # Generous so a slow-but-healthy NVD (it periodically declares "increased
+    # latency") still answers the probe instead of timing out and falsely
+    # aborting the run. The probe fetches a single result, so it returns well
+    # before this ceiling under normal conditions.
+    _PREFLIGHT_TIMEOUT = 45  # seconds
+
+    def _preflight_nvd(self, headers: Dict[str, str]) -> bool:
+        """Quick reachability probe before the full fetch.
+
+        Issues one minimal request (``resultsPerPage=1``) and returns True as
+        soon as NVD answers with HTTP 200. Retries a few times with short
+        backoff so a single transient 503/timeout does not abort the run, but
+        gives up quickly (rather than burning every query's full retry budget)
+        when NVD is genuinely unreachable or persistently degraded. Treats a
+        403/404 as a definitive negative — the key/endpoint is wrong, not flaky.
+        """
+        params = {"resultsPerPage": 1, "startIndex": 0}
+        last = "no response"
+        for attempt in range(1, self._PREFLIGHT_TRIES + 1):
+            wait = min(20, 5 * (2 ** (attempt - 1)))  # 5, 10, 20
+            try:
+                resp = requests.get(self.NVD_API_BASE, headers=headers,
+                                    params=params, timeout=self._PREFLIGHT_TIMEOUT)
+                if resp.status_code == 200:
+                    self.logger.info("  NVD reachable — pre-flight OK (HTTP 200)")
+                    return True
+                last = f"HTTP {resp.status_code}"
+                if resp.status_code in (403, 404):
+                    self.logger.error("  NVD pre-flight rejected (%s) — check API "
+                                      "key / endpoint", last)
+                    return False
+                self.logger.warning("  NVD pre-flight %s — attempt %d/%d",
+                                    last, attempt, self._PREFLIGHT_TRIES)
+            except (requests.exceptions.RequestException, json.JSONDecodeError) as exc:
+                last = str(exc)
+                self.logger.warning("  NVD pre-flight error — attempt %d/%d: %s",
+                                    attempt, self._PREFLIGHT_TRIES, exc)
+            if attempt < self._PREFLIGHT_TRIES:
+                time.sleep(wait)
+        self.logger.error("  NVD pre-flight FAILED after %d attempts (last: %s)",
+                          self._PREFLIGHT_TRIES, last)
+        return False
+
+    def _fetch_nvd_query(self, query_params: Dict[str, Any], label: str,
+                         headers: Dict[str, str], delay: float,
+                         results_per_page: int) -> Tuple[List[Dict[str, Any]], bool]:
+        """Paginate a single NVD 2.0 query (keyword or CPE) and parse results.
+
+        Retries transient failures (5xx/429/403, timeouts) with exponential
+        backoff before giving up. Returns ``(cves, ok)`` where ``ok`` is False
+        when the query could not complete (so the caller can tell a genuine
+        "0 results" apart from a transport failure / NVD outage).
+        """
+        out: List[Dict[str, Any]] = []
+        start_index = 0
+        while True:
+            params = dict(query_params)
+            params["startIndex"] = start_index
+            params["resultsPerPage"] = results_per_page
+            data = None
+            for attempt in range(1, self._MAX_TRIES + 1):
+                wait = min(40, 5 * (2 ** (attempt - 1)))  # 5, 10, 20, 40
                 try:
-                    resp = requests.get(
-                        self.NVD_API_BASE,
-                        headers=headers,
-                        params=params,
-                        timeout=30,
-                    )
-                    if resp.status_code == 403:
-                        self.logger.warning("NVD rate-limited – sleeping 30 s")
-                        time.sleep(30)
+                    # 90s (not 30s): full result pages are slow when NVD
+                    # declares "increased latency"; give the body time to
+                    # arrive instead of aborting and burning a retry.
+                    resp = requests.get(self.NVD_API_BASE, headers=headers, params=params, timeout=90)
+                    if resp.status_code in self._RETRYABLE_STATUS:
+                        self.logger.warning("NVD %s for %s — retry %d/%d after %ds",
+                                            resp.status_code, label, attempt, self._MAX_TRIES, wait)
+                        if attempt < self._MAX_TRIES:
+                            time.sleep(wait)
                         continue
-
                     resp.raise_for_status()
                     data = resp.json()
-
-                    vulns = data.get("vulnerabilities", [])
-                    total = data.get("totalResults", 0)
-                    self.logger.info("    Retrieved %d / %d", len(vulns), total)
-
-                    for v in vulns:
-                        parsed = self._parse_nvd_cve(v)
-                        if parsed and self._is_valid_public_cve(parsed):
-                            all_cves.append(parsed)
-
-                    start_index += results_per_page
-                    if start_index >= total:
-                        break
-                    time.sleep(delay)
-
-                except requests.exceptions.Timeout:
-                    self.logger.error("NVD timeout for '%s'", keyword)
                     break
-                except requests.exceptions.RequestException as exc:
-                    self.logger.error("NVD request error: %s", exc)
-                    break
-                except json.JSONDecodeError as exc:
-                    self.logger.error("NVD JSON error: %s", exc)
-                    break
+                except (requests.exceptions.RequestException, json.JSONDecodeError) as exc:
+                    self.logger.warning("NVD error (%s) — retry %d/%d: %s",
+                                        label, attempt, self._MAX_TRIES, exc)
+                    if attempt < self._MAX_TRIES:
+                        time.sleep(wait)
+            if data is None:
+                self.logger.error("NVD query failed after %d attempts (%s)",
+                                  self._MAX_TRIES, label)
+                return out, False
 
-        return all_cves
+            vulns = data.get("vulnerabilities", [])
+            total = data.get("totalResults", 0)
+            self.logger.info("    Retrieved %d / %d (%s)", len(vulns), total, label)
+
+            for v in vulns:
+                parsed = self._parse_nvd_cve(v)
+                if parsed and self._is_valid_public_cve(parsed):
+                    out.append(parsed)
+
+            start_index += results_per_page
+            if start_index >= total:
+                break
+            time.sleep(delay)
+        return out, True
 
     # ------------------------------------------------------------------
     # Parsing helpers
@@ -182,7 +316,8 @@ class CVEFetcher(PipelineModule):
             ref.get("url", "") for ref in cve.get("references", []) if ref.get("url")
         ]
 
-        # Affected products (CPE)
+        # Affected products (CPE) + version ranges. The version bounds let Phase 0
+        # derive a known-vulnerable release tag when no fix commit is found.
         affected: List[Dict[str, str]] = []
         for config_node in cve.get("configurations", []):
             for node in config_node.get("nodes", []):
@@ -192,6 +327,10 @@ class CVEFetcher(PipelineModule):
                         affected.append({
                             "cpe": cpe,
                             "vulnerable": str(match.get("vulnerable", True)),
+                            "version_start_including": match.get("versionStartIncluding", ""),
+                            "version_start_excluding": match.get("versionStartExcluding", ""),
+                            "version_end_including": match.get("versionEndIncluding", ""),
+                            "version_end_excluding": match.get("versionEndExcluding", ""),
                         })
 
         return {
@@ -318,8 +457,12 @@ class CVEFetcher(PipelineModule):
             return False
 
         if strict_target_matching:
-            # In strict mode, require explicit strong keyword evidence.
-            return strong_match
+            # In strict mode, require explicit evidence — but a project CPE match
+            # is authoritative (NVD records the product as affected), so accept it
+            # even when the description doesn't name the project. Otherwise the
+            # CPE-fetched CVEs (the whole point of cpe_match) would be discarded
+            # whenever their text describes only the affected function/component.
+            return strong_match or cpe_match
 
         if strong_match:
             return True

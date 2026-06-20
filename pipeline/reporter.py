@@ -193,6 +193,7 @@ class FeedbackLoopAttempt:
     duration_seconds: float = 0.0  # New: attempt duration
     generation_duration_seconds: float = 0.0  # New: patch generation duration
     validation_duration_seconds: float = 0.0  # New: validation duration
+    generation_model: str = ""  # New: model that produced this attempt (per-attempt escalation)
 
 
 @dataclass
@@ -453,7 +454,8 @@ class DataLoader:
                         end_time=attempt_data.get('end_time', ''),
                         duration_seconds=attempt_data.get('duration_seconds', 0.0),
                         generation_duration_seconds=attempt_data.get('generation_duration_seconds', 0.0),
-                        validation_duration_seconds=attempt_data.get('validation_duration_seconds', 0.0)
+                        validation_duration_seconds=attempt_data.get('validation_duration_seconds', 0.0),
+                        generation_model=attempt_data.get('generation_model') or ''
                     ))
                 
                 entries.append(FeedbackLoopEntry(
@@ -1319,7 +1321,8 @@ class ReportGenerator:
                 lines.append("- **Failure History:**")
                 for attempt in entry.attempts:
                     reasons = ", ".join(attempt.failure_reasons) if attempt.failure_reasons else "Unknown"
-                    lines.append(f"  - Attempt {attempt.attempt_number}: {reasons}")
+                    model_tag = f" _(model: {attempt.generation_model})_" if attempt.generation_model else ""
+                    lines.append(f"  - Attempt {attempt.attempt_number}{model_tag}: {reasons}")
                 lines.append("")
         
         return '\n'.join(lines)

@@ -16,7 +16,10 @@ phase0_config: "cve_aggregator/glibc_config.yaml"
 # Per-phase process timeouts (seconds) – used by the master pipeline executor
 phase_timeouts:
   0: 14400       # Phase 0: Data aggregation (API calls + git operations)
-  1: 3600       # Phase 1: Vulnerability reproduction (Docker builds)
+  1: 28800      # Phase 1: Vulnerability reproduction (Docker builds). 8h — the
+                # full set is ~56 CVEs, many needing a fresh ~15-20 min glibc
+                # build; 1h only got ~halfway. This is a safety cap, not a target;
+                # cached images make re-runs much faster.
   2: 10800      # Phase 2: Patch generation (LLM API calls)
   3: 7200       # Phase 3: Patch validation (Docker builds + PoC + SAST)
   4: 600        # Phase 4: Reporting
@@ -25,9 +28,27 @@ phase_timeouts:
 build_timeout: 3600     # Docker image build timeout
 run_timeout: 300        # Container run / PoC execution timeout
 
+# Phase 1 baseline determinism: a memory-bug PoC can exit non-deterministically
+# (ASLR / heap layout / timing), so a single run may record a flaky baseline
+# that Phase 3 then compares against. The baseline PoC is run up to
+# `baseline_runs` times. A crash / explicit exit code is accepted once
+# `baseline_min_agree` runs agree (early-stop). A timeout / -1 baseline is the
+# weakest signal, so it requires UNANIMITY — every run must hang — otherwise the
+# CVE is routed to manual revision as non-deterministic. Set baseline_runs: 1 to
+# restore single-run behaviour.
+baseline_runs: 3          # max baseline executions per CVE
+baseline_min_agree: 2     # identical crash runs required to trust the baseline
+                          # (timeout baselines always require all baseline_runs)
+
 # Docker resource settings
 docker:
-  memory_limit: "2g"
+  # Per-container memory ceiling for PoC execution (Phase 1 baseline + Phase 3
+  # validation). Memory-amplifying overflow PoCs (e.g. CVE-2012-4412 feeds a
+  # ~410 MB string into strcoll, whose internal buffers push past 2 GB) get
+  # OOM-killed (exit 137) BEFORE the bug's behaviour diverges between the
+  # vulnerable and patched builds — making the baseline useless. A higher ceiling
+  # lets the overflow actually manifest as a corruption crash a patch can fix.
+  memory_limit: "6g"
   cpu_limit: 1
   network_disabled: true
 
@@ -46,21 +67,6 @@ paths:
   reports: "reports"
   manual_supervision: "manual_supervision"
   documentation: "documentation"
-
-# =============================================================================
-# OS / Ubuntu Mapping
-# =============================================================================
-
-# CVE-year → Ubuntu base image for Docker builds (Phase 1 + Phase 3)
-os_mapping:
-  "2012": "ubuntu:14.04"
-  "2013": "ubuntu:14.04"
-  "2014": "ubuntu:14.04"
-  "2015": "ubuntu:16.04"
-  "2016": "ubuntu:16.04"
-  "2017": "ubuntu:18.04"
-  "2018": "ubuntu:18.04"
-  default: "ubuntu:16.04"
 
 # Vulnerability detection patterns (Phase 1)
 detection_patterns:
@@ -131,7 +137,11 @@ llm:
 
   # Generation parameters
   temperature: 0.2        # Lower = more deterministic
-  max_tokens: 8192        # Maximum tokens in response
+  # Max output tokens. Raised from 8192: whole-function regeneration of very
+  # large functions (e.g. glibc's ~1240-line ____STRTOF_INTERNAL ≈ 7.7k tokens)
+  # was truncated mid-function at 8192 → "unclosed braces" → syntax-invalid.
+  # gpt-4.1-mini allows up to 16384 output tokens; this gives ~2x headroom.
+  max_tokens: 16384       # Maximum tokens in response
 
 # =============================================================================
 # Phase 3: Validation Settings
@@ -181,10 +191,38 @@ feedback_loop:
   max_retries: 3
   timeout: 7200               # Total feedback-loop timeout (seconds)
 
+  # -------------------------------------------------------------------------
+  # Per-attempt model escalation (optional).
+  #
+  # Keys are ATTEMPT numbers, values are model ids:
+  #   1 = the initial Phase 2 generation
+  #   2 = first retry, 3 = second retry, 4 = third retry
+  # (with max_retries: 3 there are 4 attempts total: 1 initial + 3 retries).
+  #
+  # The idea: if the first patch fails, retry with a stronger/different model,
+  # escalating further on each subsequent failure. An attempt number not listed
+  # here falls back to llm.openai_model. Leave this section empty (or remove it)
+  # to use llm.openai_model for every attempt (legacy behavior).
+  #
+  # Only honored for llm.provider: openai. Set these to model ids your API key
+  # can actually access — an unknown id makes that attempt's generation fail
+  # gracefully (logged as generation_failed) and the loop moves on.
+  models_by_attempt:
+    1: "gpt-4.1-mini"        # initial generation
+    2: "gpt-5-mini"          # 1st retry — escalate
+    3: "gpt-5.4-mini"        # 2nd retry
+    4: "gpt-4.1"             # 3rd retry — escalate again
+
   retry_on:
     poc_still_works: true
     sast_failed: true
-    build_error: false
+    # Methodology v2: Phase 3 build error = the patch failed to compile in
+    # the Phase 1 image (incremental rebuild) — compiler output is injected
+    # as feedback context, so retrying is meaningful.
+    build_error: true
+    # A patch that turned the deterministic baseline into a timeout/hang is a
+    # failed patch (self-inflicted DoS); the hang is injected as feedback.
+    poc_hang: true
 
   context_injection:
     include_poc_output: true
@@ -204,20 +242,6 @@ feedback_loop:
 manual_verification:
   timeout: 1800               # Wait for manual review (seconds)
   poll_interval: 30           # Poll frequency (seconds)
-
-# =============================================================================
-# CVE-specific file mappings (Phase 3 Dockerfile generation)
-# =============================================================================
-
-cve_mappings:
-  CVE-2012-3480:
-    glibc_file: "stdlib/strtod_l.c"
-    patch_file: "strtod_l.c"
-
-  CVE-2014-5119:
-    glibc_file: "iconv/gconv_trans.c"
-    patch_file: "gconv_trans.c"
-
-  CVE-2015-7547:
-    glibc_file: "resolv/res_send.c"
-    patch_file: "res_send.c"
+  auto_skip: true             # true = never prompt; auto-exclude every CVE still
+                              #        pending manual review (unattended runs).
+                              #        Override per-run with --auto-skip-manual.

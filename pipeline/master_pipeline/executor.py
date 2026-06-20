@@ -267,15 +267,22 @@ class PhaseExecutor:
         elif phase == 3:
             validation_dir = self.config.base_dir / str(paths_cfg.get("validation_results", "validation_results"))
             if validation_dir.exists():
-                for f in validation_dir.glob("validation_summary_*.json"):
+                # Newest first. glob() order is arbitrary and this dir accumulates
+                # one validation_summary per run, so an unsorted list lets a
+                # first-match consumer (the execution-summary metric) read a STALE
+                # summary from a prior run. The timestamped filenames sort
+                # chronologically, so reverse-sort puts THIS run's summary first.
+                for f in sorted(validation_dir.glob("validation_summary_*.json"), reverse=True):
                     output_files.append(str(f))
-        
+
         elif phase == 4:
             reports_dir = self.config.base_dir / str(paths_cfg.get("reports", "reports"))
             if reports_dir.exists():
-                for f in reports_dir.glob("*.md"):
+                # Newest first (timestamped report names sort chronologically) so
+                # the current run's report leads instead of a stale one.
+                for f in sorted(reports_dir.glob("*.md"), reverse=True):
                     output_files.append(str(f))
-                for f in reports_dir.glob("*.png"):
+                for f in sorted(reports_dir.glob("*.png")):
                     output_files.append(str(f))
         
         return output_files

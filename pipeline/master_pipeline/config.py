@@ -99,6 +99,10 @@ FEEDBACK_LOOP_ENABLED: bool = bool(_fb.get("enabled", True))
 _mv = _cfg.get("manual_verification", {}) if isinstance(_cfg.get("manual_verification"), dict) else {}
 MANUAL_VERIFY_TIMEOUT: int = int(_mv.get("timeout", 1800))
 MANUAL_VERIFY_POLL_INTERVAL: int = int(_mv.get("poll_interval", 30))
+# When True, the Phase 0 manual-verification step never prompts: every CVE still
+# pending manual review is automatically skipped (excluded from Phase 1+), the
+# same as choosing [S] in the interactive menu. Lets the pipeline run unattended.
+MANUAL_VERIFY_AUTO_SKIP: bool = bool(_mv.get("auto_skip", False))
 
 # Phase scripts – structural, not user-facing config
 PHASE_SCRIPTS = {
@@ -140,6 +144,7 @@ class PipelineConfig:
     # Manual verification
     manual_verify_timeout: int = MANUAL_VERIFY_TIMEOUT
     manual_verify_poll_interval: int = MANUAL_VERIFY_POLL_INTERVAL
+    manual_verify_auto_skip: bool = MANUAL_VERIFY_AUTO_SKIP
 
     def resolve_phase0_outputs(self) -> Dict[str, Path]:
         """Read Phase 0 config YAML and return its output file paths resolved to base_dir."""

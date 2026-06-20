@@ -2,10 +2,15 @@
 # =============================================================================
 # AI-SSD Project - Phase 3: Multi-Layered Patch Validation Pipeline
 # =============================================================================
-# This script automates the validation of LLM-generated security patches by:
-# 1. Building Docker images with patched glibc code
-# 2. Running PoC exploits to verify vulnerability is mitigated
-# 3. Running SAST tools to detect any new vulnerabilities introduced
+# Methodology v2 — validates LLM-generated security patches by:
+# 1. Deriving a patched image FROM the Phase 1 CVE image (which already holds
+#    the vulnerable checkout, configured build tree, installed build and the
+#    compiled PoC + run wrapper), applying the patch and rebuilding
+#    incrementally
+# 2. Re-running the SAME PoC wrapper and comparing its exit code against the
+#    deterministic baseline captured by Phase 1 (image_manifest.json):
+#    a different exit code ⇒ the vulnerability no longer reproduces
+# 3. Running SAST tools host-side on the patched source file
 # 4. Generating comprehensive validation reports
 # =============================================================================
 
@@ -44,71 +49,83 @@ except ImportError:
 _BASE_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(_BASE_DIR))
 from master_pipeline.config import load_pipeline_config, cfg_section  # noqa: E402
+from poc_analyzer import PoCAnalyzer  # noqa: E402  (same negative filter Phase 1 uses)
 
 _cfg = load_pipeline_config(_BASE_DIR)
-_os_mapping = _cfg.get("os_mapping", {}) if isinstance(_cfg.get("os_mapping"), dict) else {}
 _paths = _cfg.get("paths", {}) if isinstance(_cfg.get("paths"), dict) else {}
-_cve_mappings = _cfg.get("cve_mappings", {}) if isinstance(_cfg.get("cve_mappings"), dict) else {}
 
-# Mapping of commit dates to appropriate Ubuntu/Debian versions
-COMMIT_OS_MAPPING = {str(k): str(v) for k, v in _os_mapping.items()} if _os_mapping else {
-    "2012": "ubuntu:14.04",
-    "2013": "ubuntu:14.04",
-    "2014": "ubuntu:14.04",
-    "2015": "ubuntu:16.04",
-    "2016": "ubuntu:16.04",
-    "2017": "ubuntu:18.04",
-    "2018": "ubuntu:18.04",
-    "default": "ubuntu:16.04",
-}
+# Per-container memory ceiling — must match Phase 1 (orchestrator.py) so the
+# patched run is compared against the baseline under identical limits.
+_docker_cfg = _cfg.get("docker", {}) if isinstance(_cfg.get("docker"), dict) else {}
+_CONTAINER_MEM_LIMIT = str(_docker_cfg.get("memory_limit") or "6g")
 
-# Known CVE to approximate commit year mapping (derived from CVE IDs)
-CVE_YEAR_HINTS = {}
-for _cve_id in _cve_mappings:
-    try:
-        _year = _cve_id.split("-")[1][:4]
-        CVE_YEAR_HINTS[_cve_id] = _year
-    except (IndexError, ValueError):
-        pass
-if not CVE_YEAR_HINTS:
-    CVE_YEAR_HINTS = {
-        "CVE-2012-3480": "2012",
-        "CVE-2014-5119": "2014",
-        "CVE-2015-7547": "2015",
+# ---------------------------------------------------------------------------
+# Phase 1 image layout (methodology v2)
+#
+# Phase 3 derives each patched validation image FROM the Phase 1 CVE image,
+# which already contains the project checked out at the vulnerable commit
+# (/build/<source_dir>), a configured build tree (/build/<build_dir>), the
+# installed vulnerable build (<install_prefix>) and the compiled PoC + run
+# wrapper. The directory names come from the same Phase 0 YAML the Phase 1
+# orchestrator uses, with identical defaults — no per-CVE configuration.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_SOURCE_DIR_NAME = "project-src"
+_DEFAULT_BUILD_DIR_NAME = "project-build"
+_DEFAULT_INSTALL_PREFIX = "/opt/project-build"
+_DEFAULT_IMAGE_MANIFEST_PATH = "results/image_manifest.json"
+
+# Must match orchestrator.py's _CONTAINER_SECURITY_OPT: the inherited PoC
+# wrapper runs the exploit as a non-root user, and some PoCs need
+# unprivileged user namespaces / restricted syscalls (e.g. CVE-2018-1000001).
+# Phase 3 must run with the same relaxed profile as Phase 1 or the baseline
+# comparison would not be apples-to-apples.
+_CONTAINER_SECURITY_OPT = ["seccomp=unconfined", "apparmor=unconfined"]
+
+
+def _resolve_phase1_layout(base_dir: Path) -> Dict[str, Any]:
+    """Resolve the Phase 1 image layout from the Phase 0 config referenced by
+    config.yaml (``phase0_config`` key). Mirrors orchestrator.py defaults."""
+    p1 = {}
+    phase0_rel = _cfg.get("phase0_config", "")
+    if phase0_rel:
+        phase0_path = Path(phase0_rel)
+        if not phase0_path.is_absolute():
+            phase0_path = _BASE_DIR / phase0_path
+        if phase0_path.exists():
+            try:
+                import yaml
+                with open(phase0_path, "r", encoding="utf-8") as fh:
+                    p1 = (yaml.safe_load(fh) or {}).get("phase1", {}) or {}
+            except Exception:
+                p1 = {}
+    manifest_rel = p1.get("image_manifest_path", _DEFAULT_IMAGE_MANIFEST_PATH)
+    manifest_path = Path(manifest_rel)
+    if not manifest_path.is_absolute():
+        manifest_path = base_dir / manifest_path
+    return {
+        "source_dir_name": p1.get("source_dir_name", _DEFAULT_SOURCE_DIR_NAME),
+        "build_dir_name": p1.get("build_dir_name", _DEFAULT_BUILD_DIR_NAME),
+        "install_prefix": p1.get("install_prefix", _DEFAULT_INSTALL_PREFIX),
+        "image_manifest_path": manifest_path,
     }
 
-# CVE to vulnerable file path mapping (within glibc source tree)
-CVE_FILE_MAPPING = {}
-for _cve_id, _mapping in _cve_mappings.items():
-    if isinstance(_mapping, dict) and "glibc_file" in _mapping:
-        CVE_FILE_MAPPING[_cve_id] = _mapping["glibc_file"]
-if not CVE_FILE_MAPPING:
-    CVE_FILE_MAPPING = {
-        "CVE-2012-3480": "stdlib/strtod_l.c",
-        "CVE-2014-5119": "iconv/gconv_trans.c",
-        "CVE-2015-7547": "resolv/res_send.c",
-    }
 
-# SAST Tools Configuration
-# These are common, well-established C/C++ static analysis tools
+# SAST Tools Configuration — run HOST-SIDE on the patched source file.
+# Static analysis of a single C file needs no container; running on the host
+# avoids installing analysis tools into EOL-distro images and keeps tool
+# versions consistent across all CVEs.
 SAST_TOOLS = {
     "cppcheck": {
-        "install_cmd": "apt-get install -y cppcheck",
-        "run_cmd": "cppcheck --enable=all --error-exitcode=1 --xml --xml-version=2 {file} 2>&1",
+        "cmd": ["cppcheck", "--enable=all", "--xml", "--xml-version=2", "{file}"],
+        "fallback_cmd": None,
         "description": "Static analysis tool for C/C++ code",
-        "severity_levels": ["error", "warning", "style", "performance", "portability"],
     },
     "flawfinder": {
-        "install_cmd": "apt-get install -y flawfinder || pip install flawfinder",
-        "run_cmd": "flawfinder --minlevel=1 --dataonly --quiet {file}",
+        "cmd": ["flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"],
+        "fallback_cmd": [sys.executable, "-m", "flawfinder",
+                         "--minlevel=1", "--dataonly", "--quiet", "{file}"],
         "description": "Examines C/C++ source code for security weaknesses",
-        "severity_levels": [1, 2, 3, 4, 5],  # 5 is highest risk
-    },
-    "rats": {
-        "install_cmd": "apt-get install -y rats || true",
-        "run_cmd": "rats --xml {file} 2>/dev/null || echo 'RATS not available'",
-        "description": "Rough Auditing Tool for Security",
-        "severity_levels": ["High", "Medium", "Low"],
     },
 }
 
@@ -117,6 +134,7 @@ class ValidationStatus(Enum):
     """Status codes for validation results"""
     SUCCESS = "Success"                          # Patch validated successfully
     POC_STILL_WORKS = "PoC Still Works"          # Vulnerability not fixed
+    POC_HANG = "Patch Caused Hang"               # Patch turned a deterministic baseline into a timeout/hang
     BUILD_ERROR = "Build Error"                  # Failed to build patched glibc
     EXECUTION_ERROR = "Execution Error"          # PoC execution environment failed
     SAST_FAILED = "SAST Failed"                  # SAST found new vulnerabilities
@@ -124,6 +142,7 @@ class ValidationStatus(Enum):
     PATCH_NOT_FOUND = "Patch Not Found"          # No patch file found
     INVALID_PATCH = "Invalid Patch"              # Patch file is invalid/empty
     TIMEOUT = "Timeout"                          # Execution timed out
+    NO_BASELINE = "No Phase 1 Baseline"          # CVE has no reproduction baseline
     UNKNOWN_ERROR = "Unknown Error"              # Unexpected error occurred
 
 
@@ -144,10 +163,18 @@ class VulnerabilityInfo:
     file_path: str
     function_name: str
     unit_type: str
-    
+    poc_language: str = ""
+
     @property
     def short_commit(self) -> str:
         return self.commit_hash[:12]
+
+    @property
+    def is_intree_test(self) -> bool:
+        """True when reproduction used the project's own regression test (Option A):
+        validation re-runs that test against the patched build (PASS = fixed),
+        not exit-code-diff."""
+        return (self.poc_language or "").lower() == "intree-test"
 
 
 @dataclass
@@ -161,7 +188,19 @@ class PatchInfo:
     response_json: Optional[Path] = None
     is_valid: bool = False
     original_filepath: str = ""
-    
+    # Model that ACTUALLY generated this patch (per-attempt escalation). The
+    # feedback-loop identity stays in model_name (used for image tag/grouping);
+    # this is for honest logging of which model produced the attempt.
+    generation_model: str = ""
+
+    @property
+    def log_label(self) -> str:
+        """`cve/model` for logs, annotated with the real generating model when
+        it differs from the loop identity (e.g. an escalated retry)."""
+        if self.generation_model and self.generation_model != self.model_name:
+            return f"{self.cve_id}/{self.model_name} (patch by {self.generation_model})"
+        return f"{self.cve_id}/{self.model_name}"
+
     @property
     def image_name(self) -> str:
         """Generate Docker image name for this patch"""
@@ -212,6 +251,7 @@ class ValidationResult:
     sast_passed: bool
     sast_results: List[Dict[str, Any]] = field(default_factory=list)
     poc_exit_code: Optional[int] = None
+    baseline_exit_code: Optional[int] = None       # Phase 1 deterministic baseline
     poc_output: Optional[str] = None
     error_message: Optional[str] = None
     execution_time_seconds: float = 0
@@ -222,7 +262,14 @@ class ValidationResult:
     build_logs: Optional[str] = None  # Build error logs for feedback
     attempt_number: int = 1  # Track which attempt this is
     is_retry: bool = False  # Whether this was a retry validation
-    
+    # Negative-filter evidence on the PATCHED run (mirrors Phase 1's proof model):
+    # the verdict is no longer a bare exit-code delta — it records whether the
+    # exploit output explicitly shows it failed, and how confident "blocked" is.
+    nf_failed: Optional[bool] = None              # True if the patched PoC output shows the exploit failed
+    nf_reason: Optional[str] = None               # short justification from the filter
+    nf_source: Optional[str] = None               # "llm" | "regex" | "regex-fallback" | "binary-abstain"
+    poc_proof_confidence: Optional[str] = None    # "confirmed" | "exit-change" | "completion-only" | None
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
         return {
@@ -235,6 +282,7 @@ class ValidationResult:
             "sast_results": self.sast_results,
             "sast_findings": self.sast_findings,
             "poc_exit_code": self.poc_exit_code,
+            "baseline_exit_code": self.baseline_exit_code,
             "poc_output": self.poc_output[:2000] if self.poc_output else None,  # Truncate long outputs
             "error_message": self.error_message,
             "execution_time_seconds": self.execution_time_seconds,
@@ -243,6 +291,10 @@ class ValidationResult:
             "build_logs": self.build_logs[:2000] if self.build_logs else None,
             "attempt_number": self.attempt_number,
             "is_retry": self.is_retry,
+            "nf_failed": self.nf_failed,
+            "nf_reason": self.nf_reason,
+            "nf_source": self.nf_source,
+            "poc_proof_confidence": self.poc_proof_confidence,
         }
     
     def to_failure_context(self) -> Dict[str, Any]:
@@ -255,6 +307,7 @@ class ValidationResult:
             "status": self.status,
             "poc_blocked": self.poc_blocked,
             "poc_exit_code": self.poc_exit_code,
+            "baseline_exit_code": self.baseline_exit_code,
             "poc_output": self.poc_output,
             "build_success": self.build_success,
             "build_logs": self.build_logs,
@@ -263,6 +316,9 @@ class ValidationResult:
             "sast_findings": self.sast_findings,
             "error_message": self.error_message,
             "attempt_number": self.attempt_number,
+            "nf_failed": self.nf_failed,
+            "nf_reason": self.nf_reason,
+            "poc_proof_confidence": self.poc_proof_confidence,
         }
 
 
@@ -329,11 +385,15 @@ class CSVParser:
             raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
         
         with open(self.csv_path, 'r', encoding='utf-8') as f:
-            # Detect delimiter
-            sample = f.read(2048)
+            # Detect delimiter from the HEADER line only. Sampling the body is
+            # unreliable: data cells embed semicolon-heavy C source (V_FUNCTION,
+            # PoC code), which would falsely outvote the real comma delimiter.
+            # Column headers never contain embedded code, so the first line is
+            # the trustworthy signal.
+            header_line = f.readline()
             f.seek(0)
-            delimiter = ';' if sample.count(';') > sample.count(',') else ','
-            
+            delimiter = ';' if header_line.count(';') > header_line.count(',') else ','
+
             reader = csv.DictReader(f, delimiter=delimiter)
             
             for row in reader:
@@ -346,7 +406,8 @@ class CSVParser:
                     commit_hash=row.get('V_COMMIT', '').strip(),
                     file_path=row.get('FilePath', '').strip(),
                     function_name=row.get('F_NAME', '').strip(),
-                    unit_type=row.get('UNIT_TYPE', '').strip()
+                    unit_type=row.get('UNIT_TYPE', '').strip(),
+                    poc_language=row.get('poc_language', '').strip()
                 )
                 vulnerabilities[cve] = vuln
                 self.logger.debug(f"Found vulnerability: {cve}")
@@ -391,7 +452,15 @@ class PatchDiscovery:
             for model_dir in cve_dir.iterdir():
                 if not model_dir.is_dir():
                     continue
-                
+
+                # Skip feedback-loop retry artifacts (e.g. "gpt-4.1-mini_retry2").
+                # These are produced and validated IN-PROCESS by the feedback
+                # loop, not Phase 2 outputs. Discovering them makes a standalone
+                # Phase 3 re-run validate N× the real patch count (one per retry).
+                if re.search(r'_retry\d+$', model_dir.name):
+                    self.logger.debug(f"Skipping feedback retry dir: {model_dir.name}")
+                    continue
+
                 patch_info = self._load_patch_info(cve_id, model_dir)
                 if patch_info:
                     patches.append(patch_info)
@@ -454,177 +523,237 @@ class PatchDiscovery:
 # Dockerfile Generator for Patched Code
 # =============================================================================
 
+class ImageManifest:
+    """Reads the Phase 1 image manifest (results/image_manifest.json).
+
+    Per CVE it provides the built CVE image tag and the deterministic
+    baseline exit code captured on the known-vulnerable build — the two
+    pieces Phase 3 needs to derive a patched image and judge the re-run.
+    """
+
+    def __init__(self, manifest_path: Path, logger: logging.Logger):
+        self.manifest_path = manifest_path
+        self.logger = logger
+        self.entries: Dict[str, Dict[str, Any]] = {}
+        self._load()
+
+    def _load(self):
+        if not self.manifest_path.exists():
+            self.logger.error(f"Phase 1 image manifest not found: {self.manifest_path}")
+            return
+        try:
+            with open(self.manifest_path) as f:
+                manifest = json.load(f)
+            for entry in manifest.get("cve_images", []):
+                cve = entry.get("cve", "").upper()
+                if cve:
+                    self.entries[cve] = entry
+            self.logger.info(
+                f"Loaded Phase 1 manifest: {len(self.entries)} CVE image(s), "
+                f"{sum(1 for e in self.entries.values() if e.get('baseline_exit_code') is not None)} "
+                f"with a baseline"
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to parse image manifest {self.manifest_path}: {e}")
+
+    def get(self, cve_id: str) -> Optional[Dict[str, Any]]:
+        return self.entries.get(cve_id.upper())
+
+
 class PatchedDockerfileGenerator:
-    """Generates Dockerfiles for building and testing patched glibc versions"""
-    
-    # Template with SAST tools pre-installed
+    """Generates Dockerfiles for patched validation images.
+
+    Methodology v2: the patched image derives FROM the Phase 1 CVE image,
+    which already contains the vulnerable checkout, the configured build
+    tree, the installed vulnerable build, the compiled PoC and the run
+    wrapper (CMD is inherited). Only the patched file is copied in and the
+    project rebuilt incrementally — the same environment Phase 1 measured
+    the baseline in, with exactly one variable changed: the patch.
+    """
+
     DOCKERFILE_TEMPLATE = '''# =============================================================================
-# Dockerfile for Patched glibc Validation - {cve}
+# AI-SSD Patched Validation Image - {cve}
 # Model: {model_name}
-# Base: {base_image}
+# Derived from Phase 1 CVE image: {cve_image_tag}
 # =============================================================================
-FROM {base_image}
+FROM {cve_image_tag}
 
 LABEL maintainer="AI-SSD Project"
+LABEL ai-ssd.type="validation"
 LABEL cve="{cve}"
 LABEL model="{model_name}"
-LABEL phase="validation"
 
-# Prevent interactive prompts
-ENV DEBIAN_FRONTEND=noninteractive
+# Apply the patch over the vulnerable source file. `touch` guarantees the
+# file is newer than every existing build artifact (COPY may preserve an
+# older mtime, which would make the incremental rebuild skip it).
+COPY patched_source.c /build/{source_dir}/{vuln_file_path}
+RUN touch /build/{source_dir}/{vuln_file_path}
 
-# Update and install build dependencies + SAST tools
-RUN apt-get update && apt-get install -y \\
-    build-essential \\
-    git \\
-    gawk \\
-    bison \\
-    texinfo \\
-    autoconf \\
-    libtool \\
-    gettext \\
-    wget \\
-    python3 \\
-    python3-pip \\
-    cppcheck \\
-    && rm -rf /var/lib/apt/lists/*
+# Tolerant incremental rebuild + install, mirroring the Phase 1 invocation
+# (-k): old source trees often carry PRE-EXISTING subdir failures unrelated
+# to the patch (Phase 1 built this same tree the same way). Whether the
+# PATCH itself compiled is verified separately below via its object file.
+WORKDIR /build/{build_dir}
+RUN make -j$(nproc) -k > /tmp/ssd_rebuild.log 2>&1; \\
+    echo "rebuild exit: $?" && tail -30 /tmp/ssd_rebuild.log; true
+RUN make install -k > /tmp/ssd_install.log 2>&1; \\
+    echo "install exit: $?" && tail -10 /tmp/ssd_install.log; true
 
-# Install additional SAST tools
-RUN pip3 install flawfinder || true
+# Extract compiler errors from the rebuild log so the feedback loop receives
+# the actual gcc diagnostics rather than make recursion noise.
+RUN grep -B2 -A8 "error:" /tmp/ssd_rebuild.log 2>/dev/null | head -100 \\
+    > /tmp/ssd_build_errors; true
 
-# Create working directory
-WORKDIR /build
+# Verification artifact 1: was the patched file's object rebuilt AFTER the
+# patch was applied? Empty marker = the patch did not compile.
+RUN {obj_check_cmd}
 
-# Clone glibc repository and checkout vulnerable commit
-RUN git clone https://github.com/bminor/glibc.git /build/glibc-src
+# Verification artifact 2: does the PoC exercise the project build at RUNTIME?
+# Mirrors the Phase 1 honesty marker — the inherited wrapper runs the PoC
+# through the project's own loader (ld.so --library-path), so we check that the
+# same loader maps the project libc (LD_LIBRARY_PATH ldd fallback). If neither
+# resolves the project build, a source patch can never change the PoC's
+# behavior — the validator surfaces this as a non-retryable environment
+# condition. Keep in sync with orchestrator.py's marker + read_poc_uses_build.
+RUN LOADER=$(find {install_prefix}/lib -maxdepth 1 -name 'ld-*.so*' 2>/dev/null | head -1); \\
+    USES=no; \\
+    if [ -n "$LOADER" ] && "$LOADER" --library-path {install_prefix}/lib --list /poc/exploit 2>/dev/null | grep -q "{install_prefix}"; then \\
+        USES=yes; \\
+    elif LD_LIBRARY_PATH={install_prefix}/lib ldd /poc/exploit 2>/dev/null | grep -q "{install_prefix}"; then \\
+        USES=yes; \\
+    fi; \\
+    echo "$USES" > /tmp/ssd_poc_uses_build; echo "poc_uses_build: $USES"
 
-WORKDIR /build/glibc-src
-RUN git fetch origin {commit_hash} && \\
-    git checkout {commit_hash}
-
-# Copy the patched source file (will replace original)
-COPY patched_source.c /build/patched_source.c
-
-# Apply the patch by replacing the vulnerable file
-RUN cp /build/patched_source.c /build/glibc-src/{vuln_file_path}
-
-# Create build directory (glibc requires out-of-tree build)
-RUN mkdir -p /build/glibc-build
-
-WORKDIR /build/glibc-build
-
-# Configure glibc build
-RUN ../glibc-src/configure \\
-    --prefix=/opt/glibc-patched \\
-    --disable-werror \\
-    --disable-sanity-checks \\
-    CC="gcc -fno-stack-protector" \\
-    CFLAGS="-O2 -g -fno-stack-protector -Wno-error" \\
-    || (cat config.log && exit 1)
-
-# Build glibc (using -k to continue on errors)
-RUN make -j$(nproc) -k 2>&1 | tee /build/build.log || true
-
-# Install to prefix
-RUN make install -k 2>&1 | tee -a /build/build.log || true
-
-# Create directory for PoC
-RUN mkdir -p /poc /sast_results
-
-# Copy exploit source
-COPY poc_exploit.c /poc/exploit.c
-
-# Copy patched source for SAST analysis
-RUN cp /build/patched_source.c /sast_results/patched_source.c
-
-# Compile the PoC against PATCHED glibc
-# Try multiple compilation strategies, but ensure we have a working binary
+# Restore the parent image's working directory: the inherited run wrapper
+# executes the PoC via relative path (./exploit) from /poc.
 WORKDIR /poc
-RUN DYNAMIC_LINKER=$(find /opt/glibc-patched/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
-    echo "Found dynamic linker: $DYNAMIC_LINKER" && \\
-    (if [ -n "$DYNAMIC_LINKER" ]; then \\
-        gcc -o exploit exploit.c \\
-        -Wl,-rpath,/opt/glibc-patched/lib \\
-        -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-        -L/opt/glibc-patched/lib \\
-        -ldl -lpthread \\
-        2>&1 && echo "Compiled with patched glibc"; \\
-    else \\
-        false; \\
-    fi) || \\
-    (gcc -o exploit exploit.c -ldl -lpthread 2>&1 && echo "Compiled with system glibc + libs") || \\
-    (gcc -o exploit exploit.c 2>&1 && echo "Compiled with minimal flags") || \\
-    (echo "ERROR: Failed to compile exploit" && exit 1)
 
-# Verify the exploit binary exists and is executable
-RUN test -x /poc/exploit || (echo "ERROR: /poc/exploit not found or not executable" && exit 1)
-
-# Set environment for running with patched glibc
-ENV LD_LIBRARY_PATH=/opt/glibc-patched/lib
-
-# Default command: run the exploit (expecting it to FAIL = patch works)
-CMD ["/poc/exploit"]
+# CMD (the Phase 1 run wrapper) is inherited from the parent image: it
+# re-runs the PoC identically and exits with the PoC's own exit code.
 '''
 
-    def __init__(self, logger: logging.Logger):
+    def __init__(self, logger: logging.Logger, layout: Dict[str, Any]):
         self.logger = logger
-    
-    def get_base_image(self, cve: str) -> str:
-        """Determine appropriate base image based on CVE"""
-        if cve in CVE_YEAR_HINTS:
-            year = CVE_YEAR_HINTS[cve]
-            return COMMIT_OS_MAPPING.get(year, COMMIT_OS_MAPPING["default"])
-        
-        # Try to extract year from CVE name
-        try:
-            parts = cve.split('-')
-            if len(parts) >= 2:
-                year = parts[1][:4]
-                if year in COMMIT_OS_MAPPING:
-                    return COMMIT_OS_MAPPING[year]
-        except (IndexError, ValueError):
-            pass
-        
-        return COMMIT_OS_MAPPING["default"]
-    
+        self.layout = layout
+
     def generate(
         self,
         patch_info: PatchInfo,
         vuln_info: VulnerabilityInfo,
+        cve_image_tag: str,
         output_dir: Path
-    ) -> Path:
-        """Generate Dockerfile for testing a patch"""
-        base_image = self.get_base_image(patch_info.cve_id)
-        
-        # Determine the vulnerable file path within glibc
-        vuln_file_path = CVE_FILE_MAPPING.get(
-            patch_info.cve_id,
-            patch_info.original_filepath or vuln_info.file_path
-        )
-        
+    ) -> Optional[Path]:
+        """Generate Dockerfile deriving from the Phase 1 CVE image."""
+        # The in-repo path of the vulnerable file, recorded by Phase 0/2.
+        vuln_file_path = (patch_info.original_filepath or vuln_info.file_path).strip().lstrip("/")
+        if not vuln_file_path:
+            self.logger.error(
+                f"{patch_info.cve_id}: no vulnerable file path recorded "
+                f"(Phase 2 response.json / Phase 0 CSV) — cannot apply patch"
+            )
+            return None
+
         self.logger.info(
-            f"Generating Dockerfile for {patch_info.cve_id}/{patch_info.model_name} "
-            f"using {base_image}"
+            f"Generating Dockerfile for {patch_info.log_label} "
+            f"derived from {cve_image_tag} (patching {vuln_file_path})"
         )
-        
+
+        # Object-rebuilt check: only meaningful for .c files (a header patch
+        # rebuilds many objects with unrelated names).
+        if vuln_file_path.endswith(".c"):
+            obj_stem = Path(vuln_file_path).stem
+            obj_check_cmd = (
+                f'find /build/{self.layout["build_dir_name"]} -name "{obj_stem}.o" '
+                f'-newer /build/{self.layout["source_dir_name"]}/{vuln_file_path} '
+                f'-print -quit > /tmp/ssd_obj_rebuilt; '
+                f'echo "obj_rebuilt: $(cat /tmp/ssd_obj_rebuilt)"'
+            )
+        else:
+            obj_check_cmd = 'echo skip > /tmp/ssd_obj_rebuilt'
+
         dockerfile_content = self.DOCKERFILE_TEMPLATE.format(
             cve=patch_info.cve_id,
             model_name=patch_info.model_name,
-            base_image=base_image,
-            commit_hash=vuln_info.commit_hash,
-            vuln_file_path=vuln_file_path
+            cve_image_tag=cve_image_tag,
+            source_dir=self.layout["source_dir_name"],
+            build_dir=self.layout["build_dir_name"],
+            install_prefix=self.layout["install_prefix"],
+            vuln_file_path=vuln_file_path,
+            obj_check_cmd=obj_check_cmd,
         )
-        
+
         # Create output directory
         safe_model = patch_info.model_name.replace(":", "_").replace(".", "_")
         build_dir = output_dir / patch_info.cve_id.lower() / safe_model
         build_dir.mkdir(parents=True, exist_ok=True)
-        
+
         dockerfile_path = build_dir / "Dockerfile"
         with open(dockerfile_path, 'w') as f:
             f.write(dockerfile_content)
-        
+
         self.logger.debug(f"Dockerfile written to: {dockerfile_path}")
+        return build_dir
+
+    # ----- Option A: in-tree regression-test validation (PROJECT-AGNOSTIC) -----
+    # Derive FROM the Phase 1 in-tree image (vulnerable tree + overlaid test +
+    # the project's baked build/run scripts), apply the patch over the vulnerable
+    # file, rebuild by re-running the project's OWN build script, and inherit the
+    # CMD (/run_intree_test.sh). No build-system/compiler commands live here —
+    # the verdict is the test's PASS/FAIL (a non-compiling patch leaves the build
+    # broken → the test won't PASS → reported as not-fixed). Works for any
+    # project (glibc make, tomcat maven, kernel kbuild, …) unchanged.
+    INTREE_DOCKERFILE_TEMPLATE = '''# =============================================================================
+# AI-SSD Patched In-Tree-Test Validation Image - {cve}
+# Model: {model_name}   Derived from Phase 1 in-tree image: {cve_image_tag}
+# =============================================================================
+FROM {cve_image_tag}
+
+LABEL maintainer="AI-SSD Project"
+LABEL ai-ssd.type="validation-intree"
+LABEL cve="{cve}"
+LABEL model="{model_name}"
+
+# Apply the patch over the vulnerable source file (touch so the rebuild can't
+# skip it on a preserved mtime).
+COPY patched_source.c /build/{source_dir}/{vuln_file_path}
+RUN touch /build/{source_dir}/{vuln_file_path}
+
+# Rebuild with the patch using the project's OWN baked build script — the SAME
+# one Phase 1 used. Project-agnostic: no build-system commands in the pipeline.
+RUN bash /build_intree.sh > /tmp/ssd_rebuild.log 2>&1; \\
+    echo "rebuild rc=$?"; tail -40 /tmp/ssd_rebuild.log; true
+
+# CMD (/run_intree_test.sh) is inherited from the Phase 1 image: it re-runs the
+# same test and prints SSD_TEST_RESULT=PASS|FAIL|NORESULT. PASS = patch fixed it.
+'''
+
+    def generate_intree(
+        self,
+        patch_info: PatchInfo,
+        vuln_info: VulnerabilityInfo,
+        cve_image_tag: str,
+        output_dir: Path,
+    ) -> Optional[Path]:
+        """Generate the patched Dockerfile for an in-tree-test CVE."""
+        vuln_file_path = (patch_info.original_filepath or vuln_info.file_path).strip().lstrip("/")
+        if not vuln_file_path:
+            self.logger.error(
+                f"{patch_info.cve_id}: no vulnerable file path recorded — cannot apply patch"
+            )
+            return None
+        self.logger.info(
+            f"Generating in-tree validation Dockerfile for {patch_info.log_label} "
+            f"from {cve_image_tag} (patching {vuln_file_path})"
+        )
+        dockerfile_content = self.INTREE_DOCKERFILE_TEMPLATE.format(
+            cve=patch_info.cve_id, model_name=patch_info.model_name,
+            cve_image_tag=cve_image_tag, source_dir=self.layout["source_dir_name"],
+            vuln_file_path=vuln_file_path,
+        )
+        safe_model = patch_info.model_name.replace(":", "_").replace(".", "_")
+        build_dir = output_dir / patch_info.cve_id.lower() / safe_model
+        build_dir.mkdir(parents=True, exist_ok=True)
+        (build_dir / "Dockerfile").write_text(dockerfile_content)
         return build_dir
 
 
@@ -638,6 +767,9 @@ class ValidationDockerManager:
     def __init__(self, logger: logging.Logger, timeout: int = 3600):
         self.logger = logger
         self.timeout = timeout
+        # Same negative filter Phase 1 uses to prove the exploit WORKED — here it
+        # proves the exploit no longer works (output shows explicit failure).
+        self.poc_analyzer = PoCAnalyzer(logger)
         try:
             self.client = docker.from_env()
             self.client.ping()
@@ -652,7 +784,7 @@ class ValidationDockerManager:
         build_context: Path
     ) -> Tuple[bool, Optional[str]]:
         """Build Docker image for patch validation"""
-        self.logger.info(f"Building image for {patch_info.cve_id}/{patch_info.model_name}...")
+        self.logger.info(f"Building image for {patch_info.log_label}...")
         
         try:
             image, build_logs = self.client.images.build(
@@ -681,186 +813,384 @@ class ValidationDockerManager:
             self.logger.error(f"Docker API error: {e}")
             return False, str(e)
     
+    def read_build_verification(self, patch_info: PatchInfo) -> Dict[str, str]:
+        """Read the verification artifacts baked into the patched image:
+        whether the patched object was rebuilt, whether the PoC links
+        against the project build, and the rebuild log tail."""
+        out = {"obj_rebuilt": "", "poc_uses_build": "", "rebuild_log_tail": ""}
+        try:
+            raw = self.client.containers.run(
+                patch_info.image_name,
+                command=("/bin/bash -c '"
+                         "echo \"OBJ:$(cat /tmp/ssd_obj_rebuilt 2>/dev/null)\"; "
+                         "echo \"USES:$(cat /tmp/ssd_poc_uses_build 2>/dev/null)\"; "
+                         "echo ===ERRORS===; cat /tmp/ssd_build_errors 2>/dev/null; "
+                         "echo ===LOG===; tail -60 /tmp/ssd_rebuild.log 2>/dev/null'"),
+                remove=True,
+                network_disabled=True,
+            ).decode("utf-8", errors="replace")
+            head, _, rest = raw.partition("===ERRORS===")
+            errors, _, log_tail = rest.partition("===LOG===")
+            # Prefer the extracted compiler errors; fall back to the raw tail
+            # only when no error lines were found.
+            out["rebuild_log_tail"] = errors.strip() or log_tail.strip()
+            for line in head.splitlines():
+                if line.startswith("OBJ:"):
+                    out["obj_rebuilt"] = line[len("OBJ:"):].strip()
+                elif line.startswith("USES:"):
+                    out["poc_uses_build"] = line[len("USES:"):].strip()
+        except Exception as e:
+            self.logger.warning(f"Could not read build verification artifacts: {e}")
+        return out
+
+    @staticmethod
+    def _extract_result_record(logs: str) -> Dict[str, Any]:
+        """Parse the SSD_RESULT marker and captured PoC output from container
+        logs (same wrapper protocol as Phase 1's DockerManager)."""
+        record: Dict[str, Any] = {"exit_code": None, "category": None,
+                                  "poc_output": None, "marker_present": False}
+        for line in reversed(logs.splitlines()):
+            line = line.strip()
+            if line.startswith("SSD_RESULT:"):
+                record["marker_present"] = True
+                for token in line[len("SSD_RESULT:"):].split():
+                    if "=" in token:
+                        k, _, v = token.partition("=")
+                        record[k] = v
+                if record.get("exit_code") is not None:
+                    try:
+                        record["exit_code"] = int(record["exit_code"])
+                    except (ValueError, TypeError):
+                        record["exit_code"] = None
+                break
+        begin_marker = "--- BEGIN POC OUTPUT ---"
+        end_marker = "--- END POC OUTPUT ---"
+        begin = logs.find(begin_marker)
+        end = logs.find(end_marker)
+        if begin != -1 and end != -1 and end > begin:
+            record["poc_output"] = logs[begin + len(begin_marker):end].strip()
+        else:
+            record["poc_output"] = logs
+        return record
+
     def run_poc(
         self,
         patch_info: PatchInfo,
-        run_timeout: int = 300
-    ) -> Tuple[bool, int, str, Optional[str]]:
+        baseline_exit_code: int,
+        run_timeout: int = 300,
+        needs_privileged: bool = False,
+    ) -> Tuple[bool, Optional[int], str, Dict[str, Any]]:
         """
-        Run the PoC exploit against patched code.
-        
-        Returns:
-            - poc_blocked: True if the PoC was blocked (vulnerability fixed)
-            - exit_code: Container exit code
-            - logs: Container output logs
-            - error_message: Optional error message if execution environment failed
+        Re-run the Phase 1 PoC wrapper against the patched build and decide
+        whether the exploit is genuinely blocked (methodology v2).
+
+        This is the SYMMETRIC counterpart to Phase 1's reproduction proof:
+        Phase 1 records a baseline only when the PoC output proves the exploit
+        WORKED (its negative filter does not flag failure); Phase 3 declares the
+        patch effective only when there is positive evidence the exploit NO
+        LONGER works — not merely a different exit code. Concretely:
+
+        - The same ``PoCAnalyzer.negative_filter`` is run on the patched output;
+          if it flags an explicit failure, that is the strongest "blocked" proof.
+        - A bare exit-code change is only trusted when the patched run exits
+          CLEANLY (< 128). A patched run that still crashes with a signal
+          (>= 128) or is OOM-killed (137) is NOT counted as a fix — the patch
+          likely relocated the fault rather than removing it.
+        - baseline == -1 (DoS/hang sentinel): the patch works iff the patched
+          run COMPLETES (clean exit) instead of hanging or crashing.
+        - A patched run that HANGS where the baseline had a deterministic exit
+          code is a failed patch (a self-inflicted DoS), reported as
+          ``POC_HANG`` and fed back to the loop — never a silent Execution Error.
+
+        Returns ``(poc_blocked, exit_code, logs, verdict)`` where ``verdict`` is
+        a dict the caller maps onto the result:
+            error_message    – set ⇒ genuine harness/infra failure (no verdict)
+            status_override  – explicit ValidationStatus value to force
+            nf_failed/nf_reason/nf_source – negative-filter evidence
+            confidence       – "confirmed" | "exit-change" | "completion-only"
         """
-        self.logger.info(f"Running PoC for {patch_info.cve_id}/{patch_info.model_name}...")
-        
+        self.logger.info(
+            f"Running PoC for {patch_info.log_label} "
+            f"(baseline exit code: {baseline_exit_code})..."
+        )
+
+        container = None
         try:
-            # Run container with resource limits
-            container = self.client.containers.run(
-                patch_info.image_name,
+            _run_kwargs = dict(
                 name=patch_info.container_name,
                 detach=True,
-                mem_limit='2g',
+                mem_limit=_CONTAINER_MEM_LIMIT,
                 cpu_period=100000,
                 cpu_quota=100000,
                 network_disabled=True,
-                remove=False
+                remove=False,
             )
-            
-            # Wait for container to finish
-            result = container.wait(timeout=run_timeout)
-            exit_code = result.get('StatusCode', -1)
-            
-            # Get logs
+            # Mirror Phase 1 exactly: a namespace PoC reproduced under a
+            # privileged container must be re-validated the same way, or it can
+            # never set up its namespace and would look "blocked" spuriously.
+            if needs_privileged:
+                _run_kwargs["privileged"] = True
+                self.logger.info(
+                    f"  Running {patch_info.log_label} container --privileged "
+                    f"(namespace PoC, matching Phase 1)"
+                )
+            try:
+                container = self.client.containers.run(
+                    patch_info.image_name,
+                    security_opt=_CONTAINER_SECURITY_OPT,  # match Phase 1 (userns/syscalls)
+                    **_run_kwargs,
+                )
+            except Exception as sec_exc:
+                # Host may not support the relaxed profile — retry without it so
+                # validation still runs (must mirror Phase 1's fallback).
+                self.logger.warning(
+                    f"Run with relaxed security_opt failed ({sec_exc}); retrying without it."
+                )
+                try:
+                    self.client.containers.get(patch_info.container_name).remove(force=True)
+                except Exception:
+                    pass
+                container = self.client.containers.run(patch_info.image_name, **_run_kwargs)
+
+            timed_out = False
+            try:
+                result = container.wait(timeout=run_timeout)
+                container_status = result.get('StatusCode', -1)
+            except Exception:
+                # requests.exceptions timeout — the patched run is hanging
+                timed_out = True
+                container_status = -1
+                try:
+                    container.kill()
+                except Exception:
+                    pass
+
             logs = container.logs(stdout=True, stderr=True).decode('utf-8', errors='replace')
-            
-            # Clean up container
+
             try:
                 container.remove(force=True)
-            except:
+            except Exception:
                 pass
-            
-            # Interpret results - for a PATCHED system, we expect the PoC to FAIL
-            poc_blocked, error_message = self._interpret_poc_result(patch_info, exit_code, logs)
-            
+
+            record = self._extract_result_record(logs)
+            marker_present = record.get("marker_present", False)
+            poc_exit_code = record.get("exit_code")
+            if poc_exit_code is None and marker_present is False and not timed_out:
+                poc_exit_code = container_status
+            poc_output = record.get("poc_output") if marker_present else logs
+
+            # Negative filter on the PATCHED output — the same evidence Phase 1
+            # uses, read in the opposite direction: a flagged failure here is the
+            # strongest proof the patch defeated the exploit. (Skipped on a
+            # timeout: there is no completed output to read.)
+            nf = {"failed": None, "reason": "not evaluated (timeout)", "source": None}
+            if not timed_out:
+                category = "DOS" if baseline_exit_code == -1 else "OTHER"
+                nf = self.poc_analyzer.negative_filter(
+                    poc_output or "", poc_exit_code, patch_info.cve_id, category
+                )
+
+            def _verdict(**kw) -> Dict[str, Any]:
+                v = {"error_message": None, "status_override": None,
+                     "nf_failed": nf.get("failed"), "nf_reason": nf.get("reason"),
+                     "nf_source": nf.get("source"), "confidence": None}
+                v.update(kw)
+                return v
+
+            crashed = isinstance(poc_exit_code, int) and poc_exit_code >= 128
+            clean_exit = (isinstance(poc_exit_code, int)
+                          and 0 <= poc_exit_code < 128 and poc_exit_code != 137)
+
+            # --- Verdict (evidence-based, mirrors Phase 1; no per-CVE logic) ---
+            if baseline_exit_code == -1:
+                # Phase 1 baseline was a hang (DoS). The fix removes the hang.
+                if timed_out:
+                    self.logger.warning(
+                        f"✗ {patch_info.cve_id}: patched run still hangs "
+                        f"(timeout {run_timeout}s) — DoS still reproduces"
+                    )
+                    return False, None, logs, _verdict()
+                if not marker_present:
+                    return False, poc_exit_code, logs, _verdict(
+                        error_message=("Run wrapper did not complete (no SSD_RESULT "
+                                       "marker) — harness/infrastructure failure, not a verdict"))
+                if crashed:
+                    # Hang became a crash: not a clean fix — exploit still drives
+                    # the vulnerable path into undefined behaviour.
+                    self.logger.warning(
+                        f"✗ {patch_info.cve_id}: DoS hang replaced by a crash "
+                        f"(exit={poc_exit_code}) — not a clean fix")
+                    return False, poc_exit_code, logs, _verdict(
+                        status_override=ValidationStatus.POC_STILL_WORKS.value)
+                confidence = "confirmed" if nf.get("failed") else "completion-only"
+                self.logger.info(
+                    f"✓ {patch_info.cve_id}: patched run completed cleanly "
+                    f"(exit={poc_exit_code}) where baseline hung — PoC blocked "
+                    f"[{confidence}]")
+                return True, poc_exit_code, logs, _verdict(confidence=confidence)
+
+            # Baseline is a real exit code.
+            if timed_out:
+                # The patch turned a deterministic exit into a hang — a failed
+                # patch (self-inflicted DoS), retryable with hang feedback.
+                self.logger.warning(
+                    f"✗ {patch_info.cve_id}: patch caused a hang (timeout "
+                    f"{run_timeout}s) where baseline exited {baseline_exit_code}")
+                return False, None, logs, _verdict(
+                    status_override=ValidationStatus.POC_HANG.value,
+                    error_message=(
+                        f"Patch caused a timeout/hang after {run_timeout}s where the "
+                        f"vulnerable baseline exited deterministically with "
+                        f"{baseline_exit_code} — the patch likely introduced an "
+                        f"infinite loop or deadlock and does not fix the vulnerability"))
+
+            if not marker_present:
+                return False, poc_exit_code, logs, _verdict(
+                    error_message=("Run wrapper did not complete (no SSD_RESULT marker) — "
+                                   "harness/infrastructure failure, not a verdict"))
+
+            if poc_exit_code == 137:
+                # OOM/external SIGKILL — an unreliable signal (Phase 1 rejects it
+                # as a baseline for the same reason). Inconclusive, not a fix.
+                self.logger.warning(
+                    f"✗ {patch_info.cve_id}: patched run SIGKILL'd (exit 137) — "
+                    f"OOM/resource kill, verdict inconclusive")
+                return False, poc_exit_code, logs, _verdict(
+                    error_message=("Patched run was SIGKILL'd (exit 137) — almost "
+                                   "certainly an OOM/resource kill, not a verdict the "
+                                   "patch can be judged on"))
+
+            # The exploit explicitly reported failure ⇒ strongest proof of a fix.
+            if nf.get("failed"):
+                self.logger.info(
+                    f"✓ {patch_info.log_label}: patched output shows the exploit "
+                    f"failed ({nf.get('source')}: {nf.get('reason')}) — PoC blocked [confirmed]")
+                return True, poc_exit_code, logs, _verdict(confidence="confirmed")
+
+            if poc_exit_code == baseline_exit_code:
+                self.logger.warning(
+                    f"✗ {patch_info.log_label}: patched exit={poc_exit_code} == "
+                    f"baseline — vulnerability still reproduces")
+                return False, poc_exit_code, logs, _verdict()
+
+            # Exit code differs from baseline. Trust it ONLY as a clean exit; a
+            # different crash signal means the bug was relocated, not removed.
+            if crashed:
+                self.logger.warning(
+                    f"✗ {patch_info.log_label}: patched run still crashes "
+                    f"(exit={poc_exit_code} vs baseline={baseline_exit_code}) — "
+                    f"patch likely relocated the fault, not a fix")
+                return False, poc_exit_code, logs, _verdict(
+                    status_override=ValidationStatus.POC_STILL_WORKS.value)
+
             self.logger.info(
-                f"PoC result for {patch_info.cve_id}/{patch_info.model_name}: "
-                f"exit_code={exit_code}, poc_blocked={poc_blocked}"
-                + (f", error={error_message}" if error_message else "")
-            )
-            return poc_blocked, exit_code, logs, error_message
-            
-        except ContainerError as e:
-            self.logger.warning(f"Container error: {e}")
-            # Container errors may indicate the exploit was blocked
-            return True, e.exit_status, str(e), None
+                f"✓ {patch_info.log_label}: patched exit={poc_exit_code} differs "
+                f"from baseline={baseline_exit_code} and exits cleanly — PoC blocked "
+                f"[exit-change]")
+            return True, poc_exit_code, logs, _verdict(confidence="exit-change")
+
         except Exception as e:
             self.logger.error(f"Failed to run PoC: {e}")
-            return False, -1, str(e), f"Exception during PoC execution: {e}"
-    
-    def _interpret_poc_result(
-        self,
-        patch_info: PatchInfo,
-        exit_code: int,
-        logs: str
-    ) -> Tuple[bool, Optional[str]]:
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass
+            return False, None, str(e), {
+                "error_message": f"Exception during PoC execution: {e}",
+                "status_override": None, "nf_failed": None, "nf_reason": None,
+                "nf_source": None, "confidence": None}
+
+    def run_intree_test(
+        self, patch_info: PatchInfo, run_timeout: int = 600,
+    ) -> Tuple[bool, str, str, Optional[str]]:
+        """Re-run the in-tree regression test against the patched build.
+
+        Verdict (Option A): the test FAILED on the vulnerable build (Phase 1),
+        so the patch is validated iff it now PASSES. Returns
+        (validated, marker, logs, error) where marker is PASS|FAIL|NORESULT.
         """
-        Interpret PoC results to determine if the vulnerability was fixed.
-        
-        For a PATCHED system:
-        - If the PoC crashes/fails differently than the vulnerability behavior = FIXED
-        - If the PoC shows "safe" behavior = FIXED
-        - If the PoC still shows vulnerability indicators = NOT FIXED
-        
-        Returns:
-            Tuple of (poc_blocked, error_message)
-            - poc_blocked: True if the PoC was blocked (vulnerability fixed)
-            - error_message: Set if there was an environment/execution error
-        """
-        cve_id = patch_info.cve_id
-        logs_lower = logs.lower()
-        
-        # Check for environment/execution errors first
-        # These indicate the test itself failed, not that the vulnerability was fixed
-        if "no such file or directory" in logs_lower:
-            self.logger.warning(
-                f"PoC execution error for {cve_id}: exploit binary not found. "
-                "This indicates a build environment issue, not vulnerability mitigation."
+        self.logger.info(f"Running in-tree test for {patch_info.log_label}...")
+        container = None
+        try:
+            try:
+                self.client.containers.get(patch_info.container_name).remove(force=True)
+            except Exception:
+                pass
+            container = self.client.containers.run(
+                patch_info.image_name, name=patch_info.container_name, detach=True,
+                mem_limit=_CONTAINER_MEM_LIMIT, network_disabled=True, remove=False,
             )
-            return False, "PoC exploit binary not found - build/environment error"
-        
-        if "exec format error" in logs_lower:
-            self.logger.warning(
-                f"PoC execution error for {cve_id}: exec format error. "
-                "The exploit binary may be corrupted or for wrong architecture."
+            timed_out = False
+            try:
+                container.wait(timeout=run_timeout)
+            except Exception:
+                timed_out = True
+                try:
+                    container.kill()
+                except Exception:
+                    pass
+            logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+            marker = "NORESULT"
+            for line in logs.splitlines():
+                if "SSD_TEST_RESULT=" in line:
+                    marker = line.split("SSD_TEST_RESULT=", 1)[1].strip().split()[0]
+            if timed_out:
+                return False, "NORESULT", logs, f"In-tree test timed out after {run_timeout}s"
+            if marker == "PASS":
+                self.logger.info(f"✓ {patch_info.log_label}: in-tree test PASSES — patch validated")
+                return True, marker, logs, None
+            if marker == "FAIL":
+                self.logger.warning(f"✗ {patch_info.log_label}: in-tree test still FAILS — not fixed")
+                return False, marker, logs, None
+            return False, "NORESULT", logs, (
+                "In-tree test produced no PASS/FAIL result (build/run error) — not a verdict"
             )
-            return False, "PoC exploit binary format error - build/environment error"
-        
-        # CVE-specific interpretation
-        if cve_id == "CVE-2012-3480":
-            # For strtod integer overflow, the vulnerable behavior is completing
-            # successfully with a malformed output.
-            # A proper fix would either:
-            # 1. Return an error/different output
-            # 2. Handle the overflow gracefully
-            # 3. Not crash (graceful handling)
-            
-            # If we see normal hex float output, vulnerability may still exist
-            # unless the output indicates proper error handling
-            if exit_code != 0:
-                # Non-zero exit might indicate proper error handling
-                return True, None
-            if "error" in logs_lower or "overflow" in logs_lower:
-                # Error messages indicate the patch caught the issue
-                return True, None
-            if "0x" in logs and "p" in logs:
-                # Still producing hex float output - might still be vulnerable
-                # But need to check if it's the same behavior
-                return False, None
-            return True, None  # Default to assuming patch worked if behavior changed
-            
-        elif cve_id == "CVE-2014-5119":
-            # For heap corruption, signs of crash/corruption indicate unfixed
-            if "corrupted" in logs_lower or "double-linked" in logs_lower:
-                return False, None  # Still vulnerable
-            if exit_code in [134, 139]:  # SIGABRT or SIGSEGV
-                return False, None  # Still crashing = still vulnerable
-            return True, None  # No corruption signs = likely fixed
-            
-        elif cve_id == "CVE-2015-7547":
-            # For stack buffer overflow in getaddrinfo
-            if exit_code == 139:  # SIGSEGV
-                return False, None  # Still crashing
-            if "stack smashing" in logs_lower:
-                return False, None  # Stack protection triggered = still vulnerable
-            if exit_code == 0 or exit_code == 1:
-                # Normal exit (with or without error) = likely fixed
-                return True, None
-            return True, None
-        
-        # Default interpretation
-        # If the program crashes with SIGSEGV/SIGABRT, likely still vulnerable
-        if exit_code in [134, 139]:
-            return False, None
-        
-        return True, None
-    
+        except Exception as e:
+            self.logger.error(f"Failed to run in-tree test: {e}")
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass
+            return False, "NORESULT", str(e), f"Exception during in-tree test: {e}"
+
     def run_sast(
         self,
         patch_info: PatchInfo,
         patched_file: Path
     ) -> List[SASTResult]:
         """
-        Run SAST tools on the patched source code.
-        
-        This runs inside a container that has SAST tools installed.
+        Run SAST tools HOST-SIDE on the patched source file.
+
+        Static analysis of a single C file needs no container: running on
+        the host avoids installing tools into EOL-distro images and keeps
+        tool versions consistent across CVEs. Tools missing from the host
+        are recorded (success=False) and logged, not treated as findings.
         """
         self.logger.info(f"Running SAST analysis for {patch_info.cve_id}/{patch_info.model_name}...")
-        
+
         results = []
-        
-        # Run each SAST tool
         for tool_name, tool_config in SAST_TOOLS.items():
-            result = self._run_sast_tool(patch_info, patched_file, tool_name, tool_config)
+            result = self._run_sast_tool(patched_file, tool_name, tool_config)
             results.append(result)
-        
         return results
-    
+
     def _run_sast_tool(
         self,
-        patch_info: PatchInfo,
         patched_file: Path,
         tool_name: str,
         tool_config: Dict[str, Any]
     ) -> SASTResult:
-        """Run a single SAST tool"""
+        """Run a single SAST tool on the host via subprocess."""
         import time
         sast_start_time = time.time()
         self.logger.debug(f"Running {tool_name}...")
-        
+
         result = SASTResult(
             tool=tool_name,
             success=False,
@@ -868,41 +1198,34 @@ class ValidationDockerManager:
             error_message=None,
             raw_output=""
         )
-        
-        try:
-            # Run SAST in the existing container image
-            sast_container_name = f"sast-{patch_info.container_name}-{tool_name}"
-            
-            # Build the SAST command
-            run_cmd = tool_config["run_cmd"].format(file="/sast_results/patched_source.c")
-            
-            # Run container with SAST command
-            container = self.client.containers.run(
-                patch_info.image_name,
-                command=f"/bin/bash -c '{run_cmd}'",
-                name=sast_container_name,
-                detach=True,
-                remove=False
+
+        # Resolve the command: primary binary, else fallback (e.g. python -m)
+        cmd_template = None
+        if shutil.which(tool_config["cmd"][0]):
+            cmd_template = tool_config["cmd"]
+        elif tool_config.get("fallback_cmd"):
+            cmd_template = tool_config["fallback_cmd"]
+
+        if cmd_template is None:
+            result.error_message = (
+                f"{tool_name} not installed on host — skipped "
+                f"(install it to enable this check)"
             )
-            
-            # Wait for completion
-            exit_result = container.wait(timeout=120)
-            exit_code = exit_result.get('StatusCode', -1)
-            
-            # Get output
-            output = container.logs(stdout=True, stderr=True).decode('utf-8', errors='replace')
+            self.logger.warning(result.error_message)
+            return result
+
+        cmd = [arg.format(file=str(patched_file)) for arg in cmd_template]
+
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=120
+            )
+            output = (proc.stdout or "") + (proc.stderr or "")
             result.raw_output = output
-            
-            # Clean up
-            try:
-                container.remove(force=True)
-            except:
-                pass
-            
-            # Parse findings based on tool
+
             result.findings = self._parse_sast_output(tool_name, output)
             result.success = True
-            
+
             # Count by severity
             for finding in result.findings:
                 severity = finding.severity.lower()
@@ -914,19 +1237,22 @@ class ValidationDockerManager:
                     result.medium_count += 1
                 else:
                     result.low_count += 1
-            
+
             sast_duration = time.time() - sast_start_time
             self.logger.debug(
                 f"{tool_name}: {len(result.findings)} findings "
                 f"(C:{result.critical_count} H:{result.high_count} M:{result.medium_count} L:{result.low_count}) "
                 f"in {sast_duration:.2f}s"
             )
-            
+
+        except subprocess.TimeoutExpired:
+            result.error_message = f"{tool_name} timed out after 120s"
+            self.logger.warning(result.error_message)
         except Exception as e:
             sast_duration = time.time() - sast_start_time
             self.logger.warning(f"SAST tool {tool_name} failed after {sast_duration:.2f}s: {e}")
             result.error_message = str(e)
-        
+
         return result
     
     def _parse_sast_output(self, tool_name: str, output: str) -> List[SASTFinding]:
@@ -937,8 +1263,6 @@ class ValidationDockerManager:
             findings = self._parse_cppcheck_output(output)
         elif tool_name == "flawfinder":
             findings = self._parse_flawfinder_output(output)
-        elif tool_name == "rats":
-            findings = self._parse_rats_output(output)
         
         return findings
     
@@ -1015,38 +1339,6 @@ class ValidationDockerManager:
         
         return findings
     
-    def _parse_rats_output(self, output: str) -> List[SASTFinding]:
-        """Parse RATS XML output"""
-        findings = []
-        
-        if "RATS not available" in output:
-            return findings
-        
-        try:
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(output)
-            
-            for vuln in root.findall('.//vulnerability'):
-                severity = vuln.find('severity')
-                severity_text = severity.text if severity is not None else "unknown"
-                
-                message_elem = vuln.find('message')
-                message = message_elem.text if message_elem is not None else ""
-                
-                line_elem = vuln.find('line')
-                line = int(line_elem.text) if line_elem is not None else None
-                
-                findings.append(SASTFinding(
-                    tool="rats",
-                    severity=severity_text.lower(),
-                    message=message,
-                    line=line
-                ))
-        except Exception:
-            pass
-        
-        return findings
-    
     def cleanup_image(self, patch_info: PatchInfo):
         """Remove Docker image"""
         try:
@@ -1066,51 +1358,6 @@ class ValidationDockerManager:
         except:
             pass
 
-
-# =============================================================================
-# PoC Manager
-# =============================================================================
-
-class PoCManager:
-    """Manages PoC exploit files"""
-    
-    def __init__(self, exploits_dir: Path, logger: logging.Logger):
-        self.exploits_dir = exploits_dir
-        self.logger = logger
-    
-    def find_poc(self, cve_id: str) -> Optional[Path]:
-        """Find PoC file for a CVE"""
-        possible_paths = [
-            self.exploits_dir / cve_id / "exploit.c",
-            self.exploits_dir / cve_id / "poc.c",
-            self.exploits_dir / cve_id.lower() / "exploit.c",
-            self.exploits_dir / f"{cve_id}.c",
-            self.exploits_dir / f"{cve_id.lower()}.c",
-        ]
-        
-        for path in possible_paths:
-            if path.exists():
-                self.logger.debug(f"Found PoC for {cve_id} at: {path}")
-                return path
-        
-        self.logger.warning(f"No PoC found for {cve_id}")
-        return None
-    
-    def copy_poc_to_build_context(self, poc_path: Path, build_context: Path) -> bool:
-        """Copy PoC file to Docker build context"""
-        try:
-            dest = build_context / "poc_exploit.c"
-            shutil.copy2(poc_path, dest)
-            self.logger.debug(f"Copied PoC to: {dest}")
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to copy PoC: {e}")
-            return False
-
-
-# =============================================================================
-# Report Generator
-# =============================================================================
 
 class ValidationReportGenerator:
     """Generates validation reports"""
@@ -1296,13 +1543,18 @@ class ValidationPipeline:
         # Setup logging
         self.logger = setup_logging(self.logs_dir, args.verbose)
         
+        # Phase 1 image layout + manifest (methodology v2)
+        self.phase1_layout = _resolve_phase1_layout(self.base_dir)
+
         # Initialize components
         self.csv_parser = CSVParser(self.csv_path, self.logger)
         self.patch_discovery = PatchDiscovery(self.patches_dir, self.logger)
-        self.dockerfile_gen = PatchedDockerfileGenerator(self.logger)
+        self.dockerfile_gen = PatchedDockerfileGenerator(self.logger, self.phase1_layout)
         self.docker_mgr = ValidationDockerManager(self.logger, self.build_timeout)
-        self.poc_mgr = PoCManager(self.exploits_dir, self.logger)
         self.report_gen = ValidationReportGenerator(self.results_dir, self.logger)
+        self.manifest = ImageManifest(
+            self.phase1_layout["image_manifest_path"], self.logger
+        )
     
     def run(self):
         """Execute the validation pipeline"""
@@ -1363,6 +1615,47 @@ class ValidationPipeline:
         self.logger.info(f"Results saved to: {report_path}")
         self.logger.info("=" * 60)
     
+    def _apply_sast(self, patch_info: "PatchInfo", result: "ValidationResult") -> None:
+        """Run SAST on the patched file and set result.sast_* + final status.
+
+        Shared by the in-tree validation path; mirrors the standard Step 7 logic
+        (SUCCESS only when the dynamic check passed AND no critical/high findings).
+        """
+        if self.skip_sast:
+            result.sast_passed = True
+            result.sast_results = [{"status": "skipped"}]
+        else:
+            sast_results = self.docker_mgr.run_sast(patch_info, patch_info.patched_file)
+            result.sast_results = []
+            result.sast_findings = []
+            total_critical = total_high = 0
+            for sr in sast_results:
+                result.sast_results.append({
+                    "tool": sr.tool, "success": sr.success,
+                    "critical_count": sr.critical_count, "high_count": sr.high_count,
+                    "medium_count": sr.medium_count, "low_count": sr.low_count,
+                    "findings_count": len(sr.findings), "error": sr.error_message,
+                })
+                for f in sr.findings:
+                    result.sast_findings.append({
+                        "tool": f.tool, "severity": f.severity, "message": f.message,
+                        "line": f.line, "column": f.column, "cwe_id": f.cwe_id,
+                        "file_path": f.file_path,
+                    })
+                total_critical += sr.critical_count
+                total_high += sr.high_count
+            result.sast_passed = (total_critical == 0 and total_high == 0)
+            if not result.sast_passed and result.status != ValidationStatus.POC_STILL_WORKS.value:
+                if result.status not in (ValidationStatus.EXECUTION_ERROR.value,
+                                         ValidationStatus.BUILD_ERROR.value):
+                    result.status = ValidationStatus.SAST_FAILED.value
+                    result.error_message = (
+                        f"SAST found {total_critical} critical and {total_high} high severity issues"
+                    )
+        if result.poc_blocked and result.sast_passed:
+            result.status = ValidationStatus.SUCCESS.value
+            self.logger.info(f"✓✓ VALIDATION SUCCESSFUL for {patch_info.log_label}")
+
     def _validate_patch(
         self,
         patch_info: PatchInfo,
@@ -1417,61 +1710,166 @@ class ValidationPipeline:
                 result.error_message = "Patch has syntax errors (marked invalid in Phase 2)"
                 return result
             
-            # Step 2: Find PoC for this CVE
-            poc_path = self.poc_mgr.find_poc(patch_info.cve_id)
-            if not poc_path:
-                result.status = ValidationStatus.POC_NOT_FOUND.value
-                result.error_message = f"No PoC found in {self.exploits_dir}"
+            # Step 2: Look up the Phase 1 baseline for this CVE (methodology
+            # v2): the built CVE image tag + the deterministic baseline exit
+            # code. Without them there is nothing to derive from or compare
+            # against — the CVE was never reproduced.
+            manifest_entry = self.manifest.get(patch_info.cve_id)
+            baseline_exit_code = (manifest_entry or {}).get("baseline_exit_code")
+            cve_image_tag = (manifest_entry or {}).get("tag")
+            if (manifest_entry is None or baseline_exit_code is None
+                    or not cve_image_tag
+                    or manifest_entry.get("needs_manual_revision")):
+                result.status = ValidationStatus.NO_BASELINE.value
+                result.error_message = (
+                    f"No Phase 1 baseline for {patch_info.cve_id} (not reproduced, "
+                    f"manual revision, or image not built) — cannot validate dynamically"
+                )
                 return result
-            
-            # Step 3: Generate Dockerfile
+            result.baseline_exit_code = baseline_exit_code
+
+            # Option A: in-tree regression-test CVEs validate differently — rebuild
+            # the Phase 1 in-tree image with the patch and re-run the project's OWN
+            # test (it FAILED on the vulnerable build, so PASS = patch fixed it).
+            # Self-contained branch that returns before the standard exit-code path.
+            if vuln_info.is_intree_test:
+                ctx = self.dockerfile_gen.generate_intree(
+                    patch_info, vuln_info, cve_image_tag, self.validation_builds_dir
+                )
+                if ctx is None:
+                    result.status = ValidationStatus.UNKNOWN_ERROR.value
+                    result.error_message = "No vulnerable file path recorded — cannot apply patch"
+                    return result
+                shutil.copy2(patch_info.patched_file, ctx / "patched_source.c")
+                build_success, build_logs = self.docker_mgr.build_image(patch_info, ctx)
+                result.build_logs = build_logs
+                if not build_success:
+                    # The image itself failed to build (infrastructure / the
+                    # project build script hard-erroring). A merely non-compiling
+                    # patch does NOT land here — the build script is tolerant, so
+                    # it surfaces as the test not PASSing below (project-agnostic:
+                    # no compiler/object-file assumptions in the validator).
+                    result.status = ValidationStatus.BUILD_ERROR.value
+                    result.error_message = "Patched in-tree image failed to build"
+                    result.poc_output = build_logs
+                    return result
+                result.build_success = True
+                validated, marker, test_logs, test_err = self.docker_mgr.run_intree_test(
+                    patch_info, max(self.run_timeout, 600)
+                )
+                result.poc_blocked = validated
+                result.poc_exit_code = 0 if validated else 1
+                result.poc_output = test_logs
+                if test_err:
+                    result.status = ValidationStatus.EXECUTION_ERROR.value
+                    result.error_message = test_err
+                    result.poc_blocked = False
+                    self.logger.error(f"✗ in-tree test error for {patch_info.log_label}: {test_err}")
+                elif not validated:
+                    result.status = ValidationStatus.POC_STILL_WORKS.value
+                    result.error_message = "In-tree regression test still FAILS on the patched build"
+                # SAST + final status (shared helper)
+                self._apply_sast(patch_info, result)
+                return result
+
+            # Step 3: Generate Dockerfile (derived FROM the Phase 1 CVE image)
             build_context = self.dockerfile_gen.generate(
-                patch_info, vuln_info, self.validation_builds_dir
+                patch_info, vuln_info, cve_image_tag, self.validation_builds_dir
             )
-            
-            # Step 4: Copy patch and PoC to build context
+            if build_context is None:
+                result.status = ValidationStatus.UNKNOWN_ERROR.value
+                result.error_message = "No vulnerable file path recorded — cannot apply patch"
+                return result
+
+            # Step 4: Copy patch into build context (the PoC and wrapper are
+            # already inside the parent image)
             patch_dest = build_context / "patched_source.c"
             shutil.copy2(patch_info.patched_file, patch_dest)
-            
-            if not self.poc_mgr.copy_poc_to_build_context(poc_path, build_context):
-                result.status = ValidationStatus.UNKNOWN_ERROR.value
-                result.error_message = "Failed to copy PoC to build context"
-                return result
-            
-            # Step 5: Build Docker image with patched code
+
+            # Step 5: Build patched image (incremental rebuild on top of the
+            # Phase 1 image; a failure here is the patch failing to compile)
             build_success, build_logs = self.docker_mgr.build_image(patch_info, build_context)
             result.build_logs = build_logs  # Store for feedback loop
-            
+
             if not build_success:
                 result.status = ValidationStatus.BUILD_ERROR.value
-                result.error_message = "Failed to build Docker image with patched code"
+                result.error_message = "Patched build failed (patch likely does not compile)"
                 result.poc_output = build_logs
                 return result
-            
+
+            # Step 5b: Verify the rebuild artifacts. The rebuild itself is
+            # tolerant (-k, matching Phase 1), so patch-specific compile
+            # failure shows up as the patched object NOT being rebuilt.
+            verify = self.docker_mgr.read_build_verification(patch_info)
+
+            if verify.get("obj_rebuilt", "") == "":
+                result.status = ValidationStatus.BUILD_ERROR.value
+                result.error_message = (
+                    "Patched source failed to compile (its object file was not "
+                    "rebuilt) — see build_logs for compiler output"
+                )
+                result.build_logs = verify.get("rebuild_log_tail") or build_logs
+                result.poc_output = result.build_logs
+                return result
+
+            if verify.get("poc_uses_build") == "no":
+                # The PoC does not exercise the project build at runtime (the
+                # project loader cannot map the build's libc) — a source patch
+                # cannot change its behavior, so dynamic validation cannot
+                # assert anything. Non-retryable environment condition.
+                result.status = ValidationStatus.EXECUTION_ERROR.value
+                result.error_message = (
+                    "PoC does not exercise the project build at runtime (project "
+                    "loader could not map the build's libc) — dynamic validation "
+                    "is not meaningful for this CVE; needs Phase 1 build fix"
+                )
+                self.logger.warning(
+                    f"✗ {patch_info.cve_id}: {result.error_message}"
+                )
+                return result
+
             result.build_success = True
-            
-            # Step 6: Run PoC against patched code (Dynamic Check A)
-            poc_blocked, exit_code, poc_logs, poc_error = self.docker_mgr.run_poc(
-                patch_info, self.run_timeout
+
+            # Step 6: Re-run PoC and compare with baseline (Dynamic Check A).
+            # Mirror Phase 1's container privilege for namespace PoCs.
+            poc_blocked, exit_code, poc_logs, verdict = self.docker_mgr.run_poc(
+                patch_info, baseline_exit_code, self.run_timeout,
+                needs_privileged=bool((manifest_entry or {}).get("needs_privileged", False)),
             )
-            
+
             result.poc_blocked = poc_blocked
             result.poc_exit_code = exit_code
             result.poc_output = poc_logs
-            
-            # Check for environment errors (e.g., exploit binary not found)
-            if poc_error:
+            # Record the negative-filter evidence behind the verdict (mirrors the
+            # proof Phase 1 stores when establishing the baseline).
+            result.nf_failed = verdict.get("nf_failed")
+            result.nf_reason = verdict.get("nf_reason")
+            result.nf_source = verdict.get("nf_source")
+            result.poc_proof_confidence = verdict.get("confidence")
+
+            poc_error = verdict.get("error_message")
+            status_override = verdict.get("status_override")
+            # Check for environment/harness errors (no verdict possible)
+            if poc_error and not status_override:
                 result.status = ValidationStatus.EXECUTION_ERROR.value
                 result.error_message = poc_error
                 result.poc_blocked = False  # Ensure not counted as success
                 self.logger.error(f"✗ PoC execution error for {patch_info.cve_id}/{patch_info.model_name}: {poc_error}")
                 # Continue to collect SAST results for complete feedback
+            elif status_override:
+                # An explicit verdict status (e.g. patch caused a hang, or the
+                # patch only relocated the crash) — retryable patch failure, fed
+                # back to the loop rather than dropped as an environment error.
+                result.status = status_override
+                result.error_message = poc_error or "PoC exploit still triggers the vulnerability"
+                result.poc_blocked = False
+                self.logger.warning(f"✗ {status_override} for {patch_info.log_label}: {result.error_message}")
             elif not poc_blocked:
                 # PoC still works - vulnerability not fixed
                 result.status = ValidationStatus.POC_STILL_WORKS.value
                 result.error_message = "PoC exploit still triggers the vulnerability"
                 # Don't return early - continue to collect SAST results for complete feedback
-                self.logger.warning(f"✗ PoC still works for {patch_info.cve_id}/{patch_info.model_name}")
+                self.logger.warning(f"✗ PoC still works for {patch_info.log_label}")
             else:
                 self.logger.info(f"✓ PoC blocked for {patch_info.cve_id}/{patch_info.model_name}")
             
@@ -1518,14 +1916,18 @@ class ValidationPipeline:
                 result.sast_passed = (total_critical == 0 and total_high == 0)
                 
                 if not result.sast_passed:
-                    # Set status but don't return - we've already collected all data
-                    if result.status != ValidationStatus.POC_STILL_WORKS.value:
+                    # Set status but don't return - we've already collected all data.
+                    # A dynamic-check failure (still works / hang) is more
+                    # important than SAST and must not be masked by it.
+                    _dynamic_fail = (ValidationStatus.POC_STILL_WORKS.value,
+                                     ValidationStatus.POC_HANG.value)
+                    if result.status not in _dynamic_fail:
                         result.status = ValidationStatus.SAST_FAILED.value
                         result.error_message = f"SAST found {total_critical} critical and {total_high} high severity issues"
                     else:
-                        # Both PoC and SAST failed
+                        # Both the dynamic check and SAST failed
                         result.error_message = (
-                            f"PoC still triggers vulnerability AND "
+                            f"{result.error_message} AND "
                             f"SAST found {total_critical} critical, {total_high} high severity issues"
                         )
                     self.logger.warning(f"✗ SAST failed for {patch_info.cve_id}/{patch_info.model_name}")
@@ -1566,7 +1968,8 @@ class ValidationPipeline:
         model_name: str,
         vuln_info: VulnerabilityInfo,
         attempt_number: int = 1,
-        is_retry: bool = False
+        is_retry: bool = False,
+        generation_model: str = ""
     ) -> ValidationResult:
         """
         Validate a single patch file directly (for feedback loop retry).
@@ -1585,8 +1988,9 @@ class ValidationPipeline:
         Returns:
             ValidationResult with detailed failure context
         """
-        self.logger.info(f"[FEEDBACK LOOP] Validating retry patch #{attempt_number} for {cve_id}/{model_name}")
-        
+        _gen = f" (patch by {generation_model})" if generation_model and generation_model != model_name else ""
+        self.logger.info(f"[FEEDBACK LOOP] Validating retry patch #{attempt_number} for {cve_id}/{model_name}{_gen}")
+
         # Create PatchInfo for the retry patch
         patch_info = PatchInfo(
             cve_id=cve_id,
@@ -1596,7 +2000,8 @@ class ValidationPipeline:
             function_only_file=None,
             response_json=None,
             is_valid=True,  # Assume valid since it passed syntax check in generator
-            original_filepath=vuln_info.file_path
+            original_filepath=vuln_info.file_path,
+            generation_model=generation_model
         )
         
         return self._validate_patch(

@@ -12,6 +12,48 @@ Automated vulnerability reproduction pipeline for glibc CVEs. The pipeline is co
 | **3 – Patch Validation** | `patch_validator.py` | Apply patches inside Docker and validate via test execution. |
 | **4 – Reporting** | `reporter.py` | Collect results and generate final report. |
 
+## Host requirements (kernel) — important for old-glibc CVEs
+
+Phase 1 reproduces a CVE by building the project from source and running its
+regression test against that build. For glibc this exposes a **host-kernel
+constraint** that is easy to miss because the pipeline runs in Docker.
+
+**Docker isolates userspace, not the kernel.** Every container shares the *host's*
+single Linux kernel — there is no kernel inside an image. The pipeline can (and does)
+build each CVE on an era-matched Ubuntu userspace (Gate B picks the base from the
+checked-out tree's glibc version), but the kernel underneath is always the host's.
+
+**The incompatibility is one-directional:**
+
+| Combination | Result |
+|---|---|
+| New glibc on an **old** kernel | ✅ works (glibc is backward-compatible down to a low minimum kernel) |
+| Old glibc on a **new** kernel | ❌ the dynamic loader (`ld.so`) **SIGSEGVs at process startup** |
+
+The crash is in glibc's loader ↔ kernel interface: old glibc (≤ ~2.34) resolves a
+vDSO symbol (e.g. `__vdso_clock_gettime`) against a newer kernel's vDSO than it was
+written for, and faults in `setup_vdso_pointers` *before* the test's `main()` runs.
+The exit code looks like a test failure but has nothing to do with the CVE. Observed
+cutoff: glibc **≤ 2.34 crash on kernel 5.15 / 6.8**; **≥ 2.36 work**. (Note: CVE
+*date* is not a proxy for glibc version — e.g. CVE-2024-2961 is a backport to the
+glibc 2.31 release branch, so it is "old glibc" despite the recent ID.)
+
+**Gate A (runtime sanity check)** detects this automatically: before recording an
+in-tree baseline it verifies the *built* runtime can start a trivial process; if not,
+the CVE is routed to manual revision instead of recording a false "reproduced."
+
+**Deployment recommendation:** to reproduce old-glibc CVEs, run the pipeline on a host
+with an **era-appropriate (older) kernel** — e.g. **Ubuntu 20.04 (kernel 5.4)**. Because
+the incompatibility is one-directional, a single old-kernel host runs **both** old and
+new glibc, so no per-CVE host routing is required. On a modern-kernel host (5.15 / 6.8)
+the old-glibc CVEs are correctly flagged by Gate A but cannot be reproduced. This is a
+host/infra choice, not a code change — the pipeline itself stays project-agnostic.
+
+*Caveats (kernel-independent, not fixed by an older host):* tests that pass on the
+vulnerable build (non-discriminating / wrong fixing commit), CVEs with no PoC or no
+recorded fixing commit, and the very oldest glibc (2.15/2.19) which may need a kernel
+older than 5.4.
+
 ## Quick-Start
 
 ```bash

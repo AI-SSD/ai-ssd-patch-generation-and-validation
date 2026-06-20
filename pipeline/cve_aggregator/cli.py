@@ -111,7 +111,9 @@ def main(argv=None) -> int:
         skip_modules=args.skip,
     )
     ctx = orchestrator.run()
-    return 0
+    # Non-zero exit when a module aborted the pipeline, so Phase 0 is reported as
+    # FAILED (not "success") and downstream phases / the master pipeline halt.
+    return 1 if ctx.get("_pipeline_failed") else 0
 
 
 if __name__ == "__main__":

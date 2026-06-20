@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List
-from .config import PipelineConfig
+from .config import PipelineConfig, cfg_section
 from .models import FeedbackLoopResult, PatchStatus
 
 class IterativeFeedbackLoop:
@@ -24,12 +24,34 @@ class IterativeFeedbackLoop:
         self.max_retries = config.max_retries
         self.timeout = config.feedback_loop_timeout  # Total timeout for feedback loop
         self.feedback_results: List[FeedbackLoopResult] = []
-        
+
+        # Per-attempt model escalation (feedback_loop.models_by_attempt in
+        # config.yaml). Keys are attempt numbers (as strings), values are model
+        # ids. Empty dict ⇒ every attempt uses the provider default model.
+        fb_cfg = cfg_section("feedback_loop", config.base_dir)
+        self.models_by_attempt: Dict[str, str] = {
+            str(k): str(v)
+            for k, v in (fb_cfg.get("models_by_attempt") or {}).items()
+            if v
+        }
+
         # Import required modules
         self._import_modules()
-        
+
         # Initialize logger
         self.logger = logging.getLogger('pipeline.feedback_loop')
+        if self.models_by_attempt:
+            self.logger.info(
+                f"[FEEDBACK LOOP] Per-attempt model schedule: {self.models_by_attempt}"
+            )
+
+    def _model_for_attempt(self, attempt_number: int) -> Any:
+        """Return the configured model id for *attempt_number*, or None.
+
+        None means "use the provider default" (OPENAI_MODEL / the loop model),
+        which is what patch_generator falls back to when generation_model is None.
+        """
+        return self.models_by_attempt.get(str(attempt_number))
     
     def _import_modules(self):
         """Import Phase 2 and Phase 3 modules dynamically."""
@@ -95,6 +117,9 @@ class IterativeFeedbackLoop:
             "start_time": start_time.isoformat(),
             "end_time": initial_end_time,
             "duration_seconds": initial_duration,
+            # Attempt 1 was produced by Phase 2 using the attempt-1 model (or the
+            # base model when no schedule is configured).
+            "generation_model": self._model_for_attempt(1),
         })
         
         # Check if initial validation passed
@@ -136,20 +161,26 @@ class IterativeFeedbackLoop:
                 return result
             
             result.total_attempts = retry + 1
-            
-            self.logger.info(f"[RETRY {retry}/{self.max_retries}] {cve_id}/{model_name}")
-            
+
+            # Resolve the model for THIS attempt (attempt number = retry + 1).
+            attempt_model = self._model_for_attempt(retry + 1)
+            self.logger.info(
+                f"[RETRY {retry}/{self.max_retries}] {cve_id}/{model_name}"
+                + (f" using model {attempt_model}" if attempt_model else "")
+            )
+
             # Extract failure context from previous validation
             failure_context = current_validation.to_failure_context()
-            
-            # Generate new patch with feedback
+
+            # Generate new patch with feedback (per-attempt model when configured)
             new_patch_result = self._generate_patch_with_feedback(
                 cve_id=cve_id,
                 model_name=model_name,
                 vuln_data=vuln_data,
                 previous_patch=previous_patch,
                 failure_context=failure_context,
-                attempt_number=retry + 1
+                attempt_number=retry + 1,
+                generation_model=attempt_model
             )
             
             if not new_patch_result.get("success"):
@@ -166,6 +197,7 @@ class IterativeFeedbackLoop:
                     "start_time": attempt_start_time.isoformat(),
                     "end_time": attempt_end_time.isoformat(),
                     "duration_seconds": attempt_duration,
+                    "generation_model": new_patch_result.get("generation_model", attempt_model),
                 })
                 continue
             
@@ -175,7 +207,8 @@ class IterativeFeedbackLoop:
                 model_name=model_name,
                 patch_file=Path(new_patch_result["patch_file"]),
                 vuln_data=vuln_data,
-                attempt_number=retry + 1
+                attempt_number=retry + 1,
+                generation_model=new_patch_result.get("generation_model") or attempt_model
             )
             
             # Calculate attempt duration
@@ -194,6 +227,7 @@ class IterativeFeedbackLoop:
                 "end_time": attempt_end_time.isoformat(),
                 "duration_seconds": attempt_duration,
                 "patch_file": new_patch_result.get("patch_file"),
+                "generation_model": new_patch_result.get("generation_model"),
                 "generation_duration_seconds": new_patch_result.get("total_duration_ns", 0) / 1e9 if new_patch_result.get("total_duration_ns") else None,
                 "validation_duration_seconds": new_validation.execution_time_seconds,
             })
@@ -224,10 +258,21 @@ class IterativeFeedbackLoop:
             # Update for next iteration
             current_validation = new_validation
             previous_patch = new_patch_result.get("patched_function", previous_patch)
-            
+
             self.logger.warning(
                 f"Retry #{retry} failed for {cve_id}/{model_name}: {new_validation.status}"
             )
+
+            # Environment conditions cannot be fixed by regenerating the
+            # patch — abort the retry cycle instead of burning LLM calls.
+            if new_validation.status in ("No Phase 1 Baseline", "Execution Error",
+                                         "Patch Not Found"):
+                self.logger.warning(
+                    f"Aborting retry cycle for {cve_id}/{model_name}: "
+                    f"'{new_validation.status}' is an environment condition that "
+                    f"patch regeneration cannot fix"
+                )
+                break
         
         # All retries exhausted
         final_end_time = datetime.now()
@@ -270,10 +315,14 @@ class IterativeFeedbackLoop:
         vuln_data: Dict[str, Any],
         previous_patch: str,
         failure_context: Dict[str, Any],
-        attempt_number: int
+        attempt_number: int,
+        generation_model: Any = None
     ) -> Dict[str, Any]:
-        """Generate a new patch using failure feedback."""
-        
+        """Generate a new patch using failure feedback.
+
+        ``generation_model`` (when set) selects a per-attempt model for the
+        OpenAI provider; None falls back to the provider default.
+        """
         return self.patch_generator.generate_patch_with_feedback(
             cve_id=cve_id,
             function_name=vuln_data['F_NAME'],
@@ -284,7 +333,8 @@ class IterativeFeedbackLoop:
             previous_patch=previous_patch,
             failure_context=failure_context,
             attempt_number=attempt_number,
-            output_dir=self.config.base_dir / "patches"
+            output_dir=self.config.base_dir / "patches",
+            generation_model=generation_model
         )
     
     def _validate_retry_patch(
@@ -293,7 +343,8 @@ class IterativeFeedbackLoop:
         model_name: str,
         patch_file: Path,
         vuln_data: Dict[str, Any],
-        attempt_number: int
+        attempt_number: int,
+        generation_model: Any = None
     ) -> Any:
         """Validate a retry patch."""
         
@@ -336,9 +387,10 @@ class IterativeFeedbackLoop:
             model_name=model_name,
             vuln_info=vuln_info,
             attempt_number=attempt_number,
-            is_retry=True
+            is_retry=True,
+            generation_model=str(generation_model) if generation_model else ""
         )
-    
+
     def _promote_successful_patch(
         self,
         cve_id: str,
@@ -350,9 +402,15 @@ class IterativeFeedbackLoop:
         Copy successful retry patch to mark it as the final successful patch.
         Also create a metadata file indicating the successful attempt.
         """
-        model_safe = model_name.replace(":", "_").replace(".", "_")
+        # Must match the directory Phase 2 actually created. patch_generator's
+        # sanitize_model_name only replaces ':' and '/', NOT '.', so a model like
+        # "gpt-4.1-mini" lives in patches/<cve>/gpt-4.1-mini. Sanitizing dots here
+        # pointed at a non-existent "gpt-4_1-mini" dir and crashed promotion on a
+        # genuine success. Reuse the canonical function and create defensively.
+        model_safe = self.patch_generator.sanitize_model_name(model_name)
         main_patch_dir = self.config.base_dir / "patches" / cve_id / model_safe
-        
+        main_patch_dir.mkdir(parents=True, exist_ok=True)
+
         # Create success marker file
         success_marker = main_patch_dir / "feedback_loop_success.json"
         with open(success_marker, 'w') as f:

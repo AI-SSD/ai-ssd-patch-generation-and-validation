@@ -125,13 +125,24 @@ class MasterPipeline:
         # Generate summary
         self._generate_summary()
         
-        # Print results table
-        print_summary_table(self.results)
-        
-        # Print feedback loop summary if applicable
+        # Print the detailed feedback loop summary FIRST, then the execution
+        # summary table (which also carries a condensed Feedback Loop row), so
+        # the table reads as the final at-a-glance scorecard.
+        feedback_row = None
         if self.feedback_results:
             self._print_feedback_loop_summary()
-        
+            feedback_row = {
+                "total": len(self.feedback_results),
+                "successful": sum(
+                    1 for r in self.feedback_results
+                    if r.final_status == PatchStatus.SUCCESS
+                ),
+            }
+
+        # Print results table with per-phase success numbers/% + feedback row
+        print_summary_table(self.results, metrics=self._compute_phase_metrics(),
+                            feedback=feedback_row)
+
         # Final status
         total_duration = (self.end_time - self.start_time).total_seconds()
         status_msg = "COMPLETED SUCCESSFULLY" if success else "COMPLETED WITH FAILURES"
@@ -165,11 +176,24 @@ class MasterPipeline:
         if not pending_cves:
             logger.info("No CVEs require manual verification - proceeding immediately")
             return
-        
+
+        # Auto-skip: skip the prompt entirely and exclude every pending CVE from
+        # Phase 1+ (same as choosing [S]). For unattended runs. These PoCs failed
+        # syntax repair, so excluding them is the honest default - we never
+        # auto-approve broken PoCs into Phase 1.
+        if getattr(self.config, "manual_verify_auto_skip", False):
+            self.skipped_cves.update(pending_cves)
+            logger.warning(
+                "Auto-skip enabled (manual_verification.auto_skip / --auto-skip-manual): "
+                "excluding %d CVE(s) still pending manual review: %s",
+                len(pending_cves), ", ".join(sorted(pending_cves))
+            )
+            return
+
         # Show syntax reports flagged for manual supervision
         self._generate_missing_reports(csv_path, pending_cves)
         self._show_syntax_reports(pending_cves)
-        
+
         # Interactive loop
         while True:
             print(f"\n{'='*70}")
@@ -462,23 +486,37 @@ class MasterPipeline:
                         logger.warning(f"Could not remove {stale.name}: {exc}")
     
     def _get_pending_manual_cves(self, csv_path: Path) -> List[str]:
-        """Read CSV and return CVE IDs where manual_review_required=True and manual_verified!=done."""
-        pending = []
+        """Return CVE IDs that have NO runnable PoC — every PoC is pending review.
+
+        A CVE is only pending when *all* of its PoCs need manual review. If it
+        has at least one runnable PoC (manual_review_required not set / already
+        verified, with a poc_path), Phase 1 can run that PoC, so the CVE is NOT
+        excluded — even if sibling PoCs (e.g. unrunnable Metasploit modules) are
+        still flagged.
+        """
+        flagged_pending: List[str] = []   # CVEs with >=1 manual-pending PoC (in order)
+        has_runnable: set = set()         # CVEs with >=1 runnable PoC
         try:
             with open(csv_path, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
+                    cve_id = row.get('CVE', '').strip()
+                    if not cve_id:
+                        continue
+                    if self.config.cves and cve_id not in self.config.cves:
+                        continue
                     manual_required = str(row.get('manual_review_required', '')).strip().lower()
                     manual_verified = str(row.get('manual_verified', '')).strip().lower()
-                    cve_id = row.get('CVE', '').strip()
-                    
+                    poc_path = row.get('poc_path', '').strip()
+
                     if manual_required in ('true', '1', 'yes') and manual_verified != 'done':
-                        # If specific CVEs are requested, only track those
-                        if self.config.cves and cve_id not in self.config.cves:
-                            continue
-                        pending.append(cve_id)
+                        flagged_pending.append(cve_id)
+                    elif poc_path:
+                        has_runnable.add(cve_id)
         except Exception as e:
             logger.error(f"Error reading CSV for manual verification check: {e}")
+        # Pending only when the CVE has no runnable PoC at all.
+        pending = [c for c in flagged_pending if c not in has_runnable]
         return list(dict.fromkeys(pending))
     
     def _get_pending_cve_details(self, csv_path: Path) -> Dict[str, Dict[str, str]]:
@@ -793,13 +831,45 @@ RECOMMENDED ACTIONS:
         
         # Initialize feedback loop
         self.feedback_loop = IterativeFeedbackLoop(self.config)
-        
-        # Identify failed patches that need retry
-        failed_patches = [
-            r for r in validation_results 
-            if r.get("status") != "Success"
-        ]
-        
+
+        # Identify failed patches that a retry can actually fix, honoring
+        # feedback_loop.retry_on from config.yaml. Statuses like "No Phase 1
+        # Baseline" or "Patch Not Found" are NOT retryable: regenerating the
+        # patch cannot create a missing reproduction baseline or file.
+        retry_on = {}
+        try:
+            fb_cfg = cfg_section("feedback_loop", self.config.base_dir) or {}
+            retry_on = fb_cfg.get("retry_on", {}) if isinstance(fb_cfg.get("retry_on"), dict) else {}
+        except Exception:
+            pass
+        retryable_statuses = set()
+        if retry_on.get("poc_still_works", True):
+            retryable_statuses.add("PoC Still Works")
+        if retry_on.get("sast_failed", True):
+            retryable_statuses.add("SAST Failed")
+        if retry_on.get("build_error", False):
+            # Methodology v2: a Phase 3 build error means the patch did not
+            # compile — the compiler output is ideal feedback context.
+            retryable_statuses.add("Build Error")
+        if retry_on.get("poc_hang", True):
+            # A patch that turned the deterministic baseline into a timeout/hang
+            # is a failed patch (self-inflicted DoS) — the hang is ideal feedback
+            # context, so retry it rather than dropping it as an Execution Error.
+            retryable_statuses.add("Patch Caused Hang")
+
+        skipped_statuses: Dict[str, int] = {}
+        failed_patches = []
+        for r in validation_results:
+            status = r.get("status")
+            if status == "Success":
+                continue
+            if status in retryable_statuses:
+                failed_patches.append(r)
+            else:
+                skipped_statuses[status] = skipped_statuses.get(status, 0) + 1
+
+        if skipped_statuses:
+            logger.info(f"Not retrying (non-retryable statuses): {skipped_statuses}")
         logger.info(f"Found {len(failed_patches)} failed patches for retry")
         
         for idx, failed in enumerate(failed_patches, 1):
@@ -821,6 +891,7 @@ RECOMMENDED ACTIONS:
                     self.poc_blocked = data.get("poc_blocked", False)
                     self.sast_passed = data.get("sast_passed", False)
                     self.poc_exit_code = data.get("poc_exit_code")
+                    self.baseline_exit_code = data.get("baseline_exit_code")
                     self.poc_output = data.get("poc_output", "")
                     self.build_success = data.get("build_success", False)
                     self.build_logs = data.get("build_logs")
@@ -837,6 +908,7 @@ RECOMMENDED ACTIONS:
                         "status": self.status,
                         "poc_blocked": self.poc_blocked,
                         "poc_exit_code": self.poc_exit_code,
+                        "baseline_exit_code": self.baseline_exit_code,
                         "poc_output": self.poc_output,
                         "build_success": self.build_success,
                         "build_logs": self.build_logs,
@@ -900,21 +972,50 @@ RECOMMENDED ACTIONS:
         return results
     
     def _load_vulnerability_data(self) -> Dict[str, Dict[str, Any]]:
-        """Load vulnerability data from CSV."""
+        """Load vulnerability data (one best row per CVE) from the Phase 0 CSV.
+
+        Falls back to the legacy ``documentation/file-function.csv`` when no
+        Phase 0 output exists. The delimiter is auto-detected (Phase 0 writes
+        comma-separated CSV; the legacy file is semicolon-separated). Rows
+        with extracted function data (V_FUNCTION/F_NAME) win over rows
+        without, mirroring patch_generator's selection.
+        """
         import pandas as pd
-        
-        csv_file = self.config.base_dir / "documentation" / "file-function.csv"
-        if not csv_file.exists():
+
+        csv_file = None
+        try:
+            csv_file = self._phase0_outputs.get("csv_path")
+        except Exception:
+            csv_file = None
+        if not csv_file or not Path(csv_file).exists():
+            csv_file = self.config.base_dir / "documentation" / "file-function.csv"
+        if not Path(csv_file).exists():
             return {}
-        
-        df = pd.read_csv(csv_file, sep=';')
-        
-        vuln_map = {}
+
+        with open(csv_file, 'r', encoding='utf-8', errors='replace') as f:
+            header = f.readline()
+        sep = ';' if header.count(';') > header.count(',') else ','
+        df = pd.read_csv(csv_file, sep=sep)
+
+        def _txt(v) -> str:
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return ''
+            return str(v)
+
+        vuln_map: Dict[str, Dict[str, Any]] = {}
         for _, row in df.iterrows():
-            cve = row.get('CVE', '')
-            if cve:
-                vuln_map[cve] = row.to_dict()
-        
+            d = {k: ('' if pd.isna(v) else v) if not isinstance(v, str) else v
+                 for k, v in row.to_dict().items()}
+            cve = _txt(d.get('CVE')).strip()
+            if not cve:
+                continue
+            has_func = bool(_txt(d.get('V_FUNCTION')).strip()) and bool(_txt(d.get('F_NAME')).strip())
+            existing = vuln_map.get(cve)
+            existing_has_func = bool(_txt((existing or {}).get('V_FUNCTION')).strip())
+            if existing is None or (has_func and not existing_has_func):
+                vuln_map[cve] = d
+
+        logger.info(f"Loaded vulnerability data for {len(vuln_map)} CVE(s) from {csv_file}")
         return vuln_map
     
     def _save_feedback_loop_results(self, phase_start: datetime = None, phase_end: datetime = None):
@@ -1000,6 +1101,98 @@ RECOMMENDED ACTIONS:
         
         logger.info(f"Feedback loop results saved to: {results_file}")
     
+    def _compute_phase_metrics(self) -> Dict[int, str]:
+        """Build a ``{phase: 'x/y (z%)'}`` map for the execution-summary Success
+        column.
+
+        Each phase already writes its own summary JSON/CSV; we read those rather
+        than recompute anything. Best-effort and defensive — any missing/parse
+        failure simply omits that phase (the summary still prints "—"). General:
+        no per-CVE logic.
+        """
+        metrics: Dict[int, str] = {}
+
+        def _ratio(num: int, den: int) -> str:
+            if not den:
+                return f"{num}/{den} (N/A)"
+            return f"{num}/{den} ({num / den * 100:.0f}%)"
+
+        def _find(result: PhaseResult, *needles: str) -> Optional[Path]:
+            for f in (result.output_files or []):
+                if any(n in Path(f).name for n in needles):
+                    return Path(f)
+            return None
+
+        def _load(path: Optional[Path]) -> Optional[dict]:
+            try:
+                if path and path.exists():
+                    with open(path) as fh:
+                        return json.load(fh)
+            except Exception:
+                pass
+            return None
+
+        by_phase = {r.phase: r for r in self.results}
+
+        # Phase 0 — Phase-1-READY CVEs / total unique CVEs. "Ready" means Phase 1
+        # can actually act on the record: a usable PoC AND a fixing commit
+        # (V_COMMIT). The commit is what Phase 1 checks out to build the
+        # known-vulnerable glibc; without it there is only stock distro glibc, so
+        # no deterministic baseline is possible and Phase 1 routes the CVE to
+        # manual revision. An Ubuntu era alone (version/year) is NOT enough — it
+        # was previously accepted and counted ancient pre-git CVEs (e.g.
+        # CVE-2010-3856/4052) as "ready" even though they have no commit to build.
+        # Requiring V_COMMIT makes the Phase-0 numerator equal the number of CVEs
+        # Phase 1 can actually reproduce against.
+        r0 = by_phase.get(0)
+        if r0:
+            csvp = _find(r0, ".csv") or self._phase0_outputs.get("csv_path")
+            try:
+                if csvp and Path(csvp).exists():
+                    seen, ready = set(), set()
+                    with open(csvp, newline="") as fh:
+                        for row in csv.DictReader(fh):
+                            cve = (row.get("CVE") or "").strip()
+                            if not cve:
+                                continue
+                            seen.add(cve)
+                            has_poc = bool((row.get("poc_path") or "").strip())
+                            has_commit = bool((row.get("V_COMMIT") or "").strip())
+                            if has_poc and has_commit:
+                                ready.add(cve)
+                    metrics[0] = _ratio(len(ready), len(seen))
+            except Exception:
+                pass
+
+        # Phase 1 — vulnerabilities reproduced / total
+        r1 = by_phase.get(1)
+        if r1:
+            m = (_load(_find(r1, "results.json")) or {}).get("metadata", {})
+            if "total_vulnerabilities" in m:
+                metrics[1] = _ratio(
+                    m.get("successful_reproductions", 0), m.get("total_vulnerabilities", 0)
+                )
+
+        # Phase 2 — syntactically valid patches / generation tasks
+        r2 = by_phase.get(2)
+        if r2:
+            s = (_load(_find(r2, "pipeline_summary.json")) or {}).get("summary", {})
+            if "total_tasks" in s:
+                metrics[2] = _ratio(s.get("syntax_valid", 0), s.get("total_tasks", 0))
+
+        # Phase 3 — PoC blocked / validations run
+        r3 = by_phase.get(3)
+        if r3:
+            d = _load(_find(r3, "validation_summary"))
+            if d:
+                s = d.get("summary", {})
+                total = len(d.get("all_results", [])) or (
+                    s.get("successful", 0) + s.get("build_failures", 0)
+                )
+                metrics[3] = _ratio(s.get("poc_blocked", 0), total)
+
+        return metrics
+
     def _print_feedback_loop_summary(self):
         """Print feedback loop summary to console."""
         total = len(self.feedback_results)
@@ -1044,59 +1237,191 @@ RECOMMENDED ACTIONS:
         logger.info(f"  Manual Verify Poll: {self.config.manual_verify_poll_interval}s")
     
     def _validate_prerequisites(self) -> bool:
-        """Validate prerequisites before running pipeline."""
-        logger.info("Validating prerequisites...")
-        
-        # Check if required scripts exist (resolve from the pipeline root,
-        # not base_dir which may be a per-project working directory)
-        for phase, script in PHASE_SCRIPTS.items():
-            if phase in self.config.phases:
-                script_path = BASE_DIR / script
-                if not script_path.exists():
-                    logger.error(f"Missing script: {script_path}")
-                    return False
-        
-        # Check Docker availability for phases 1 and 3
-        if 1 in self.config.phases or 3 in self.config.phases:
-            try:
-                result = subprocess.run(
-                    ['docker', 'info'],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if result.returncode != 0:
-                    logger.error("Docker is not running or not accessible")
-                    return False
-            except Exception as e:
-                logger.error(f"Docker check failed: {e}")
-                return False
-        # Check CSV file for phases 1-3
-        if any(p in self.config.phases for p in [1, 2, 3]):
-            if 0 not in self.config.phases:
-                csv_file = self._phase0_outputs.get("csv_path")
-                if not csv_file or not csv_file.exists():
-                    logger.error(f"Missing CSV file: {csv_file}")
-                    return False
+        """Validate prerequisites before running the pipeline.
 
-        
-        # Pre-flight LLM API health check for Phase 2
-        if 2 in self.config.phases:
-            logger.info("Checking LLM API connectivity...")
-            if not self._check_llm_api_health():
-                logger.error("LLM API is not accessible - Phase 2 cannot run")
-                logger.error("Please verify the API server is running and accessible")
+        Builds a dependency report scoped to the phases actually being run and
+        prints it up front. REQUIRED items that are missing abort the run;
+        OPTIONAL items that are missing are *reported* (not silently skipped)
+        so the user is told NOW instead of discovering a skipped step mid-run —
+        e.g. a Phase-3 SAST tool that is not installed on the host.
+
+        All checks are host-level and project-agnostic (tools, services, Python
+        modules); nothing project-specific lives here.
+        """
+        import shutil
+        import importlib.util
+
+        logger.info("Validating prerequisites...")
+        phases = set(self.config.phases)
+        required: List[str] = []   # missing → abort the run
+        optional: List[str] = []   # missing → warn only (reduced coverage)
+
+        def _module(name: str) -> bool:
+            try:
+                return importlib.util.find_spec(name) is not None
+            except Exception:
                 return False
-            logger.info("✓ LLM API is accessible")
-        
-        logger.info("Prerequisites validated successfully")
-        return True
-    
+
+        # --- Required: phase scripts (resolved from the pipeline root, not
+        # base_dir which may be a per-project working directory) ---
+        for phase, script in PHASE_SCRIPTS.items():
+            if phase in phases and not (BASE_DIR / script).exists():
+                required.append(f"[phase {phase}] missing script: {BASE_DIR / script}")
+
+        # --- Required: Docker daemon for phases 1 and 3 ---
+        if 1 in phases or 3 in phases:
+            docker_ok = False
+            try:
+                docker_ok = subprocess.run(
+                    ['docker', 'info'], capture_output=True, text=True, timeout=10
+                ).returncode == 0
+            except Exception as e:
+                logger.debug(f"docker info probe failed: {e}")
+            if not docker_ok:
+                required.append("[phases 1,3] Docker is not running or not accessible "
+                                "(start Docker / check user permissions)")
+
+        # --- Required: Phase-0 CSV when phases 1-3 run without phase 0 ---
+        if any(p in phases for p in (1, 2, 3)) and 0 not in phases:
+            csv_file = self._phase0_outputs.get("csv_path")
+            if not csv_file or not Path(csv_file).exists():
+                required.append(f"[phases 1-3] missing Phase 0 CSV: {csv_file} "
+                                "(run Phase 0 first)")
+
+        # --- Required: Python client modules used by the relevant phases ---
+        if (0 in phases or 2 in phases) and not _module("requests"):
+            required.append("[phases 0,2] Python 'requests' not installed "
+                            "(pip install requests)")
+        if 2 in phases:
+            provider = str(cfg_section("llm", self.config.base_dir)
+                           .get("provider", "ollama")).lower()
+            if provider == "openai" and not _module("openai"):
+                required.append("[phase 2] Python 'openai' not installed for "
+                                "provider=openai (pip install openai)")
+
+        # --- Required: LLM backend for phase 2 ---
+        if 2 in phases:
+            logger.info("Checking LLM API connectivity...")
+            if self._check_llm_api_health():
+                logger.info("✓ LLM API is accessible")
+            else:
+                required.append("[phase 2] LLM API not accessible "
+                                "(verify provider/key/endpoint in config.yaml)")
+
+        # --- Optional: per-phase host tools / Python modules. Missing ones do
+        # NOT abort — the phase runs with reduced coverage (a SAST check skips,
+        # a chart is not drawn) — but they are reported so it is never silent. ---
+        if 0 in phases and not shutil.which("gcc"):
+            optional.append("[phase 0] gcc not found — SyntaxValidator cannot "
+                            "syntax-check C PoCs (apt install gcc)")
+        if 3 in phases:
+            for name, present, hint in self._sast_tool_status():
+                if not present:
+                    optional.append(f"[phase 3] {name} not found — SAST '{name}' "
+                                    f"will be skipped ({hint})")
+        if 4 in phases:
+            if not _module("matplotlib"):
+                optional.append("[phase 4] matplotlib not found — report charts "
+                                "will be skipped (pip install matplotlib)")
+            if not _module("numpy"):
+                optional.append("[phase 4] numpy not found — report charts will "
+                                "be skipped (pip install numpy)")
+
+        self._print_prerequisite_report(phases, required, optional)
+        return not required
+
+    def _sast_tool_status(self):
+        """Probe each Phase-3 SAST tool exactly as ``patch_validator`` does —
+        primary binary on PATH, else a ``python -m <module>`` fallback — and
+        yield ``(tool_name, present, remediation_hint)``.
+
+        Derived from ``patch_validator.SAST_TOOLS`` so the preflight and the
+        real Phase-3 run never drift; falls back to a minimal mirror if that
+        module can't be imported.
+        """
+        import shutil
+        import importlib.util
+
+        hints = {"cppcheck": "apt install cppcheck",
+                 "flawfinder": "pip install flawfinder"}
+        try:
+            from patch_validator import SAST_TOOLS as tools
+        except Exception:
+            tools = {"cppcheck": {"cmd": ["cppcheck"], "fallback_cmd": None},
+                     "flawfinder": {"cmd": ["flawfinder"],
+                                    "fallback_cmd": ["python3", "-m", "flawfinder"]}}
+        for name, cfg in tools.items():
+            present = bool(shutil.which(cfg["cmd"][0]))
+            if not present:
+                fb = cfg.get("fallback_cmd")
+                if fb and len(fb) >= 3 and fb[1] == "-m":
+                    # e.g. [python, "-m", "flawfinder", ...] — check the module
+                    try:
+                        present = importlib.util.find_spec(fb[2]) is not None
+                    except Exception:
+                        present = False
+                elif fb:
+                    present = bool(shutil.which(fb[0]))
+            yield name, present, hints.get(name, f"install {name}")
+
+    def _print_prerequisite_report(self, phases, required: List[str],
+                                   optional: List[str]) -> None:
+        """Print + log a concise per-run dependency report. Missing lines are
+        also emitted through the logger so they land in the run log file."""
+        ordered = ", ".join(str(p) for p in sorted(phases))
+        if not required and not optional:
+            logger.info(f"Prerequisites validated successfully (phases: {ordered})")
+            return
+
+        print("\n" + "=" * 70)
+        print("  DEPENDENCY CHECK")
+        print("=" * 70)
+        print(f"  Phases to run: {ordered}")
+        if required:
+            print(f"\n  ❌ Missing REQUIRED dependencies ({len(required)}) — cannot run:")
+            for m in required:
+                print(f"     • {m}")
+                logger.error(f"Missing required dependency: {m}")
+        if optional:
+            print(f"\n  ⚠️  Missing OPTIONAL dependencies ({len(optional)}) — "
+                  "phases run with reduced coverage:")
+            for m in optional:
+                print(f"     • {m}")
+                logger.warning(f"Missing optional dependency: {m}")
+        print("=" * 70 + "\n")
+
     def _check_llm_api_health(self) -> bool:
-        """Check if the LLM API is accessible before starting Phase 2."""
+        """Check if the LLM backend configured for Phase 2 is usable.
+
+        Branches on ``llm.provider``: for ``openai`` we only verify an API key
+        is configured (no Ollama probe — the OpenAI endpoint is reached by the
+        SDK in Phase 2); for ``ollama`` we probe the local chat endpoint.
+        """
+        import os
         import requests
 
         llm_cfg = cfg_section("llm", self.config.base_dir)
+        provider = str(llm_cfg.get("provider", "ollama")).lower()
+
+        # --- OpenAI: validate the API key, do NOT ping the Ollama endpoint ---
+        if provider == "openai":
+            api_key = os.environ.get("OPENAI_API_KEY") or str(llm_cfg.get("openai_api_key", "") or "")
+            if not api_key:
+                key_file = self.config.base_dir / "API-openai-key"
+                if key_file.exists():
+                    api_key = key_file.read_text().strip()
+            if api_key:
+                model = str(llm_cfg.get("openai_model", "gpt-4.1-mini"))
+                logger.info(f"✓ OpenAI provider configured (model: {model})")
+                return True
+            logger.error(
+                "OpenAI provider selected but no API key found. Set the "
+                "OPENAI_API_KEY env var, llm.openai_api_key in config.yaml, or "
+                "an API-openai-key file in the pipeline root."
+            )
+            return False
+
+        # --- Ollama: probe the local chat endpoint ---
         hc_cfg = llm_cfg.get("health_check", {}) if isinstance(llm_cfg.get("health_check"), dict) else {}
 
         api_endpoint = str(llm_cfg.get("endpoint", "http://localhost:11434/api/chat"))
@@ -1179,11 +1504,14 @@ RECOMMENDED ACTIONS:
             return True
         
         elif phase == 2:
-            # Phase 2 needs Phase 1 outputs (or can run independently)
-            # Check if docker_builds exist
-            docker_builds = self.config.base_dir / "docker_builds"
-            if not docker_builds.exists() or not any(docker_builds.iterdir()):
-                logger.warning("Phase 1 outputs not found - Phase 2 may work with limited context")
+            # Phase 2 needs Phase 1's image manifest (per-CVE baseline exit
+            # codes); without it every CVE is skipped as "no baseline".
+            manifest = self.config.base_dir / "results" / "image_manifest.json"
+            if not manifest.exists():
+                logger.warning(
+                    "Phase 1 image manifest not found (results/image_manifest.json) "
+                    "- Phase 2 will skip all CVEs (no baselines)"
+                )
             return True
         
         elif phase == 3:

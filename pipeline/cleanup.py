@@ -11,7 +11,7 @@ Cleans:
   - Phase 2: Generated patches and summaries
   - Phase 3: Validation builds, results, and container images
   - Phase 4: Reports and visualizations
-  - Projects: Project-specific workspaces
+  - Projects: Per-project workspaces (projects/) and run archives (project-runs/)
   - Logs: All log files
 
 Author: AI-SSD Project
@@ -80,9 +80,10 @@ CLEANUP_TARGETS = {
         'docker_images': [],
     },
     'projects': {
-        'description': 'Project Workspaces',
+        'description': 'Project Workspaces & Run Archives',
         'directories': [
-            'projects',
+            'projects',       # live per-project output (run_project.sh --base-dir projects/<name>)
+            'project-runs',   # archived completed runs
         ],
         'files': [],
         'docker_images': [],
@@ -610,7 +611,7 @@ Targets:
   phase2    - Generated patches (Phase 2: Patch Generation)
   phase3    - Validation builds and results (Phase 3: Patch Validation)
   phase4    - Reports and charts (Phase 4: Automated Reporting)
-  projects  - Project-specific workspaces
+  projects  - Per-project workspaces (projects/) and run archives (project-runs/)
   logs      - All log files
   all       - Everything (default)
 

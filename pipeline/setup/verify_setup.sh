@@ -107,13 +107,44 @@ fi
 echo ""
 echo -e "${BLUE}--- API Keys ---${NC}"
 
-# Check NVD API Key
+# Check NVD API Key — resolve from env, the pipeline-root file, or the
+# nvd_api_key value in any cve_aggregator/*_config.yaml, then validate it live.
 echo -n "Checking NVD API Key... "
-if [ -s "$PIPELINE_ROOT/API-nvd-key" ]; then
-    echo -e "${GREEN}✓${NC} Found and not empty"
-else
-    echo -e "${YELLOW}⚠${NC} Not found or empty at $PIPELINE_ROOT/API-nvd-key"
+NVD_KEY="${NVD_API_KEY:-}"
+if [ -z "$NVD_KEY" ] && [ -s "$PIPELINE_ROOT/API-nvd-key" ]; then
+    NVD_KEY="$(tr -d '[:space:]' < "$PIPELINE_ROOT/API-nvd-key")"
+fi
+if [ -z "$NVD_KEY" ]; then
+    NVD_KEY="$(grep -rhoE '^[[:space:]]*nvd_api_key:[[:space:]]*"[^"]+"' "$PIPELINE_ROOT"/cve_aggregator/*_config.yaml 2>/dev/null \
+        | sed -E 's/.*"([^"]+)".*/\1/' | head -1)"
+fi
+if [ -z "$NVD_KEY" ]; then
+    echo -e "${YELLOW}⚠${NC} No key found (env NVD_API_KEY, $PIPELINE_ROOT/API-nvd-key, or nvd_api_key in YAML) — fetch will be heavily rate-limited"
     WARNINGS=$((WARNINGS + 1))
+else
+    # Live validation: 200 with the key proves it is accepted by NVD. NVD 503s
+    # routinely even for valid keys, so retry a few times before warning; a
+    # 403/404 is a definitive rejection and breaks out immediately.
+    NVD_CODE="000"
+    for _try in 1 2 3; do
+        NVD_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
+            -H "apiKey: $NVD_KEY" \
+            "https://services.nvd.nist.gov/rest/json/cves/2.0?resultsPerPage=1" 2>/dev/null)
+        NVD_CODE="${NVD_CODE:-000}"
+        case "$NVD_CODE" in
+            200|403|404) break ;;
+            *) [ "$_try" -lt 3 ] && sleep 3 ;;
+        esac
+    done
+    if [ "$NVD_CODE" = "200" ]; then
+        echo -e "${GREEN}✓${NC} Found and validated against NVD (HTTP 200)"
+    elif [ "$NVD_CODE" = "404" ] || [ "$NVD_CODE" = "403" ]; then
+        echo -e "${RED}✗${NC} Key rejected by NVD (HTTP $NVD_CODE) — check the key value"
+        ERRORS=$((ERRORS + 1))
+    else
+        echo -e "${YELLOW}⚠${NC} Found, but NVD unreachable/flaky (HTTP $NVD_CODE) — likely transient, key may still be fine"
+        WARNINGS=$((WARNINGS + 1))
+    fi
 fi
 
 # Check OpenAI API Key

@@ -31,6 +31,23 @@ from .base import PipelineModule
 logger = logging.getLogger(__name__)
 
 
+# Signatures of a Metasploit module. These are framework plugins (run inside
+# msfconsole), NOT standalone-runnable PoCs — a Ruby module is valid *syntax*
+# yet cannot execute on its own, so it must never be treated as a usable PoC.
+_METASPLOIT_PATTERNS = re.compile(
+    r"class\s+MetasploitModule\b"
+    r"|<\s*Msf::"
+    r"|\binclude\s+Msf::"
+    r"|\brequire\s+['\"]msf/"
+    r"|\bMsf::Exploit\b",
+)
+
+
+def is_metasploit_module(content: str) -> bool:
+    """True when *content* is a Metasploit framework module (not standalone)."""
+    return bool(content) and _METASPLOIT_PATTERNS.search(content) is not None
+
+
 class SyntaxValidator(PipelineModule):
     """Pipeline module: *Syntax Validation*.
 
@@ -248,6 +265,17 @@ class SyntaxValidator(PipelineModule):
         return out, changed
 
     def _validate(self, content: str, language: str, cfg: Dict) -> SyntaxValidationResult:
+        # A Metasploit module is not a standalone-runnable PoC (it needs the
+        # Metasploit framework). Flagging it invalid here — regardless of the
+        # detected language — stops it from being treated as a "valid" primary
+        # PoC, which would otherwise block promotion of a runnable standalone
+        # exploit for the same CVE (e.g. CVE-2018-1000001's C PoC).
+        if is_metasploit_module(content):
+            return SyntaxValidationResult(
+                is_valid=False, language=language,
+                errors=["metasploit_module"],
+                needs_manual_review=True,
+            )
         validators = {
             "c": self._validate_c,
             "cpp": self._validate_cpp,

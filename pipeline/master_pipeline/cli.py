@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from .config import (BASE_DIR, DEFAULT_MODELS, MAX_RETRIES,
                      MANUAL_VERIFY_TIMEOUT, MANUAL_VERIFY_POLL_INTERVAL,
+                     MANUAL_VERIFY_AUTO_SKIP,
                      PHASE_SCRIPTS, PipelineConfig, get_config)
 from .utils import setup_logging, print_banner
 from .orchestrator import MasterPipeline
@@ -150,7 +151,16 @@ Examples:
         default=MANUAL_VERIFY_POLL_INTERVAL,
         help=f'Poll interval in seconds for manual verification (default: {MANUAL_VERIFY_POLL_INTERVAL})'
     )
-    
+
+    parser.add_argument(
+        '--auto-skip-manual',
+        action='store_true',
+        default=MANUAL_VERIFY_AUTO_SKIP,
+        help='Skip the Phase 0 manual-verification prompt: automatically exclude '
+             'every CVE still pending manual review (unattended runs). '
+             f'(default: {MANUAL_VERIFY_AUTO_SKIP}, set via manual_verification.auto_skip)'
+    )
+
     return parser.parse_args()
 
 
@@ -178,6 +188,7 @@ def main():
         phase0_config=args.phase0_config,
         manual_verify_timeout=args.manual_verify_timeout,
         manual_verify_poll_interval=args.manual_verify_poll,
+        manual_verify_auto_skip=args.auto_skip_manual,
     )
     
     logger.info("Pipeline Configuration:")
@@ -196,7 +207,8 @@ def main():
         logger.info(f"  Max Retries: {config.max_retries}")
     logger.info(f"  Manual Verify Timeout: {config.manual_verify_timeout}s")
     logger.info(f"  Manual Verify Poll: {config.manual_verify_poll_interval}s")
-    
+    logger.info(f"  Manual Verify Auto-Skip: {config.manual_verify_auto_skip}")
+
     # Handle dry run
     if args.dry_run:
         print("\n" + "="*70)

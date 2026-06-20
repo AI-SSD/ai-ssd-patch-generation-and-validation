@@ -20,6 +20,7 @@ import requests
 from ..models import ExploitInfo
 from ..utils.git_utils import clone_or_update_repo
 from ..utils.file_utils import (
+    classify_poc_runnability,
     detect_language_from_path,
     extract_file_content,
     is_text_file,
@@ -55,6 +56,11 @@ class PoCMapper(PipelineModule):
         extract_content: bool = cfg.get("extract_content", True)
         reverse_search: bool = cfg.get("reverse_search", True)
         require_verified: bool = cfg.get("require_verified", True)
+        # Ordered list of preferred ExploitDB platform tokens (project-agnostic;
+        # set per project in the YAML). The FIRST saved PoC (index 0) becomes the
+        # primary exploit Phase 1 compiles, so a Linux-targeted pipeline should
+        # prefer linux exploits over osx/bsd/multiple. Empty list = no reordering.
+        prefer_platforms: List[str] = cfg.get("prefer_platforms", [])
 
         # Step 1 – Update ExploitDB
         if cfg.get("auto_update", True):
@@ -78,6 +84,7 @@ class PoCMapper(PipelineModule):
         # Step 4 – Cross-reference each CVE with ExploitDB
         self.logger.info("Cross-referencing CVEs with ExploitDB …")
         matched = 0
+        dropped_nonrunnable = 0
         for cve in raw_cves:
             cve_id = cve.get("cve_id", "")
             exploits: List[Dict] = []
@@ -90,9 +97,33 @@ class PoCMapper(PipelineModule):
             if deep_search and not exploits:
                 exploits.extend(self._search_in_content(edb_path, cve_id))
 
+            # Prefer exploits whose platform matches the project target, so the
+            # primary PoC (index 0) is the one most likely to build/run on the
+            # target OS. Done BEFORE content extraction & before any downstream
+            # module indexes the list, so indices stay consistent everywhere.
+            exploits = self._rank_by_platform(exploits, prefer_platforms)
+
             # Extract source code
             if extract_content:
                 exploits = [self._extract_content(e, edb_path) for e in exploits]
+                # Precision filter: drop prose write-ups and CVE-ID-mismatched
+                # entries so `has_poc` reflects *runnable* PoCs only. ExploitDB
+                # frequently files write-ups as .txt (e.g. EDB-39454/CVE-2015-7547
+                # links to a GitHub PoC) or tags a CVE whose write-up is about a
+                # different one (EDB-15274) — counting those as PoCs inflates the
+                # funnel. Dropped entries are logged for traceability.
+                kept: List[Dict] = []
+                for e in exploits:
+                    runnable, why = classify_poc_runnability(
+                        e.get("source_code_content"), e.get("file_path", ""), cve_id)
+                    if runnable:
+                        kept.append(e)
+                    else:
+                        dropped_nonrunnable += 1
+                        self.logger.info(
+                            "  %s: dropping non-runnable ExploitDB entry %s (%s)",
+                            cve_id, e.get("exploit_id") or e.get("file_path") or "?", why)
+                exploits = kept
 
             cve["exploits"] = exploits
             cve["has_poc"] = len(exploits) > 0
@@ -100,7 +131,9 @@ class PoCMapper(PipelineModule):
             if exploits:
                 matched += 1
 
-        self.logger.info("PoC Mapper: %d / %d CVEs have exploits", matched, len(raw_cves))
+        self.logger.info(
+            "PoC Mapper: %d / %d CVEs have runnable exploits (dropped %d non-runnable write-up/mismap entries)",
+            matched, len(raw_cves), dropped_nonrunnable)
         context["raw_cves"] = raw_cves
         return context
 
@@ -144,10 +177,43 @@ class PoCMapper(PipelineModule):
         return count
 
     @staticmethod
+    def _rank_by_platform(exploits: List[Dict], prefer_platforms: List[str]) -> List[Dict]:
+        """Stable-sort *exploits* so preferred-platform PoCs come first.
+
+        An exploit's rank is the index of the first ``prefer_platforms`` token
+        that appears (case-insensitive substring) in its ``platform`` field;
+        non-matching or platform-less exploits (e.g. content-search hits) sort
+        after all preferred ones. The sort is STABLE, so the original relative
+        order is preserved within each rank — when ``prefer_platforms`` is empty
+        the list is returned unchanged. General: the project supplies the token
+        list (e.g. linux); no per-CVE or hardcoded-project logic.
+        """
+        if not prefer_platforms or len(exploits) < 2:
+            return exploits
+        prefs = [p.lower() for p in prefer_platforms]
+
+        def _rank(e: Dict) -> int:
+            platform = str(e.get("platform", "")).lower()
+            if platform:
+                for i, pref in enumerate(prefs):
+                    if pref in platform:
+                        return i
+            return len(prefs)
+
+        return sorted(exploits, key=_rank)
+
+    @staticmethod
     def _row_to_info(row: Dict, edb_path: Path) -> Dict:
         eid = row.get("id", "")
         file_rel = row.get("file", "")
         full_path = str(edb_path / file_rel) if file_rel else ""
+        # The CSV ``aliases`` column names a companion archive for multi-file
+        # exploits (e.g. "CVE-2014-5119.tar.gz"). We only treat it as one when it
+        # has an archive extension; the actual file is fetched by EDB id later.
+        alias = (row.get("aliases", "") or "").strip()
+        companion_archive = alias if alias.lower().endswith(
+            (".tar.gz", ".tgz", ".tar", ".zip")
+        ) else ""
         return {
             "exploit_id": f"EDB-{eid}" if eid else "",
             "file_path": file_rel,
@@ -161,6 +227,7 @@ class PoCMapper(PipelineModule):
             "verified": row.get("verified", "0") == "1",
             "match_type": "csv_metadata",
             "exploitdb_url": f"https://www.exploit-db.com/exploits/{eid}" if eid else "",
+            "companion_archive": companion_archive,
         }
 
     # ------------------------------------------------------------------

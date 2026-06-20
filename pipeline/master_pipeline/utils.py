@@ -79,27 +79,50 @@ def print_phase_header(phase: int, name: str):
     print(f"  PHASE {phase}: {name.upper()}")
     print(f"{'='*70}\n")
 
-def print_summary_table(results: List[PhaseResult]):
-    """Print summary table of phase results."""
-    print("\n" + "="*70)
+def print_summary_table(results: List[PhaseResult], metrics: dict = None,
+                        feedback: dict = None):
+    """Print summary table of phase results.
+
+    Args:
+        results: per-phase results.
+        metrics: optional ``{phase_number: success_string}`` shown in the
+                 Success column (e.g. ``"3/9 (33%)"``). Missing phases show "—".
+        feedback: optional ``{'successful': int, 'total': int}`` appended as a
+                  Feedback Loop row with its own success number/%.
+    """
+    metrics = metrics or {}
+    icons = {
+        PhaseStatus.SUCCESS: "✅",
+        PhaseStatus.FAILED: "❌",
+        PhaseStatus.SKIPPED: "⏭️",
+        PhaseStatus.PENDING: "⏳",
+        PhaseStatus.RUNNING: "🔄",
+    }
+
+    print("\n" + "="*78)
     print("  PIPELINE EXECUTION SUMMARY")
-    print("="*70)
-    print(f"\n{'Phase':<8} {'Name':<25} {'Status':<12} {'Duration':<12} {'Exit':<6}")
-    print("-"*70)
-    
+    print("="*78)
+    print(f"\n{'Phase':<7} {'Name':<26} {'Status':<11} {'Success':<15} {'Duration':<10} {'Exit':<5}")
+    print("-"*78)
+
     for r in results:
-        status_icon = {
-            PhaseStatus.SUCCESS: "✅",
-            PhaseStatus.FAILED: "❌",
-            PhaseStatus.SKIPPED: "⏭️",
-            PhaseStatus.PENDING: "⏳",
-            PhaseStatus.RUNNING: "🔄"
-        }.get(r.status, "❓")
-        
-        print(f"{r.phase:<8} {r.name:<25} {status_icon} {r.status.value:<10} "
-              f"{r.duration_seconds:>8.1f}s   {r.exit_code:<6}")
-    
-    print("-"*70)
+        status_icon = icons.get(r.status, "❓")
+        success = metrics.get(r.phase, "—")
+        print(f"{r.phase:<7} {r.name:<26} {status_icon} {r.status.value:<9} "
+              f"{success:<15} {r.duration_seconds:>7.1f}s   {r.exit_code:<5}")
+
+    if feedback:
+        total = feedback.get("total", 0)
+        succ = feedback.get("successful", 0)
+        pct = f"{(succ/total*100):.0f}%" if total else "N/A"
+        fb_success = f"{succ}/{total} ({pct})"
+        # ✅ only when every processed patch was salvaged; ⚠️ otherwise (the
+        # feedback loop running at all means Phase 3 left failures to retry).
+        fb_icon = "✅" if total and succ == total else "⚠️"
+        print(f"{'FB':<7} {'Feedback Loop':<26} {fb_icon} {'self-heal':<9} "
+              f"{fb_success:<15} {'':>7}    {'':<5}")
+
+    print("-"*78)
 
 def format_duration(seconds: float) -> str:
     """Format duration in human-readable format."""

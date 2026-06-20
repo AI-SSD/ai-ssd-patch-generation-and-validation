@@ -11,12 +11,17 @@ Produces all final artefacts:
 from __future__ import annotations
 
 import csv
+import io
 import json
 import logging
 import shutil
+import tarfile
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import requests
 
 from ..models import CVEEntry, Dataset
 from ..utils.cwe_lookup import get_cwe_descriptions
@@ -33,6 +38,24 @@ from ..utils.version_mapping import (
 from .base import PipelineModule
 
 logger = logging.getLogger(__name__)
+
+
+def _is_test_file(path: str) -> bool:
+    """Heuristic: does *path* point at a test/harness file rather than
+    production source?  Fix commits routinely ADD a regression test next to
+    the real fix; the vulnerable code is never in the test file.  Patterns
+    are project-agnostic naming conventions (glibc ``tst-*``, generic
+    ``test_*``/``*_test``, ``tests/`` directories).
+    """
+    p = path.lower()
+    name = p.rsplit("/", 1)[-1]
+    if name.startswith(("tst-", "tst_", "test-", "test_", "bug-")):
+        return True
+    stem = name.rsplit(".", 1)[0]
+    if stem.endswith(("-test", "_test", "-tests", "_tests")):
+        return True
+    parts = p.split("/")
+    return any(d in ("test", "tests", "testsuite", "testing") for d in parts[:-1])
 
 
 class OutputGenerator(PipelineModule):
@@ -111,6 +134,12 @@ class OutputGenerator(PipelineModule):
         def include_entry(entry: CVEEntry) -> bool:
             if require_commit and not entry.has_commits:
                 return False
+            # Option A: a regression test the fixing commit ships is a valid,
+            # authoritative reproducer — so a CVE with one is kept even when it
+            # has no ExploitDB PoC (the majority of glibc CVEs). Phase 1 runs it
+            # in-tree and self-validates (test must FAIL on the vulnerable build).
+            if getattr(entry.project_state, "regression_tests", None):
+                return True
             if require_poc and not entry.has_poc:
                 return False
             if require_verified_poc:
@@ -171,6 +200,7 @@ class OutputGenerator(PipelineModule):
             "CVE_Description", "CWE", "CWE_Description",
             "project_version", "project_version_normalized", "ubuntu_version",
             "poc_index", "poc_path", "poc_language",
+            "FIX_COMMIT", "TEST_PATH", "TEST_SUBDIR",
             "manual_review_required", "manual_verified",
         ]
         fieldnames = cfg.get("csv_fields", default_fields)
@@ -221,6 +251,105 @@ class OutputGenerator(PipelineModule):
         return total, len(rows), poc_saved
 
     # ------------------------------------------------------------------
+    # Companion archive fetch (multi-file PoCs)
+    # ------------------------------------------------------------------
+
+    def _fetch_companion_archive(
+        self, cve_id: str, exploit: Any, dest_dir: Path, cfg: Dict,
+    ) -> None:
+        """Download and extract a multi-file PoC's companion archive.
+
+        ExploitDB stores attachments in the separate ``exploitdb-bin-sploits``
+        repo as ``bin-sploits/<edb-id>.<ext>``. We extract every member into
+        ``exploits/<CVE>.d/`` (flattened — Phase 1 only reads top-level files),
+        skipping any ``exploit.*`` member so it can't clobber the primary PoC
+        binary Phase 1 compiles. General and best-effort: any failure (offline,
+        404, bad archive) leaves the single-file PoC untouched.
+        """
+        edb_id = str(getattr(exploit, "exploit_id", "")).replace("EDB-", "").strip()
+        archive_name = getattr(exploit, "companion_archive", "")
+        if not edb_id or not archive_name:
+            return
+
+        # Extension drives the parser; the remote file is keyed by EDB id.
+        low = archive_name.lower()
+        if low.endswith(".tar.gz") or low.endswith(".tgz"):
+            ext, kind = ".tar.gz", "tar"
+        elif low.endswith(".tar"):
+            ext, kind = ".tar", "tar"
+        elif low.endswith(".zip"):
+            ext, kind = ".zip", "zip"
+        else:
+            return
+
+        url_template = cfg.get(
+            "bin_sploits_url_template",
+            "https://gitlab.com/exploit-database/exploitdb-bin-sploits/-/raw/main/bin-sploits/{id}{ext}",
+        )
+        url = url_template.format(id=edb_id, ext=ext)
+
+        try:
+            resp = requests.get(url, timeout=60)
+            if resp.status_code != 200 or not resp.content:
+                self.logger.warning(
+                    "%s: companion archive fetch failed (HTTP %s) %s",
+                    cve_id, resp.status_code, url,
+                )
+                return
+            data = resp.content
+        except Exception as exc:  # network error, timeout, etc.
+            self.logger.warning("%s: companion archive download error: %s", cve_id, exc)
+            return
+
+        # Collect (basename -> bytes), skipping directories, the main exploit
+        # (avoids clobbering /poc/exploit), and path-traversal names.
+        members: Dict[str, bytes] = {}
+        try:
+            if kind == "tar":
+                with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+                    for m in tf.getmembers():
+                        if not m.isfile():
+                            continue
+                        base = Path(m.name).name
+                        if not base or base.startswith(".."):
+                            continue
+                        if Path(base).stem.lower() == "exploit":
+                            continue
+                        fh = tf.extractfile(m)
+                        if fh is not None:
+                            members[base] = fh.read()
+            else:  # zip
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    for name in zf.namelist():
+                        if name.endswith("/"):
+                            continue
+                        base = Path(name).name
+                        if not base or base.startswith(".."):
+                            continue
+                        if Path(base).stem.lower() == "exploit":
+                            continue
+                        members[base] = zf.read(name)
+        except Exception as exc:
+            self.logger.warning("%s: companion archive extraction error: %s", cve_id, exc)
+            return
+
+        if not members:
+            return
+
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            for base, blob in members.items():
+                (dest_dir / base).write_bytes(blob)
+        except OSError as exc:
+            self.logger.warning("%s: failed writing companion files: %s", cve_id, exc)
+            return
+
+        self.logger.info(
+            "%s: extracted %d companion file(s) to %s/: %s",
+            cve_id, len(members), dest_dir.name, ", ".join(sorted(members)),
+        )
+
+    # ------------------------------------------------------------------
     # Single-row builder
     # ------------------------------------------------------------------
 
@@ -257,8 +386,11 @@ class OutputGenerator(PipelineModule):
         if require_commit and not ps.fix_commit_hash:
             return None
 
-        # Require at least a PoC
-        if not entry.exploits:
+        # Require at least a PoC — an ExploitDB exploit OR a regression test the
+        # fixing commit ships (Option A). The latter lets CVEs with no ExploitDB
+        # entry (the majority of glibc CVEs) still reach Phase 1.
+        reg_tests = list(getattr(ps, "regression_tests", None) or [])
+        if not entry.exploits and not reg_tests:
             return None
 
         # ---- Save ALL PoC files and collect per-exploit info ----
@@ -325,6 +457,22 @@ class OutputGenerator(PipelineModule):
                     "PoC %d for %s needs manual review – not saving to exploits/",
                     saved_idx, cve_id,
                 )
+                # Remove any stale file written by a previous run: a PoC that was
+                # "repaired" before but is now flagged (e.g. the repair was
+                # rejected as a hallucination, or the source is now detected as a
+                # mislabeled advisory) must not leave bogus code behind for Phase 1.
+                if poc_path.exists():
+                    try:
+                        poc_path.unlink()
+                        self.logger.info(
+                            "Removed stale exploit file for %s: %s",
+                            cve_id, poc_path.name,
+                        )
+                    except OSError as exc:
+                        self.logger.warning(
+                            "Failed to remove stale exploit file %s: %s",
+                            poc_path, exc,
+                        )
             else:
                 try:
                     poc_path.write_text(content, encoding="utf-8")
@@ -334,12 +482,52 @@ class OutputGenerator(PipelineModule):
                     self.logger.warning("Failed to save PoC %d for %s: %s",
                                         saved_idx, cve_id, exc)
 
+                # Multi-file PoC: the primary exploit (index 0) may ship a
+                # companion archive (e.g. CVE-2014-5119's pty.c helper). Fetch and
+                # extract it into exploits/<CVE>.d/ so Phase 1 can build the helper
+                # the main PoC invokes (./pty). Best-effort; never fatal.
+                if poc_saved and saved_idx == 0 and getattr(exploit, "companion_archive", ""):
+                    self._fetch_companion_archive(
+                        cve_id, exploit, poc_dir / f"{cve_id}.d", cfg,
+                    )
+
             poc_infos.append({
                 "poc_index": saved_idx,
                 "poc_path": str(poc_path) if poc_saved else "",
                 "poc_language": poc_lang,
                 "needs_manual": needs_manual,
                 "poc_saved": poc_saved,
+            })
+            saved_idx += 1
+
+        # ---- Option A: emit the fixing commit's regression test(s) as PoCs ----
+        # poc_language "intree-test": Phase 1 overlays the test (by TEST_PATH at
+        # FIX_COMMIT) + its Makefile onto the vulnerable tree and runs it in-tree;
+        # baseline = the test FAILS on the vulnerable build. The test source is
+        # also saved for inspection. Always offered (in addition to any ExploitDB
+        # PoC) since it is typically the authoritative, deterministic reproducer.
+        for rt in reg_tests:
+            test_src = rt.get("content") or ""
+            if not test_src:
+                continue
+            test_file = poc_dir / f"{cve_id}.test{saved_idx}.c"
+            saved = False
+            try:
+                test_file.write_text(test_src, encoding="utf-8")
+                saved = True
+                any_poc_saved = True
+            except IOError as exc:
+                self.logger.warning("Failed to save regression test for %s: %s",
+                                    cve_id, exc)
+            poc_infos.append({
+                "poc_index": saved_idx,
+                "poc_path": str(test_file) if saved else "",
+                "poc_language": "intree-test",
+                "needs_manual": False,
+                "poc_saved": saved,
+                "test_path": rt.get("repo_path", ""),
+                "test_subdir": rt.get("subdir", ""),
+                "fix_commit": ps.fix_commit_hash or "",
             })
             saved_idx += 1
 
@@ -378,8 +566,32 @@ class OutputGenerator(PipelineModule):
         changed_units_map = ps.changed_code_units or {}
         vuln_files = ps.vulnerable_files_content or {}
 
-        for fpath, units in changed_units_map.items():
+        # Process production source files before test files: fix commits
+        # often ADD a regression test alongside the real fix, and a test
+        # file's "changed units" (e.g. a brand-new do_test with an empty
+        # vulnerable body) must not shadow the actual vulnerable function.
+        # Test-file rows are emitted only when NO production file yielded
+        # any unit (last-resort, so the CVE is not silently dropped).
+        _ordered_files = sorted(
+            changed_units_map.items(),
+            key=lambda kv: _is_test_file(kv[0]),
+        )
+        _prod_has_units = any(
+            units and not _is_test_file(fpath)
+            for fpath, units in changed_units_map.items()
+        )
+
+        for fpath, units in _ordered_files:
+            if _is_test_file(fpath) and _prod_has_units:
+                self.logger.debug(
+                    "%s: skipping test-file units from %s", cve_id, fpath
+                )
+                continue
             vuln_file_content = vuln_files.get(fpath, "")
+            # Within a file, prefer units that actually have a vulnerable
+            # body (units new in the fix commit have an empty vuln_body and
+            # are useless for patch generation).
+            units = sorted(units, key=lambda u: not (u.get("vuln_body") or ""))
             for unit in units:
                 base_rows.append({
                     "CVE": cve_id,
@@ -456,6 +668,11 @@ class OutputGenerator(PipelineModule):
                 row["poc_index"] = pi["poc_index"]
                 row["poc_path"] = pi["poc_path"]
                 row["poc_language"] = pi["poc_language"]
+                # Option A: in-tree regression-test PoCs carry the fix ref + the
+                # test's in-repo path so Phase 1 can overlay and run it.
+                row["FIX_COMMIT"] = pi.get("fix_commit", "")
+                row["TEST_PATH"] = pi.get("test_path", "")
+                row["TEST_SUBDIR"] = pi.get("test_subdir", "")
                 row["manual_review_required"] = pi["needs_manual"]
                 row["manual_verified"] = "pending" if pi["needs_manual"] else "done"
                 row["_poc_saved"] = pi["poc_saved"]

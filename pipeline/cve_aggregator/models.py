@@ -34,6 +34,12 @@ class ExploitInfo:
     exploitdb_url: str = ""
     match_type: str = ""         # How this exploit was matched (csv_metadata, content_search, …)
     verified: bool = False
+    # Companion archive name from the ExploitDB CSV ``aliases`` column (e.g.
+    # "CVE-2014-5119.tar.gz"). Non-empty when the exploit is multi-file: the
+    # full archive lives in the exploitdb-bin-sploits repo as
+    # ``bin-sploits/<edb-id>.<ext>`` and contains helper files (e.g. pty.c) the
+    # main PoC invokes at runtime. OutputGenerator extracts it to exploits/<CVE>.d/.
+    companion_archive: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return dc.asdict(self)
@@ -62,6 +68,13 @@ class ProjectState:
     vulnerable_functions: Optional[Dict[str, Any]] = None
     # Per-file list of changed code units (functions/macros) with full bodies
     changed_code_units: Optional[Dict[str, List[Dict[str, str]]]] = None
+    # Regression tests ADDED/changed by the fixing commit (Option A: use the
+    # project's own test as the reproducer). Each entry:
+    #   {"repo_path": <in-repo path, e.g. iconvdata/tst-foo.c>,
+    #    "subdir": <e.g. iconvdata>, "name": <e.g. tst-foo>, "content": <source>}
+    # Run in-tree by Phase 1: overlay test+Makefile onto the vulnerable tree,
+    # `make test t=subdir/name`; baseline = test FAILS on the vulnerable build.
+    regression_tests: Optional[List[Dict[str, str]]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return dc.asdict(self)

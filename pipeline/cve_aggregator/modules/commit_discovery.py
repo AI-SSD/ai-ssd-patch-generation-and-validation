@@ -26,7 +26,11 @@ from ..utils.git_utils import (
     get_parent_commit,
 )
 from ..utils.code_parser import find_changed_units
-from ..utils.file_utils import classify_file_type
+from ..utils.file_utils import (
+    classify_file_type,
+    is_regression_test_path,
+    resolve_test_build_subdir,
+)
 from .base import PipelineModule
 
 logger = logging.getLogger(__name__)
@@ -168,7 +172,9 @@ class CommitDiscovery(PipelineModule):
         if not repo_path.exists():
             return ps
 
-        # Find fix commit
+        # Find fix commit. Pass source_extensions so primary-fix selection can
+        # prefer the commit that actually modifies project source (over a
+        # ChangeLog/test-only follow-up that shares the bug reference).
         fix = find_cve_fix_commit(
             repo_path,
             cve_id,
@@ -177,6 +183,14 @@ class CommitDiscovery(PipelineModule):
             enable_bz_fallback=cfg.get("enable_bz_fallback", True),
             allow_unscoped_extra_patterns=cfg.get("allow_unscoped_extra_patterns", False),
             commit_index=commit_index,
+            source_exts=cfg.get("source_extensions", [".c", ".h"]),
+            # Only trust bug ids from the project's native tracker host(s); skip
+            # cross-vendor distro trackers (Red Hat/SUSE/…) whose ids are unrelated
+            # to the repo. Empty/unset → built-in foreign-tracker denylist.
+            native_bug_hosts=cfg.get("bugzilla_hosts"),
+            # Opt-in network step: follow a distro Bugzilla reference to the
+            # upstream (native) bug id and find its fix commit. Off by default.
+            enable_online_bug_resolution=cfg.get("enable_online_bug_resolution", False),
         )
         if not fix:
             return ps
@@ -254,6 +268,57 @@ class CommitDiscovery(PipelineModule):
                 self.logger.debug(
                     "  %s: %d changed code units", fpath, len(units),
                 )
+
+        # ---------------------------------------------------------------
+        # Option A: harvest the regression test(s) the fixing commit ships,
+        # so Phase 1 can use the project's OWN reproducer (run in-tree on the
+        # vulnerable build). The test source is read at the FIX commit; Phase 1
+        # overlays it onto the vulnerable parent tree. General — no per-CVE code.
+        # ---------------------------------------------------------------
+        # Makefiles the fixing commit touched, used to resolve each test's REAL
+        # build subdir (the dir whose Makefile registers the test) — not always
+        # the test source's first path component (e.g. a sysdeps/ test gets
+        # registered in math/Makefile). Read once at the fix commit.
+        # Config gate (default ON): when commit_discovery.harvest_regression_tests
+        # is false, Option A is disabled and Phase 1 falls back to PoC-only
+        # reproducers (e.g. ExploitDB). Reversible — flip the flag to re-enable.
+        harvest_regression_tests = self.config.get("commit_discovery", {}).get(
+            "harvest_regression_tests", True)
+
+        regression_tests: List[Dict[str, str]] = []
+        if harvest_regression_tests:
+            # Makefiles the fixing commit touched, used to resolve each test's REAL
+            # build subdir (the dir whose Makefile registers the test).
+            changed_makefiles = [
+                f["file_path"] for f in (ps.changed_files or [])
+                if f["file_path"].replace("\\", "/").rsplit("/", 1)[-1] == "Makefile"
+            ]
+            makefile_contents = [
+                (m, get_file_content_at_commit(repo_path, m, fix) or "")
+                for m in changed_makefiles
+            ]
+            for finfo in (ps.changed_files or []):
+                tpath = finfo["file_path"]
+                if not is_regression_test_path(tpath):
+                    continue
+                content = get_file_content_at_commit(repo_path, tpath, fix)
+                if not content:
+                    continue
+                parts = tpath.split("/")
+                name = parts[-1].rsplit(".", 1)[0]
+                default_subdir = parts[0] if len(parts) > 1 else ""
+                subdir = resolve_test_build_subdir(name, makefile_contents, default_subdir)
+                regression_tests.append({
+                    "repo_path": tpath, "subdir": subdir, "name": name,
+                    "content": content,
+                })
+        if regression_tests:
+            ps.regression_tests = regression_tests
+            self.logger.info(
+                "  %s: fixing commit ships %d regression test(s): %s",
+                cve_id, len(regression_tests),
+                ", ".join(t["repo_path"] for t in regression_tests),
+            )
 
         return ps
 

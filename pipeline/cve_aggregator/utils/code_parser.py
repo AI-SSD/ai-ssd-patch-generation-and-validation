@@ -43,6 +43,88 @@ def strip_code_for_comparison(code: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Analysis-view helpers
+# ---------------------------------------------------------------------------
+
+def _build_analysis_view(content: str) -> str:
+    """Return a same-length copy of *content* where characters that must not
+    influence structural analysis are blanked out (replaced by spaces,
+    newlines preserved):
+
+    1. Comment interiors (``/* … */`` and ``// …``) — braces inside comments
+       would corrupt brace matching.
+    2. Non-first branches of preprocessor conditionals (``#else``/``#elif``
+       up to the matching ``#endif``) — C code such as glibc routinely opens
+       the *same* brace in every branch of an ``#if``/``#else`` group, so
+       counting braces in more than one branch unbalances the walk and makes
+       whole functions undetectable.
+
+    Because the view preserves offsets, regex matches and brace positions
+    found on the view can be used to slice the ORIGINAL content.
+    """
+    chars = list(content)
+    n = len(chars)
+
+    # Pass 1: blank comment interiors (string/char literal aware)
+    i = 0
+    while i < n:
+        ch = content[i]
+        if ch == '"' or ch == "'":
+            quote = ch
+            i += 1
+            while i < n and content[i] != quote:
+                if content[i] == "\\":
+                    i += 1
+                i += 1
+            i += 1
+        elif ch == "/" and i + 1 < n and content[i + 1] == "*":
+            j = content.find("*/", i + 2)
+            j = n if j == -1 else j + 2
+            for k in range(i, j):
+                if chars[k] != "\n":
+                    chars[k] = " "
+            i = j
+        elif ch == "/" and i + 1 < n and content[i + 1] == "/":
+            j = content.find("\n", i)
+            j = n if j == -1 else j
+            for k in range(i, j):
+                chars[k] = " "
+            i = j
+        else:
+            i += 1
+
+    decommented = "".join(chars)
+
+    # Pass 2: blank non-first preprocessor branches (line-based).
+    # Stack entries: True while the *active* (first) branch is being kept.
+    out_lines: List[str] = []
+    stack: List[bool] = []
+    for line in decommented.split("\n"):
+        directive = line.lstrip()
+        is_if = re.match(r"#\s*if(def|ndef)?\b", directive)
+        is_else = re.match(r"#\s*(else\b|elif\b)", directive)
+        is_endif = re.match(r"#\s*endif\b", directive)
+
+        if is_if:
+            stack.append(True)
+            out_lines.append(line)
+        elif is_else and stack:
+            stack[-1] = False
+            out_lines.append(" " * len(line))
+        elif is_endif:
+            if stack:
+                stack.pop()
+            out_lines.append(line)
+        elif False in stack:
+            # Inside a discarded branch (possibly nested) — blank it.
+            out_lines.append(" " * len(line))
+        else:
+            out_lines.append(line)
+
+    return "\n".join(out_lines)
+
+
+# ---------------------------------------------------------------------------
 # C function extraction  (robust version from extract_patches.py)
 # ---------------------------------------------------------------------------
 
@@ -57,9 +139,29 @@ _FUNCTION_SIGNATURE_RE = re.compile(
     r"\s+)*"                       # return type (optional qualifiers + type)
     r"(\*?\s*\w+)\s*"             # function name (may have pointer star)
     r"\([^)]*\)\s*"               # parameter list
+    r"(?:[^;{}()]*;)*\s*"         # optional K&R-style parameter declarations
+                                   # (old C: `foo (a, b)\n int a;\n char *b;\n {`).
+                                   # Each is a `;`-terminated decl; zero matches ⇒
+                                   # normal `) {` still works. This is what makes
+                                   # glibc's macro-named K&R funcs (e.g.
+                                   # ____STRTOF_INTERNAL) extractable.
+                                   # Excludes ()  so the block CANNOT bridge across a
+                                   # preceding `name(...)` (e.g. a `#define X F (Y)`
+                                   # macro) into a distant `{` and swallow the real
+                                   # definition under a bogus name. Also: no `\s*`
+                                   # INSIDE the repeat — `;` is a hard delimiter, so
+                                   # each iteration has a unique end, avoiding
+                                   # catastrophic backtracking on large files.
     r"\{",                         # opening brace
     re.MULTILINE,
 )
+
+
+# Lines consisting only of type/qualifier tokens (e.g. "char *", "FLOAT",
+# "static unsigned long int") — used to pull a GNU-style return type written
+# on its own line into the function span. Mirrors patch_generator's regex of
+# the same name so Phase 0 extraction and Phase 2 splicing agree.
+_DECL_PREFIX_RE = re.compile(r'^[ \t]*[A-Za-z_][A-Za-z0-9_ \t]*\**[ \t]*$')
 
 
 def extract_c_functions(content: str) -> Dict[str, str]:
@@ -70,10 +172,17 @@ def extract_c_functions(content: str) -> Dict[str, str]:
 
     Uses the robust regex and brace-matching approach from
     ``extract_patches.py``.
+
+    Matching and brace-walking run on an *analysis view* of the content
+    (comments and non-first preprocessor branches blanked out, offsets
+    preserved) so that braces inside comments or in ``#else`` branches do
+    not unbalance the walk.  Function bodies are sliced from the ORIGINAL
+    content using the view's offsets.
     """
     functions: Dict[str, str] = {}
+    view = _build_analysis_view(content)
 
-    for match in _FUNCTION_SIGNATURE_RE.finditer(content):
+    for match in _FUNCTION_SIGNATURE_RE.finditer(view):
         try:
             f_name_raw = match.group(2)
             if not f_name_raw:
@@ -89,13 +198,36 @@ def extract_c_functions(content: str) -> Dict[str, str]:
                 continue
 
             signature_start = match.start()
+
+            # Extend upward over a GNU-style return-type line written on its
+            # own line above the name (e.g. glibc's macro return type:
+            #   FLOAT\n____STRTOF_INTERNAL (nptr, endptr, group, loc)).
+            # The signature regex only recognizes a whitelist of type keywords,
+            # so a macro/typedef return type (FLOAT, __mpz_struct, etc.) is left
+            # out of the match and the extracted function would otherwise begin
+            # at the name — losing its return type. Mirror the boundary logic in
+            # patch_generator.find_function_boundaries so Phase 0's extracted
+            # function matches what Phase 2 splices.
+            fs = signature_start
+            for _ in range(4):
+                if fs == 0:
+                    break
+                prev_nl = view.rfind("\n", 0, fs - 1)
+                prev_start = prev_nl + 1 if prev_nl != -1 else 0
+                prev_line = view[prev_start:fs - 1]
+                if prev_line.strip() and _DECL_PREFIX_RE.match(prev_line):
+                    fs = prev_start
+                else:
+                    break
+            signature_start = fs
+
             brace_pos = match.end() - 1  # the '{' character
 
             # Walk forward to find the matching closing brace
             depth = 1
             i = brace_pos + 1
-            while i < len(content) and depth > 0:
-                ch = content[i]
+            while i < len(view) and depth > 0:
+                ch = view[i]
                 if ch == "{":
                     depth += 1
                 elif ch == "}":
@@ -103,15 +235,15 @@ def extract_c_functions(content: str) -> Dict[str, str]:
                 elif ch == '"':
                     # skip string literal
                     i += 1
-                    while i < len(content) and content[i] != '"':
-                        if content[i] == "\\":
+                    while i < len(view) and view[i] != '"':
+                        if view[i] == "\\":
                             i += 1
                         i += 1
                 elif ch == "'":
                     # skip char literal
                     i += 1
-                    while i < len(content) and content[i] != "'":
-                        if content[i] == "\\":
+                    while i < len(view) and view[i] != "'":
+                        if view[i] == "\\":
                             i += 1
                         i += 1
                 i += 1

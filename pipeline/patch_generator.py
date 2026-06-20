@@ -36,6 +36,12 @@ BASE_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(BASE_DIR))
 from master_pipeline.config import load_pipeline_config, cfg_section  # noqa: E402
 
+# Structural-analysis view: blanks comment interiors and non-first
+# preprocessor branches while preserving offsets, so brace matching is not
+# corrupted by braces/apostrophes in comments (e.g. GNU-style `foo' quoting)
+# or by #if/#else groups that open the same brace in every branch.
+from cve_aggregator.utils.code_parser import _build_analysis_view  # noqa: E402
+
 _cfg = load_pipeline_config(BASE_DIR)
 _llm = _cfg.get("llm", {}) if isinstance(_cfg.get("llm"), dict) else {}
 _paths = _cfg.get("paths", {}) if isinstance(_cfg.get("paths"), dict) else {}
@@ -60,6 +66,21 @@ if not OPENAI_API_KEY:
     _key_file = BASE_DIR / "API-openai-key"
     if _key_file.exists():
         OPENAI_API_KEY = _key_file.read_text().strip()
+
+# Optional per-attempt model escalation for the feedback loop. Keys are attempt
+# numbers (1 = the initial Phase 2 generation, 2 = first retry, ...), values are
+# model ids. Honored only for the OpenAI provider; an attempt not listed falls
+# back to OPENAI_MODEL. The feedback loop reads the same config and passes the
+# resolved model per retry via ``generation_model`` (see generate_patch_with_feedback).
+_fb_cfg = _cfg.get("feedback_loop", {}) if isinstance(_cfg.get("feedback_loop"), dict) else {}
+FEEDBACK_MODELS_BY_ATTEMPT = {
+    str(k): str(v) for k, v in (_fb_cfg.get("models_by_attempt") or {}).items() if v
+}
+# Attempt-1 override: the initial Phase 2 generation (which the feedback loop
+# reuses as attempt 1) should use the attempt-1 model when one is configured,
+# so the per-attempt schedule is honored end-to-end.
+if LLM_PROVIDER == "openai" and FEEDBACK_MODELS_BY_ATTEMPT.get("1"):
+    OPENAI_MODEL = FEEDBACK_MODELS_BY_ATTEMPT["1"]
 
 # Shared request settings
 API_TIMEOUT = int(_llm.get("timeout", 600))
@@ -130,45 +151,113 @@ syntax_logger = logging.getLogger('syntax_errors')
 # Prompt Engineering
 # =============================================================================
 
-SYSTEM_PROMPT = """You are an expert C security engineer specializing in vulnerability patching for the GNU C Library (glibc). Your task is to fix security vulnerabilities in C functions while maintaining complete backward compatibility.
+# Shared description of the SEARCH/REPLACE edit format both prompts require.
+# Patches are expressed as minimal edits applied by literal string match, NOT
+# as whole-function rewrites — so the model never re-transcribes (and corrupts)
+# the hundreds of unchanged lines / macros / K&R prototypes around the fix.
+_SEARCH_REPLACE_FORMAT = """You fix the vulnerability by emitting one or more SEARCH/REPLACE edit blocks, each in EXACTLY this format (markers on their own lines):
 
-CRITICAL REQUIREMENTS:
-1. PRESERVE THE EXACT FUNCTION SIGNATURE - Do not modify the return type, function name, or parameter list under any circumstances.
-2. Return ONLY the patched C function code - no explanations, no markdown formatting, no code fences.
-3. Ensure the patch addresses the specific vulnerability while maintaining the original functionality.
-4. Use defensive programming practices: bounds checking, input validation, and safe memory operations.
-5. Maintain code style consistency with the original function.
-6. Do not add new includes or external dependencies unless absolutely necessary for the fix.
+<<<<<<< SEARCH
+<lines copied VERBATIM from the vulnerable code shown to you>
+=======
+<the replacement lines>
+>>>>>>> REPLACE
 
-OUTPUT FORMAT:
-Return only valid C code. Start directly with the function definition. Do not wrap in markdown code blocks (```). Do not include any text before or after the function code."""
+EDIT RULES:
+1. The SEARCH text MUST be copied character-for-character from the VULNERABLE FUNCTION CODE shown to you — same tokens, same indentation. It is located by literal matching, so any deviation makes the edit fail.
+2. SEARCH must match a UNIQUE location. If a single line is ambiguous, include a few unchanged surrounding lines so the block matches exactly one place.
+3. Make the SMALLEST edit that fixes the vulnerability. Change only the lines that must change. Do NOT reprint the whole function. Do NOT touch the function signature, return type, declaring macros (e.g. MPN_VAR), or unrelated lines.
+4. Emit MULTIPLE SEARCH/REPLACE blocks when the fix spans several places. Each block is applied independently.
+5. Preserve behavior for all legitimate inputs; add the bounds/overflow/validation checks needed to stop the exploit.
+6. Output ONLY the SEARCH/REPLACE block(s) — no prose, no explanations, no markdown code fences."""
+
+
+SYSTEM_PROMPT = """You are an expert C security engineer specializing in vulnerability patching for the GNU C Library (glibc). Your task is to fix a security vulnerability by making the SMALLEST POSSIBLE EDIT to the vulnerable function — never by rewriting it.
+
+""" + _SEARCH_REPLACE_FORMAT
 
 
 # System prompt for retry/feedback loop with failure context
-FEEDBACK_SYSTEM_PROMPT = """You are an expert C security engineer specializing in vulnerability patching for the GNU C Library (glibc). Your previous patch attempt FAILED validation. You must analyze the failure and generate an improved patch.
+FEEDBACK_SYSTEM_PROMPT = """You are an expert C security engineer specializing in vulnerability patching for the GNU C Library (glibc). Your previous patch attempt FAILED validation. Analyze the failure and produce an improved fix as MINIMAL edits — never rewrite the whole function.
 
-CRITICAL REQUIREMENTS:
-1. PRESERVE THE EXACT FUNCTION SIGNATURE - Do not modify the return type, function name, or parameter list under any circumstances.
-2. Return ONLY the patched C function code - no explanations, no markdown formatting, no code fences.
-3. Carefully analyze the FAILURE CONTEXT provided to understand why your previous patch failed.
-4. Address both the original vulnerability AND the issues identified in the failure feedback.
-5. Use defensive programming practices: bounds checking, input validation, and safe memory operations.
-6. Do not add new includes or external dependencies unless absolutely necessary for the fix.
+""" + _SEARCH_REPLACE_FORMAT + """
 
-OUTPUT FORMAT:
-Return only valid C code. Start directly with the function definition. Do not wrap in markdown code blocks (```). Do not include any text before or after the function code."""
+Carefully read the FAILURE ANALYSIS: if the PoC still works your fix was insufficient; if the build failed your edit introduced a compile error (often by quoting SEARCH text that did not match, or by editing lines you should have left alone)."""
 
 
-def create_patch_prompt(cve_id: str, function_name: str, vulnerable_code: str, file_context: str) -> str:
+def _find_poc_source(cve_id: str, max_len: int = 3000) -> str:
+    """Read the primary PoC source for *cve_id* from the exploits directory.
+
+    Looks for ``exploits/<CVE>.<ext>`` (the primary PoC, not _pocN variants).
+    Returns the truncated source, or "" when no PoC file exists.
+    """
+    exploits_dir = BASE_DIR / str(_paths.get("exploits_dir", "exploits"))
+    try:
+        candidates = sorted(
+            p for p in exploits_dir.glob(f"{cve_id}.*")
+            if p.is_file()
+        )
+    except OSError:
+        return ""
+    if not candidates:
+        return ""
+    try:
+        src = candidates[0].read_text(errors="replace")
+    except OSError:
+        return ""
+    if len(src) > max_len:
+        src = src[:max_len] + "\n/* ... PoC truncated for brevity ... */"
+    return src
+
+
+def _build_vulnerability_context(
+    cve_id: str,
+    description: Optional[str] = None,
+    cwe: Optional[str] = None,
+    cwe_description: Optional[str] = None,
+) -> str:
+    """Build the vulnerability-knowledge section shared by both prompts:
+    the CVE/CWE description (when available from the Phase 0 CSV) and the
+    actual PoC exploit source — so the model knows the exact attack vector
+    its patch must block."""
+    sections = []
+
+    desc = (description or "").strip()
+    if desc and desc.lower() not in ("nan", "none"):
+        if len(desc) > 900:
+            desc = desc[:900] + " ..."
+        sections.append(f"VULNERABILITY DESCRIPTION:\n{desc}")
+
+    cwe_line = " ".join(
+        s.strip() for s in (cwe, cwe_description)
+        if s and str(s).strip().lower() not in ("nan", "none")
+    )
+    if cwe_line:
+        sections.append(f"WEAKNESS CLASS: {cwe_line}")
+
+    poc_src = _find_poc_source(cve_id)
+    if poc_src:
+        sections.append(
+            "PROOF-OF-CONCEPT EXPLOIT (this is the exact attack your patch "
+            "must stop — after patching, this program must no longer trigger "
+            "the vulnerability):\n" + poc_src
+        )
+
+    return "\n\n".join(sections)
+
+
+def create_patch_prompt(cve_id: str, function_name: str, vulnerable_code: str,
+                        file_context: str, vuln_context: str = "") -> str:
     """
     Create a detailed prompt for patch generation.
-    
+
     Args:
         cve_id: The CVE identifier
         function_name: Name of the vulnerable function
         vulnerable_code: The vulnerable function code
         file_context: Full file content for context (truncated if too long)
-    
+        vuln_context: CVE description / CWE / PoC source section (optional)
+
     Returns:
         Formatted user prompt string
     """
@@ -176,39 +265,41 @@ def create_patch_prompt(cve_id: str, function_name: str, vulnerable_code: str, f
     max_context_len = 4000
     if len(file_context) > max_context_len:
         file_context = file_context[:max_context_len] + "\n/* ... file truncated for brevity ... */"
-    
+
+    vuln_section = f"\n{vuln_context}\n" if vuln_context else ""
+
     prompt = f"""VULNERABILITY: {cve_id}
 FUNCTION NAME: {function_name}
-
-VULNERABLE FUNCTION CODE:
+{vuln_section}
+VULNERABLE FUNCTION CODE (copy your SEARCH text verbatim from here):
 {vulnerable_code}
 
 FILE CONTEXT (for understanding types and dependencies):
 {file_context}
 
-TASK: Provide a patched version of the function '{function_name}' that fixes the {cve_id} vulnerability.
+TASK: Fix the {cve_id} vulnerability in the function '{function_name}' using SEARCH/REPLACE edit block(s).
 
 REMEMBER:
-- Keep the EXACT same function signature: same return type, same name, same parameters
-- Return ONLY the C code for the function
-- No markdown, no explanations, no code fences
-- Start directly with the function definition"""
+- Copy each SEARCH section character-for-character from the VULNERABLE FUNCTION CODE above
+- Make the smallest edit that fixes the vulnerability; do not rewrite the whole function or touch its signature
+- Output ONLY SEARCH/REPLACE block(s) — no markdown, no explanations"""
 
     return prompt
 
 
 def create_feedback_prompt(
-    cve_id: str, 
-    function_name: str, 
-    vulnerable_code: str, 
+    cve_id: str,
+    function_name: str,
+    vulnerable_code: str,
     file_context: str,
     previous_patch: str,
     failure_context: Dict[str, Any],
-    attempt_number: int
+    attempt_number: int,
+    vuln_context: str = ""
 ) -> str:
     """
     Create a prompt for retry patch generation with failure feedback context.
-    
+
     Args:
         cve_id: The CVE identifier
         function_name: Name of the vulnerable function
@@ -217,7 +308,8 @@ def create_feedback_prompt(
         previous_patch: The previous failed patch attempt
         failure_context: Dictionary containing failure details from Phase 3
         attempt_number: Current retry attempt number
-    
+        vuln_context: CVE description / CWE / PoC source section (optional)
+
     Returns:
         Formatted user prompt string with failure context
     """
@@ -225,18 +317,27 @@ def create_feedback_prompt(
     max_context_len = 3000  # Slightly smaller to accommodate failure context
     if len(file_context) > max_context_len:
         file_context = file_context[:max_context_len] + "\n/* ... file truncated for brevity ... */"
-    
+
     # Truncate previous patch if too long
     max_patch_len = 2000
     if len(previous_patch) > max_patch_len:
         previous_patch = previous_patch[:max_patch_len] + "\n/* ... patch truncated ... */"
-    
+
     # Build failure analysis section
     failure_analysis = _build_failure_analysis(failure_context)
-    
+
+    vuln_section = ""
+    if vuln_context:
+        vuln_section = f"""
+═══════════════════════════════════════════════════════════════════
+VULNERABILITY KNOWLEDGE (description / exploit your patch must stop):
+═══════════════════════════════════════════════════════════════════
+{vuln_context}
+"""
+
     prompt = f"""RETRY ATTEMPT #{attempt_number} for VULNERABILITY: {cve_id}
 FUNCTION NAME: {function_name}
-
+{vuln_section}
 ═══════════════════════════════════════════════════════════════════
 PREVIOUS PATCH ATTEMPT (FAILED):
 ═══════════════════════════════════════════════════════════════════
@@ -248,7 +349,7 @@ FAILURE ANALYSIS:
 {failure_analysis}
 
 ═══════════════════════════════════════════════════════════════════
-ORIGINAL VULNERABLE CODE:
+ORIGINAL VULNERABLE CODE (copy your SEARCH text verbatim from here):
 ═══════════════════════════════════════════════════════════════════
 {vulnerable_code}
 
@@ -258,19 +359,19 @@ FILE CONTEXT (for understanding types and dependencies):
 {file_context}
 
 ═══════════════════════════════════════════════════════════════════
-TASK: Generate an IMPROVED patch that:
+TASK: Generate an IMPROVED fix, as SEARCH/REPLACE edit block(s), that:
 1. Fixes the original {cve_id} vulnerability
 2. Addresses the specific failures identified above
-3. Maintains the EXACT same function signature
+3. Changes as few lines as possible and never touches the signature/macros
 
 CRITICAL: Learn from the failure. If PoC still works, your previous fix was insufficient.
-If SAST found issues, you may have introduced new vulnerabilities.
+If the build failed, your SEARCH text likely did not match the real code, or you edited
+lines you should not have — re-copy SEARCH verbatim from the ORIGINAL VULNERABLE CODE.
 
 REMEMBER:
-- Keep the EXACT same function signature
-- Return ONLY the C code for the function
-- No markdown, no explanations, no code fences
-- Start directly with the function definition"""
+- Copy each SEARCH section character-for-character from the ORIGINAL VULNERABLE CODE above
+- Make the smallest edit that fixes the vulnerability
+- Output ONLY SEARCH/REPLACE block(s) — no markdown, no explanations"""
 
     return prompt
 
@@ -579,6 +680,33 @@ def _call_ollama_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[
     return None, metadata
 
 
+def _is_openai_reasoning_model(model: str) -> bool:
+    """True for models that use the newer Chat Completions parameter contract.
+
+    The gpt-5 family and the o-series reasoning models (o1/o3/o4...) reject
+    ``max_tokens`` (they require ``max_completion_tokens``) and only accept the
+    default ``temperature`` (1). Older chat models (gpt-4.1, gpt-4o, gpt-4-*,
+    gpt-3.5-*) take ``max_tokens`` + a custom temperature.
+    """
+    m = (model or "").lower()
+    return (
+        m.startswith("gpt-5")
+        or m.startswith("o1")
+        or m.startswith("o3")
+        or m.startswith("o4")
+    )
+
+
+def _openai_sampling_kwargs(model: str) -> Dict[str, Any]:
+    """Return model-appropriate token/temperature kwargs for the chat call."""
+    if _is_openai_reasoning_model(model):
+        # Reasoning models bill reasoning tokens against the completion budget,
+        # so give them headroom (8k can be fully consumed by reasoning, leaving
+        # empty content). Temperature is omitted (only the default is allowed).
+        return {"max_completion_tokens": max(LLM_MAX_TOKENS, 16384)}
+    return {"max_tokens": LLM_MAX_TOKENS, "temperature": LLM_TEMPERATURE}
+
+
 def _call_openai_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[Optional[str], Dict[str, Any]]:
     """Call the OpenAI API with retry logic."""
     try:
@@ -605,6 +733,10 @@ def _call_openai_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[
         "error": None
     }
 
+    # Token/temperature contract differs between classic and reasoning models.
+    # Start from the name-based guess; the loop below adapts if the API rejects it.
+    sampling = _openai_sampling_kwargs(model)
+
     for attempt in range(MAX_RETRIES):
         try:
             logger.debug(f"OpenAI API call attempt {attempt + 1}/{MAX_RETRIES} for model {model}")
@@ -614,8 +746,7 @@ def _call_openai_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=LLM_TEMPERATURE,
-                max_tokens=LLM_MAX_TOKENS,
+                **sampling,
             )
             content = completion.choices[0].message.content or ""
             usage = completion.usage
@@ -639,6 +770,32 @@ def _call_openai_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[
             logger.error(f"OpenAI API error on attempt {attempt + 1}: {e}")
             metadata["error"] = str(e)
             metadata["retries"] = attempt + 1
+            # Adaptive parameter fallback: if the model rejects the token/
+            # temperature parameter we chose (e.g. a reasoning model the name
+            # heuristic missed), swap to the other contract and retry without
+            # consuming the delay. Covers both directions.
+            msg = str(e).lower()
+            if "max_completion_tokens" in msg and "max_tokens" in sampling:
+                logger.info(
+                    f"Model {model} requires max_completion_tokens — switching "
+                    f"parameter contract and retrying."
+                )
+                sampling = {"max_completion_tokens": max(LLM_MAX_TOKENS, 16384)}
+                continue
+            if (("'temperature'" in msg or "unsupported value: 'temperature'" in msg
+                 or "temperature" in msg and "unsupported" in msg)
+                    and "temperature" in sampling):
+                logger.info(
+                    f"Model {model} rejects a custom temperature — dropping it and retrying."
+                )
+                sampling.pop("temperature", None)
+                continue
+            if "max_tokens" in msg and "max_completion_tokens" in sampling:
+                logger.info(
+                    f"Model {model} requires max_tokens — switching parameter contract."
+                )
+                sampling = {"max_tokens": LLM_MAX_TOKENS, "temperature": LLM_TEMPERATURE}
+                continue
         if attempt < MAX_RETRIES - 1:
             logger.info(f"Retrying in {RETRY_DELAY} seconds...")
             time.sleep(RETRY_DELAY)
@@ -648,27 +805,33 @@ def _call_openai_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[
     return None, metadata
 
 
-def call_llm_api(model: str, user_prompt: str, system_prompt: str = SYSTEM_PROMPT) -> Tuple[Optional[str], Dict[str, Any]]:
+def call_llm_api(model: str, user_prompt: str, system_prompt: str = SYSTEM_PROMPT,
+                 model_override: Optional[str] = None) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Call the configured LLM backend (Ollama or OpenAI) with retry logic.
 
     Dispatches to ``_call_ollama_api`` or ``_call_openai_api`` based on
     ``llm.provider`` in config.yaml.  For the OpenAI provider, *model* is
-    replaced by ``OPENAI_MODEL`` (the caller-supplied value is ignored so
-    that the per-CVE model-iteration loop in Phase 2 still works without
-    changes).
+    normally replaced by ``OPENAI_MODEL`` (the caller-supplied value is ignored
+    so the per-CVE model-iteration loop in Phase 2 still works without changes).
+
+    ``model_override`` takes precedence over both: the feedback loop uses it to
+    select a different model per retry attempt (see ``models_by_attempt`` in
+    config.yaml). When set, it is the model actually used and recorded in the
+    returned metadata for BOTH providers.
 
     Args:
-        model: Ollama model name (ignored when provider="openai")
+        model: Ollama model name (ignored when provider="openai" and no override)
         user_prompt: The user's prompt
         system_prompt: System prompt for context
+        model_override: Explicit model id to use, overriding the provider default
 
     Returns:
         Tuple of (response_content, metadata_dict)
     """
     if LLM_PROVIDER == "openai":
-        return _call_openai_api(OPENAI_MODEL, user_prompt, system_prompt)
-    return _call_ollama_api(model, user_prompt, system_prompt)
+        return _call_openai_api(model_override or OPENAI_MODEL, user_prompt, system_prompt)
+    return _call_ollama_api(model_override or model, user_prompt, system_prompt)
 
 # =============================================================================
 # Code Extraction & Cleaning
@@ -710,6 +873,40 @@ def strip_markdown_fences(code: str) -> str:
     return code.strip()
 
 
+def _walk_to_matching_brace(view: str, open_idx: int) -> int:
+    """Return the index just past the brace matching ``view[open_idx]``.
+
+    *view* must be an analysis view (comments and inactive #if branches
+    blanked), so only string/char literals need handling here. Returns -1
+    if no matching brace is found.
+    """
+    depth = 0
+    in_string = False
+    in_char = False
+    escape_next = False
+    i = open_idx
+    n = len(view)
+    while i < n:
+        ch = view[i]
+        if escape_next:
+            escape_next = False
+        elif ch == '\\':
+            escape_next = True
+        elif ch == '"' and not in_char:
+            in_string = not in_string
+        elif ch == "'" and not in_string:
+            in_char = not in_char
+        elif not in_string and not in_char:
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+        i += 1
+    return -1
+
+
 def extract_code_from_response(response: str, function_name: str) -> str:
     """
     Extract clean C code from LLM response.
@@ -748,40 +945,23 @@ def extract_code_from_response(response: str, function_name: str) -> str:
         rf'(\b{re.escape(function_name)}\s*\([^;]*?\)\s*\{{)',
     ]
     
+    # Search and brace-match on the analysis view (comments and inactive
+    # #if branches blanked) but slice from the original text — apostrophes
+    # in comments and #if/#else brace imbalance must not corrupt the walk.
+    view = _build_analysis_view(code)
     match = None
     for pattern in func_patterns:
-        match = re.search(pattern, code, re.MULTILINE | re.DOTALL)
+        match = re.search(pattern, view, re.MULTILINE | re.DOTALL)
         if match:
             break
     if match:
         start_idx = match.start()
-        # Find matching closing brace
-        brace_count = 0
-        end_idx = start_idx
-        in_string = False
-        in_char = False
-        escape_next = False
-        
-        for i, char in enumerate(code[start_idx:], start=start_idx):
-            if escape_next:
-                escape_next = False
-                continue
-            if char == '\\':
-                escape_next = True
-                continue
-            if char == '"' and not in_char:
-                in_string = not in_string
-            elif char == "'" and not in_string:
-                in_char = not in_char
-            elif not in_string and not in_char:
-                if char == '{':
-                    brace_count += 1
-                elif char == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        end_idx = i + 1
-                        break
-        
+        open_idx = view.find('{', start_idx)
+        end_idx = _walk_to_matching_brace(view, open_idx) if open_idx != -1 else -1
+        if end_idx == -1:
+            # No matching brace found — keep the rest of the response
+            # rather than returning an empty extraction.
+            end_idx = len(code)
         code = code[start_idx:end_idx]
     
     # Final cleanup - strip markdown fences again after extraction
@@ -860,108 +1040,96 @@ def clean_code(code: str) -> str:
     return result
 
 
+# Lines consisting only of type/qualifier tokens (e.g. "char *",
+# "static unsigned long int", "internal_function") — used to pull the
+# GNU-style return type, written on its own line, into the function span.
+_DECL_PREFIX_RE = re.compile(r'^[ \t]*[A-Za-z_][A-Za-z0-9_ \t]*\**[ \t]*$')
+
+
+# Whitespace + optional K&R-style parameter declarations between `)` and `{`.
+# `;` is a hard delimiter and `()` are excluded, so it can't bridge across a
+# call site or run away (no catastrophic backtracking). Matches the empty string
+# for ANSI `) {`, so normal functions are unaffected.
+_KR_PARAMS_RE = re.compile(r'\s*(?:[^;{}()]*;)*\s*')
+
+
 def find_function_boundaries(file_content: str, function_name: str) -> Tuple[int, int]:
     """
     Find the start and end positions of a function in C source code.
-    
-    Args:
-        file_content: Full C source file content
-        function_name: Name of the function to find
-    
+
+    Scans an analysis view (comments and inactive #if branches blanked) with
+    an O(n) walk — no regex backtracking — and slices using offsets valid in
+    the original content. The returned span includes return-type/qualifier
+    lines written above the function name (GNU style: ``char *\\n__getcwd``),
+    so replacing the span never leaves a stray return-type line behind.
+
     Returns:
         Tuple of (start_index, end_index) or (-1, -1) if not found
     """
-    # Pattern to match function definition (handles various return types and attributes)
-    # This looks for the function name followed by parameters and opening brace
-    func_pattern = rf'((?:^|\n)(?:[\t ]*(?:/\*[^*]*\*/)?[\t ]*)*' \
-                   rf'(?:static\s+)?(?:inline\s+)?(?:__attribute__\s*\([^)]*\)\s*)?' \
-                   rf'(?:const\s+)?(?:unsigned\s+)?(?:signed\s+)?(?:long\s+)?(?:short\s+)?' \
-                   rf'(?:struct\s+\w+\s*\*?|enum\s+\w+|union\s+\w+|\w+)\s*\**\s*' \
-                   rf'{re.escape(function_name)}\s*\([^)]*\)\s*\{{)'
-    
-    match = re.search(func_pattern, file_content, re.MULTILINE | re.DOTALL)
-    if not match:
-        logger.warning(f"Could not find function '{function_name}' in file content")
-        return -1, -1
-    
-    # Find the start (include any leading whitespace/newline)
-    start_idx = match.start()
-    if file_content[start_idx] == '\n':
-        start_idx += 1
-    
-    # Find matching closing brace
-    brace_count = 0
-    end_idx = start_idx
-    in_string = False
-    in_char = False
-    in_comment = False
-    in_line_comment = False
-    escape_next = False
-    i = start_idx
-    
-    while i < len(file_content):
-        char = file_content[i]
-        
-        if escape_next:
-            escape_next = False
-            i += 1
-            continue
-        
-        if char == '\\':
-            escape_next = True
-            i += 1
-            continue
-        
-        # Handle newline (ends line comments)
-        if char == '\n':
-            in_line_comment = False
-            i += 1
-            continue
-        
-        # Skip if in line comment
-        if in_line_comment:
-            i += 1
-            continue
-        
-        # Check for comment start
-        if not in_string and not in_char and not in_comment:
-            if i + 1 < len(file_content):
-                two_char = file_content[i:i+2]
-                if two_char == '/*':
-                    in_comment = True
-                    i += 2
-                    continue
-                elif two_char == '//':
-                    in_line_comment = True
-                    i += 2
-                    continue
-        
-        # Check for comment end
-        if in_comment:
-            if i + 1 < len(file_content) and file_content[i:i+2] == '*/':
-                in_comment = False
-                i += 2
-                continue
-            i += 1
-            continue
-        
-        # Handle strings and chars
-        if char == '"' and not in_char:
-            in_string = not in_string
-        elif char == "'" and not in_string:
-            in_char = not in_char
-        elif not in_string and not in_char:
-            if char == '{':
-                brace_count += 1
-            elif char == '}':
-                brace_count -= 1
-                if brace_count == 0:
-                    end_idx = i + 1
+    view = _build_analysis_view(file_content)
+    name_pat = re.compile(rf'\b{re.escape(function_name)}\s*\(')
+
+    for m in name_pat.finditer(view):
+        name_start = m.start()
+
+        # Walk past the parameter list (balanced parens)
+        i = m.end() - 1  # position of the '(' matched by \(
+        paren_depth = 0
+        scan_limit = min(name_start + 8192, len(view))
+        while i < scan_limit:
+            c = view[i]
+            if c == '(':
+                paren_depth += 1
+            elif c == ')':
+                paren_depth -= 1
+                if paren_depth == 0:
+                    i += 1
                     break
-        
-        i += 1
-    
-    return start_idx, end_idx
+            i += 1
+        else:
+            continue  # no matching )
+
+        # Skip whitespace / newlines AND optional K&R-style parameter
+        # declarations between ) and { — old C puts the decls there:
+        #   ____STRTOF_INTERNAL (nptr, endptr, group, loc)
+        #        const STRING_TYPE *nptr;
+        #        ... { ... }
+        # Mirrors the Phase 0 code_parser fix. The `;`-delimited, ()-free skip
+        # cannot bridge a CALL site (`f(a,b);` then code) into a brace: a call
+        # hits `}` (end of caller) or `(` before any `{`, so it's still rejected.
+        kr = _KR_PARAMS_RE.match(view, i, scan_limit)
+        if kr:
+            i = kr.end()
+
+        if i >= scan_limit or view[i] != '{':
+            # No opening brace → this is a call or forward declaration
+            continue
+
+        brace_pos = i
+
+        # Start of the line containing the function name
+        line_start = view.rfind('\n', 0, name_start)
+        func_start = line_start + 1 if line_start != -1 else 0
+
+        # Extend upward over return-type/qualifier lines (GNU style puts
+        # the return type on its own line above the name).
+        for _ in range(4):
+            if func_start == 0:
+                break
+            prev_nl = view.rfind('\n', 0, func_start - 1)
+            prev_start = prev_nl + 1 if prev_nl != -1 else 0
+            prev_line = view[prev_start:func_start - 1]
+            if prev_line.strip() and _DECL_PREFIX_RE.match(prev_line):
+                func_start = prev_start
+            else:
+                break
+
+        end_idx = _walk_to_matching_brace(view, brace_pos)
+        if end_idx != -1:
+            return func_start, end_idx
+
+    logger.warning(f"Could not find function '{function_name}' in file content")
+    return -1, -1
 
 
 def replace_function_in_file(file_content: str, function_name: str, patched_function: str) -> Tuple[str, bool]:
@@ -998,9 +1166,205 @@ def replace_function_in_file(file_content: str, function_name: str, patched_func
         patched_function += '\n'
     
     patched_file = before + patched_function + after
-    
+
     logger.debug(f"Replaced function '{function_name}' (chars {start_idx}-{end_idx})")
     return patched_file, True
+
+
+# =============================================================================
+# SEARCH/REPLACE edit application
+# =============================================================================
+#
+# Phase 2 asks the model for minimal SEARCH/REPLACE edits rather than a whole
+# rewritten function. Each block is applied to the PRISTINE original file by
+# literal string match, so the function signature, declaring macros (MPN_VAR),
+# K&R prototypes and the hundreds of unchanged lines are never re-transcribed
+# (and therefore never corrupted). Whole-function regeneration is kept only as
+# a fallback for when the model ignores the edit-block format entirely.
+
+# Tolerant block matcher: any run of >=3 of the marker char, `SEARCH`/`REPLACE`
+# may carry trailing text, and the `=======` / `>>>>>>> REPLACE` lines are
+# anchored to line starts (^) so a stray `=`/`>` inside code can't terminate a
+# block early.
+_SR_BLOCK_RE = re.compile(
+    r"<{3,}\s*SEARCH[^\n]*\n(.*?)^={3,}[^\n]*\n(.*?)^>{3,}\s*REPLACE",
+    re.DOTALL | re.MULTILINE,
+)
+
+
+def parse_search_replace_blocks(response: str) -> List[Tuple[str, str]]:
+    """Parse all SEARCH/REPLACE blocks from an LLM response.
+
+    Returns a list of ``(search_text, replace_text)`` tuples (leading/trailing
+    blank lines trimmed). Empty-SEARCH blocks are dropped — we only support
+    anchored edits, not blind insertions. Returns ``[]`` when the response
+    contains no well-formed blocks (the caller then falls back to whole-function
+    handling).
+    """
+    if not response:
+        return []
+    blocks: List[Tuple[str, str]] = []
+    for m in _SR_BLOCK_RE.finditer(response):
+        search = m.group(1).strip("\n")
+        replace = m.group(2).strip("\n")
+        if search.strip() == "":
+            continue
+        blocks.append((search, replace))
+    return blocks
+
+
+def _line_start_offsets(content: str) -> List[int]:
+    """Char offset of the start of each line in *content* (split on '\\n')."""
+    offsets = []
+    idx = 0
+    for line in content.split("\n"):
+        offsets.append(idx)
+        idx += len(line) + 1  # + newline
+    return offsets
+
+
+def _find_block_region(content: str, search: str) -> Optional[Tuple[int, int]]:
+    """Locate *search* within *content*.
+
+    Tries an exact substring match first, then a whitespace-tolerant match that
+    compares lines after stripping leading/trailing whitespace (handles tab/space
+    and trailing-whitespace drift between the model's quote and the real file —
+    harmless for C, which is whitespace-insensitive). Returns ``(start, end)``
+    char offsets of the matched region, or ``None`` if not found.
+    """
+    # 1. Exact match
+    pos = content.find(search)
+    if pos != -1:
+        return pos, pos + len(search)
+
+    # 2. Whitespace-tolerant, line-based match
+    c_lines = content.split("\n")
+    s_lines = [ln.strip() for ln in search.split("\n")]
+    while s_lines and s_lines[0] == "":
+        s_lines.pop(0)
+    while s_lines and s_lines[-1] == "":
+        s_lines.pop()
+    if not s_lines:
+        return None
+
+    n = len(s_lines)
+    offsets = _line_start_offsets(content)
+    c_stripped = [ln.strip() for ln in c_lines]
+    for i in range(len(c_lines) - n + 1):
+        if c_stripped[i:i + n] == s_lines:
+            start = offsets[i]
+            end = offsets[i + n - 1] + len(c_lines[i + n - 1])  # end of last line, before its '\n'
+            return start, end
+    return None
+
+
+def apply_search_replace_blocks(
+    file_content: str, blocks: List[Tuple[str, str]]
+) -> Tuple[str, int, List[str]]:
+    """Apply SEARCH/REPLACE *blocks* to *file_content* in order.
+
+    Each block's SEARCH region is located in the CURRENT (progressively edited)
+    content and replaced. Returns ``(new_content, applied_count, errors)`` where
+    *errors* lists the 1-based indices/reasons of blocks whose SEARCH text could
+    not be located.
+    """
+    new_content = file_content
+    applied = 0
+    errors: List[str] = []
+    for i, (search, replace) in enumerate(blocks, 1):
+        region = _find_block_region(new_content, search)
+        if region is None:
+            first_line = search.strip().splitlines()[0] if search.strip() else ""
+            errors.append(f"block {i}: SEARCH text not found (starts with: {first_line[:80]!r})")
+            continue
+        start, end = region
+        new_content = new_content[:start] + replace + new_content[end:]
+        applied += 1
+    return new_content, applied, errors
+
+
+def build_patched_file_from_response(
+    raw_response: str, function_name: str, file_context: str
+) -> Dict[str, Any]:
+    """Turn an LLM response into a patched file + the contract the rest of
+    Phase 2 expects.
+
+    Preference order:
+      1. SEARCH/REPLACE edit blocks applied to the pristine ``file_context``.
+      2. Fallback (model ignored the format): whole-function extraction + splice.
+
+    Returns a dict with:
+      - ``full_patched_file``: the patched file content
+      - ``patched_function``: the patched function text (re-extracted from the
+        file for SR mode, or the extracted function for whole-function mode) —
+        used for the ``_function_only`` artifact and structural validation
+      - ``function_replaced``: bool
+      - ``mode``: ``"search_replace"`` | ``"whole_function"``
+      - ``apply_error``: set when SR blocks parsed but did NOT apply cleanly
+        (forces an invalid verdict so the file is never silently left unpatched)
+      - ``sr_blocks`` / ``sr_applied``: edit-block counts (for metadata)
+    """
+    blocks = parse_search_replace_blocks(raw_response)
+
+    if blocks:
+        new_file, applied, errors = apply_search_replace_blocks(file_context, blocks)
+        if applied == len(blocks) and not errors:
+            patched_function = _extract_function_text(new_file, function_name)
+            return {
+                "full_patched_file": new_file,
+                "patched_function": patched_function or new_file,
+                "function_replaced": True,
+                "mode": "search_replace",
+                "apply_error": None,
+                "sr_blocks": len(blocks),
+                "sr_applied": applied,
+            }
+        # Blocks were produced but did not all apply — do NOT fall back to a
+        # whole-function parse (the response isn't a function). Surface the
+        # mismatch so the feedback loop can re-quote SEARCH text. The file is
+        # left unchanged and explicitly marked invalid.
+        msg = (
+            f"{applied}/{len(blocks)} SEARCH/REPLACE blocks applied; "
+            + "; ".join(errors)
+        )
+        logger.warning(f"SEARCH/REPLACE apply incomplete for '{function_name}': {msg}")
+        partial_file, _ = (new_file, applied) if applied else (file_context, 0)
+        return {
+            "full_patched_file": partial_file,
+            "patched_function": f"/* SEARCH/REPLACE apply failed: {msg} */",
+            "function_replaced": applied > 0,
+            "mode": "search_replace",
+            "apply_error": msg,
+            "sr_blocks": len(blocks),
+            "sr_applied": applied,
+        }
+
+    # Fallback: no edit blocks at all → treat the response as a whole function.
+    patched_function = clean_code(extract_code_from_response(raw_response, function_name))
+    if not patched_function:
+        patched_function = raw_response
+    full_file, replaced = replace_function_in_file(file_context, function_name, patched_function)
+    if not replaced:
+        full_file = patched_function
+    return {
+        "full_patched_file": full_file,
+        "patched_function": patched_function,
+        "function_replaced": replaced,
+        "mode": "whole_function",
+        "apply_error": None,
+        "sr_blocks": 0,
+        "sr_applied": 0,
+    }
+
+
+def _extract_function_text(file_content: str, function_name: str) -> str:
+    """Slice the full text of *function_name* out of *file_content* (return-type
+    line included), or ``""`` if it can't be located."""
+    start_idx, end_idx = find_function_boundaries(file_content, function_name)
+    if start_idx == -1 or end_idx == -1:
+        return ""
+    return file_content[start_idx:end_idx].strip()
+
 
 # =============================================================================
 # Syntax Validation
@@ -1034,23 +1398,19 @@ def is_missing_header_error(error_msg: str) -> bool:
     """
     if 'No such file or directory' not in error_msg and 'file not found' not in error_msg.lower():
         return False
-    
+
+    # Any missing header during HOST-side syntax checking is an environment
+    # limitation, not a patch defect: project-internal headers only exist
+    # inside the container build tree (Phase 3's in-container rebuild is the
+    # real arbiter). Fall back to structural validation in that case.
+    if re.search(r'fatal error:\s*[^\n:]+\.h', error_msg):
+        return True
+
     # Check if any known internal header is mentioned
     for header in GLIBC_INTERNAL_HEADERS:
         if header in error_msg:
             return True
-    
-    # Also check for common glibc-specific include patterns
-    glibc_patterns = [
-        r'bits/[a-zA-Z_-]+\.h',
-        r'sys/[a-zA-Z_-]+\.h.*No such file',
-        r'gnu/[a-zA-Z_-]+\.h',
-        r'asm/[a-zA-Z_-]+\.h',
-    ]
-    for pattern in glibc_patterns:
-        if re.search(pattern, error_msg):
-            return True
-    
+
     return False
 
 
@@ -1075,58 +1435,22 @@ def validate_function_structure(code: str, function_name: str) -> Tuple[bool, st
     if '```' in code:
         return False, "Code contains markdown artifacts (```)"
     
-    # Check for mismatched braces
+    # Check for mismatched braces on the analysis view: comments and
+    # non-first #if/#else branches are blanked, so glibc-style code that
+    # opens the same brace in every preprocessor branch (e.g. STRCOLL) is
+    # not falsely flagged, and apostrophes in comments don't corrupt the
+    # char-literal tracking.
+    view = _build_analysis_view(code)
     brace_count = 0
     in_string = False
     in_char = False
-    in_comment = False
-    in_line_comment = False
     escape_next = False
-    i = 0
-    
-    while i < len(code):
-        char = code[i]
-        
+    for char in view:
         if escape_next:
             escape_next = False
-            i += 1
-            continue
-        
-        if char == '\\':
+        elif char == '\\':
             escape_next = True
-            i += 1
-            continue
-        
-        if char == '\n':
-            in_line_comment = False
-            i += 1
-            continue
-        
-        if in_line_comment:
-            i += 1
-            continue
-        
-        if not in_string and not in_char and not in_comment:
-            if i + 1 < len(code):
-                two_char = code[i:i+2]
-                if two_char == '/*':
-                    in_comment = True
-                    i += 2
-                    continue
-                elif two_char == '//':
-                    in_line_comment = True
-                    i += 2
-                    continue
-        
-        if in_comment:
-            if i + 1 < len(code) and code[i:i+2] == '*/':
-                in_comment = False
-                i += 2
-                continue
-            i += 1
-            continue
-        
-        if char == '"' and not in_char:
+        elif char == '"' and not in_char:
             in_string = not in_string
         elif char == "'" and not in_string:
             in_char = not in_char
@@ -1135,14 +1459,13 @@ def validate_function_structure(code: str, function_name: str) -> Tuple[bool, st
                 brace_count += 1
             elif char == '}':
                 brace_count -= 1
-        
-        i += 1
-    
+
     if brace_count != 0:
         return False, f"Mismatched braces: {brace_count} {'unclosed' if brace_count > 0 else 'extra closing'}"
-    
-    # Check parentheses balance (simple count, not perfect but catches most issues)
-    paren_count = code.count('(') - code.count(')')
+
+    # Check parentheses balance on the same view (comments and inactive
+    # branches excluded for the same reason)
+    paren_count = view.count('(') - view.count(')')
     if abs(paren_count) > 0:
         return False, f"Mismatched parentheses: {paren_count} {'unclosed' if paren_count > 0 else 'extra closing'}"
     
@@ -1336,33 +1659,69 @@ def save_patch_artifacts(
 # Data Loading
 # =============================================================================
 
+def _detect_csv_delimiter(csv_path: Path) -> str:
+    """Detect the CSV delimiter from the header line.
+
+    The Phase 0 aggregator writes standard comma-separated CSV (quoted),
+    while the legacy ``documentation/file-function.csv`` is
+    semicolon-separated.  Counting candidate delimiters on the header line
+    (column names never contain either character) disambiguates reliably.
+    """
+    with open(csv_path, 'r', encoding='utf-8', errors='replace') as f:
+        header = f.readline()
+    return ';' if header.count(';') > header.count(',') else ','
+
+
 def load_vulnerability_data(csv_path: Path) -> pd.DataFrame:
     """
     Load and validate the vulnerability dataset.
-    
+
     Args:
         csv_path: Path to the CSV file
-    
+
     Returns:
-        Pandas DataFrame with vulnerability data
+        Pandas DataFrame with vulnerability data (one row per CVE, only
+        rows that carry usable function-level data)
     """
     logger.info(f"Loading vulnerability data from {csv_path}")
-    
+
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
-    
-    df = pd.read_csv(csv_path, sep=';')
-    
+
+    sep = _detect_csv_delimiter(csv_path)
+    logger.info(f"Detected CSV delimiter: {sep!r}")
+    df = pd.read_csv(csv_path, sep=sep)
+
     # Validate required columns
     required_columns = ['CVE', 'FilePath', 'F_NAME', 'V_FILE', 'V_FUNCTION']
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
         raise ValueError(f"Missing required columns: {missing_columns}")
-    
-    logger.info(f"Loaded {len(df)} vulnerability entries")
-    logger.info(f"CVEs: {df['CVE'].unique().tolist()}")
-    
-    return df
+
+    total_cves = df['CVE'].nunique()
+
+    # Keep only rows with usable function-level data: patch generation
+    # needs the vulnerable function body, its name, and the file path the
+    # patch will later be applied to.
+    usable = df
+    for col in ('V_FUNCTION', 'F_NAME', 'FilePath'):
+        usable = usable[usable[col].notna() & (usable[col].astype(str).str.strip() != '')]
+
+    skipped = sorted(set(df['CVE'].unique()) - set(usable['CVE'].unique()))
+    if skipped:
+        logger.warning(
+            f"Skipping {len(skipped)} CVE(s) with no extracted vulnerable-function "
+            f"data (V_FUNCTION/F_NAME/FilePath empty): {skipped}"
+        )
+
+    # One row per CVE: Phase 0 orders rows best-first (production source
+    # files before test files, units with vulnerable bodies first).
+    usable = usable.drop_duplicates(subset=['CVE'], keep='first')
+
+    logger.info(f"Loaded {len(usable)} usable CVE entries (of {total_cves} total)")
+    logger.info(f"CVEs: {usable['CVE'].unique().tolist()}")
+
+    return usable
 
 # =============================================================================
 # Main Pipeline
@@ -1396,9 +1755,16 @@ def process_single_vulnerability(
         "model": model,
         "success": False
     }
-    
-    # Generate prompt
-    prompt = create_patch_prompt(cve_id, function_name, vulnerable_code, file_context)
+
+    # Generate prompt (with CVE description + PoC source when available)
+    vuln_context = _build_vulnerability_context(
+        cve_id,
+        description=str(row.get("CVE_Description", "") or ""),
+        cwe=str(row.get("CWE", "") or ""),
+        cwe_description=str(row.get("CWE_Description", "") or ""),
+    )
+    prompt = create_patch_prompt(cve_id, function_name, vulnerable_code,
+                                 file_context, vuln_context)
     
     # Call LLM API
     raw_response, metadata = call_llm_api(model, prompt)
@@ -1422,32 +1788,36 @@ def process_single_vulnerability(
         )
         return result
     
-    # Extract and clean code
-    patched_function = extract_code_from_response(raw_response, function_name)
-    patched_function = clean_code(patched_function)
-    
-    if not patched_function:
-        logger.warning(f"Could not extract code from response for {cve_id} with {model}")
-        patched_function = raw_response  # Save raw response as fallback
-    
-    # Replace the vulnerable function in the full file content FIRST
-    # We need the full file for proper syntax validation
-    full_patched_file, function_replaced = replace_function_in_file(
-        file_context, function_name, patched_function
-    )
-    
-    if not function_replaced:
-        logger.warning(f"Could not replace function in file for {cve_id} with {model}")
-        # Fall back to just the patched function if replacement fails
-        full_patched_file = patched_function
+    # Build the patched file from the response: minimal SEARCH/REPLACE edits
+    # applied to the pristine file, with whole-function regeneration as a
+    # fallback when the model ignores the edit-block format.
+    patch = build_patched_file_from_response(raw_response, function_name, file_context)
+    patched_function = patch["patched_function"]
+    full_patched_file = patch["full_patched_file"]
+    function_replaced = patch["function_replaced"]
+    metadata["patch_mode"] = patch["mode"]
+    metadata["sr_blocks"] = patch["sr_blocks"]
+    metadata["sr_applied"] = patch["sr_applied"]
+
+    if patch["mode"] == "search_replace":
+        logger.info(
+            f"✓ Applied {patch['sr_applied']}/{patch['sr_blocks']} SEARCH/REPLACE "
+            f"edit(s) for {cve_id} with {model}"
+        )
+    elif function_replaced:
+        logger.info(f"✓ Function replaced (whole-function fallback) for {cve_id} with {model}")
     else:
-        logger.info(f"✓ Function replaced in full file for {cve_id} with {model}")
-    
-    # Validate syntax using the FULL patched file (has all includes and type defs)
-    is_valid, validation_error = validate_syntax(
-        full_patched_file, function_name, patched_function
-    )
-    
+        logger.warning(f"Could not apply patch for {cve_id} with {model}")
+
+    # Validate: an unapplied edit block is an immediate failure (file unchanged);
+    # otherwise syntax-check the FULL patched file (has all includes and type defs).
+    if patch["apply_error"]:
+        is_valid, validation_error = False, patch["apply_error"]
+    else:
+        is_valid, validation_error = validate_syntax(
+            full_patched_file, function_name, patched_function
+        )
+
     if is_valid:
         logger.info(f"✓ Syntax valid for {cve_id} with {model}")
     else:
@@ -1491,7 +1861,8 @@ def generate_patch_with_feedback(
     previous_patch: str,
     failure_context: Dict[str, Any],
     attempt_number: int,
-    output_dir: Optional[Path] = None
+    output_dir: Optional[Path] = None,
+    generation_model: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Generate a new patch using failure feedback from Phase 3 validation.
@@ -1511,7 +1882,9 @@ def generate_patch_with_feedback(
         failure_context: Dictionary containing failure details from Phase 3
         attempt_number: Current retry attempt number (1-based)
         output_dir: Optional custom output directory
-    
+        generation_model: Explicit model id for this attempt (per-attempt
+            escalation from feedback_loop.models_by_attempt). None = provider default.
+
     Returns:
         Dictionary with processing results including:
         - success: Whether patch generation succeeded
@@ -1521,18 +1894,30 @@ def generate_patch_with_feedback(
         - full_patched_file: Complete file with patch integrated
         - attempt_number: The attempt number
     """
-    logger.info(f"[FEEDBACK LOOP] Generating retry patch #{attempt_number} for {cve_id} with {model}")
-    
+    # Resolve the model actually used for this attempt. ``generation_model`` (from
+    # feedback_loop.models_by_attempt) escalates per retry; when absent we fall
+    # back to the provider default (OPENAI_MODEL for OpenAI, else the loop model).
+    effective_model = generation_model or (OPENAI_MODEL if LLM_PROVIDER == "openai" else model)
+    logger.info(
+        f"[FEEDBACK LOOP] Generating retry patch #{attempt_number} for {cve_id} "
+        f"with {effective_model}"
+        + (f" (escalated from loop model {model})" if generation_model and generation_model != model else "")
+    )
+
     result = {
         "cve_id": cve_id,
         "function_name": function_name,
         "model": model,
+        "generation_model": effective_model,
         "attempt_number": attempt_number,
         "success": False,
         "is_retry": True
     }
     
-    # Create feedback-enhanced prompt
+    # Create feedback-enhanced prompt (PoC source so the model sees the
+    # exact attack it failed to stop; description comes from the CSV when
+    # invoked through Phase 2, or is omitted in feedback-only invocations)
+    vuln_context = _build_vulnerability_context(cve_id)
     prompt = create_feedback_prompt(
         cve_id=cve_id,
         function_name=function_name,
@@ -1540,15 +1925,20 @@ def generate_patch_with_feedback(
         file_context=file_context,
         previous_patch=previous_patch,
         failure_context=failure_context,
-        attempt_number=attempt_number
+        attempt_number=attempt_number,
+        vuln_context=vuln_context
     )
     
-    # Call LLM API with feedback system prompt
-    raw_response, metadata = call_llm_api(model, prompt, system_prompt=FEEDBACK_SYSTEM_PROMPT)
-    
+    # Call LLM API with feedback system prompt (escalated model when configured)
+    raw_response, metadata = call_llm_api(
+        model, prompt, system_prompt=FEEDBACK_SYSTEM_PROMPT,
+        model_override=generation_model,
+    )
+
     # Add retry metadata
     metadata["is_retry"] = True
     metadata["attempt_number"] = attempt_number
+    metadata["generation_model"] = effective_model
     metadata["failure_context_summary"] = {
         "status": failure_context.get("status"),
         "poc_blocked": failure_context.get("poc_blocked"),
@@ -1557,36 +1947,39 @@ def generate_patch_with_feedback(
     }
     
     if raw_response is None:
-        logger.error(f"Failed to get retry response for {cve_id} with {model}")
+        logger.error(f"Failed to get retry response for {cve_id} with {effective_model}")
         result["error"] = metadata.get("error", "Unknown error")
         return result
     
-    # Extract and clean code
-    patched_function = extract_code_from_response(raw_response, function_name)
-    patched_function = clean_code(patched_function)
-    
-    if not patched_function:
-        logger.warning(f"Could not extract code from retry response for {cve_id} with {model}")
-        patched_function = raw_response
-    
-    # Replace the vulnerable function in the full file content
-    full_patched_file, function_replaced = replace_function_in_file(
-        file_context, function_name, patched_function
-    )
-    
-    if not function_replaced:
-        logger.warning(f"Could not replace function in file for retry {cve_id} with {model}")
-        full_patched_file = patched_function
+    # Build the patched file via SEARCH/REPLACE edits (whole-function fallback)
+    patch = build_patched_file_from_response(raw_response, function_name, file_context)
+    patched_function = patch["patched_function"]
+    full_patched_file = patch["full_patched_file"]
+    function_replaced = patch["function_replaced"]
+    metadata["patch_mode"] = patch["mode"]
+    metadata["sr_blocks"] = patch["sr_blocks"]
+    metadata["sr_applied"] = patch["sr_applied"]
+
+    if patch["mode"] == "search_replace":
+        logger.info(
+            f"✓ Applied {patch['sr_applied']}/{patch['sr_blocks']} SEARCH/REPLACE "
+            f"edit(s) for retry {cve_id} with {effective_model}"
+        )
+    elif function_replaced:
+        logger.info(f"✓ Function replaced (whole-function fallback) for retry {cve_id} with {effective_model}")
     else:
-        logger.info(f"✓ Function replaced in full file for retry {cve_id} with {model}")
-    
-    # Validate syntax
-    is_valid, validation_error = validate_syntax(
-        full_patched_file, function_name, patched_function
-    )
-    
+        logger.warning(f"Could not apply retry patch for {cve_id} with {effective_model}")
+
+    # Validate: an unapplied edit block fails immediately; else syntax-check the file.
+    if patch["apply_error"]:
+        is_valid, validation_error = False, patch["apply_error"]
+    else:
+        is_valid, validation_error = validate_syntax(
+            full_patched_file, function_name, patched_function
+        )
+
     if is_valid:
-        logger.info(f"✓ Syntax valid for retry #{attempt_number} of {cve_id} with {model}")
+        logger.info(f"✓ Syntax valid for retry #{attempt_number} of {cve_id} with {effective_model}")
     else:
         logger.warning(f"✗ Syntax invalid for retry #{attempt_number}: {validation_error[:100]}...")
     
@@ -1594,7 +1987,10 @@ def generate_patch_with_feedback(
     if output_dir is None:
         output_dir = OUTPUT_DIR
     
-    model_safe = sanitize_model_name(model)
+    # Name the retry directory by the model that ACTUALLY generated it (the
+    # escalated per-attempt model), not the loop's base identity — so the
+    # artifacts path matches the "Generating … with <model>" logs.
+    model_safe = sanitize_model_name(effective_model)
     retry_output_path = output_dir / cve_id / f"{model_safe}_retry{attempt_number}"
     retry_output_path.mkdir(parents=True, exist_ok=True)
     
@@ -1680,11 +2076,42 @@ def run_pipeline(
     except Exception as e:
         logger.error(f"Failed to load data: {e}")
         return {"success": False, "error": str(e)}
-    
+
     # Apply CVE filter if specified
     if cve_filter:
         df = df[df['CVE'].isin(cve_filter)]
         logger.info(f"Filtered to {len(df)} entries for CVEs: {cve_filter}")
+
+    # Restrict to CVEs whose vulnerability Phase 1 actually reproduced
+    # (a deterministic baseline exit code exists in the image manifest).
+    # Generating patches for unreproduced CVEs would waste LLM calls AND
+    # produce patches Phase 3 could never validate dynamically.
+    manifest_path = OUTPUT_DIR.parent / str(_paths.get("results", "results")) / "image_manifest.json"
+    if manifest_path.exists():
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            reproduced = {
+                e["cve"] for e in manifest.get("cve_images", [])
+                if e.get("baseline_exit_code") is not None
+                and not e.get("needs_manual_revision")
+            }
+            not_reproduced = sorted(set(df['CVE'].unique()) - reproduced)
+            if not_reproduced:
+                logger.warning(
+                    f"Skipping {len(not_reproduced)} CVE(s) without a Phase 1 "
+                    f"baseline (not reproduced / manual revision): {not_reproduced}"
+                )
+            df = df[df['CVE'].isin(reproduced)]
+            logger.info(f"{len(df)} CVE(s) have a Phase 1 baseline and proceed to generation")
+        except Exception as e:
+            logger.warning(f"Could not apply Phase 1 manifest filter ({e}); proceeding with all CVEs")
+    else:
+        logger.warning(f"No Phase 1 manifest at {manifest_path} — proceeding with all CVEs")
+
+    if len(df) == 0:
+        logger.error("No CVEs eligible for patch generation — nothing to do")
+        return {"success": False, "error": "No eligible CVEs after filtering"}
     
     logger.info(f"Total tasks to process: {len(df) * len(models)}")
     
@@ -1929,7 +2356,12 @@ Examples:
     # Handle dry run
     if args.dry_run:
         df = load_vulnerability_data(csv_path)
-        models = args.model if args.model else MODELS
+        if args.model:
+            models = args.model
+        elif LLM_PROVIDER == "openai":
+            models = [OPENAI_MODEL]
+        else:
+            models = MODELS
         cves = args.cve if args.cve else df['CVE'].unique().tolist()
         
         print("\nDry Run Summary:")
@@ -1968,15 +2400,34 @@ Examples:
         logger.error("Exiting — GPU not available within timeout.")
         sys.exit(2)
     
+    # Resolve models for the active provider: with OpenAI every configured
+    # Ollama model name would route to the SAME OpenAI model, producing N
+    # identical generations stored under misleading directory names.
+    if args.model:
+        models = args.model
+    elif LLM_PROVIDER == "openai":
+        models = [OPENAI_MODEL]
+    else:
+        models = MODELS
+
     # Run pipeline
     summary = run_pipeline(
         csv_path=csv_path,
-        models=args.model if args.model else MODELS,
+        models=models,
         cve_filter=args.cve
     )
-    
-    # Exit with appropriate code
-    if summary.get("failed", 0) > 0:
+
+    # Exit with appropriate code. A hard failure (data load error, nothing
+    # eligible) must propagate as non-zero so the master pipeline does not
+    # mark Phase 2 successful with zero patches. Partial per-task failures
+    # do NOT fail the phase as long as at least one syntactically valid
+    # patch was produced (Phase 3 can still validate the rest).
+    if summary.get("success") is False or summary.get("error"):
+        logger.error(f"Phase 2 failed: {summary.get('error', 'unknown error')}")
+        sys.exit(1)
+    stats = summary.get("summary", {})
+    if stats.get("syntax_valid", 0) < 1:
+        logger.error("Phase 2 produced no syntactically valid patch — failing phase")
         sys.exit(1)
     sys.exit(0)
 

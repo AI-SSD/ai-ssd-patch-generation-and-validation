@@ -311,6 +311,284 @@ def find_commit_by_message(
     return None
 
 
+# Bug-tracker id patterns inside NVD reference URLs (sourceware / RedHat / etc.).
+_BUG_ID_URL_PATTERNS = [
+    re.compile(r"show_bug\.cgi\?(?:[^#\s]*&)?id=(\d+)", re.IGNORECASE),
+    re.compile(r"bugzilla[^?#\s]*[?&]id=(\d+)", re.IGNORECASE),
+]
+
+
+# Distro / cross-vendor bug trackers. A bug id from one of these lives in a
+# DIFFERENT namespace than the upstream project's own commits (e.g. a Red Hat
+# Bugzilla id like 645672 is unrelated to glibc's sourceware "[BZ #NNNN]"
+# numbers). Searching the project repo for such an id finds nothing — or, worse,
+# a coincidental same-number match for an unrelated change. So these are skipped
+# when harvesting native bug ids (observed: CVE-2010-3856/-4052, whose only
+# bug-tracker references are bugzilla.redhat.com).
+_FOREIGN_BUG_TRACKER_HOSTS = (
+    "redhat.com", "suse.com", "novell.com", "launchpad.net",
+    "debian.org", "ubuntu.com", "mageia.org", "gentoo.org",
+    "bugzilla.mozilla.org", "chromium.org",
+)
+
+
+def extract_bug_ids_from_references(
+    reference_urls: Optional[List[str]],
+    *,
+    native_hosts: Optional[List[str]] = None,
+) -> List[str]:
+    """Extract real upstream bug-tracker ids from a CVE's NVD reference URLs.
+
+    These are the ACTUAL project bug numbers (e.g. a sourceware Bugzilla id),
+    curated by NVD for this specific CVE — unlike the CVE's own numeric suffix,
+    which has NO relationship to the project's bug tracker. Used to find and
+    validate fix commits that reference the bug rather than the CVE id.
+
+    Bug ids hosted on a cross-vendor distro tracker are excluded: their numbers
+    are not the upstream project's and matching them against the repo is unsound.
+    When *native_hosts* is given (project config), ONLY those hosts are trusted;
+    otherwise a built-in foreign-tracker denylist is applied.
+    """
+    import urllib.parse
+    ids: List[str] = []
+    for url in reference_urls or []:
+        decoded = urllib.parse.unquote(url)
+        host = urllib.parse.urlparse(decoded).netloc.lower()
+        if native_hosts:
+            if not any(nh.lower() in host for nh in native_hosts):
+                continue
+        elif any(fh in host for fh in _FOREIGN_BUG_TRACKER_HOSTS):
+            continue
+        for pat in _BUG_ID_URL_PATTERNS:
+            for m in pat.finditer(decoded):
+                if m.group(1) not in ids:
+                    ids.append(m.group(1))
+    return ids
+
+
+def _message_for_commit(
+    commit_index: Optional[List[Tuple[str, str]]], commit_hash: str
+) -> Optional[str]:
+    """Return the commit message for *commit_hash* from the in-memory index."""
+    if not commit_index or not commit_hash:
+        return None
+    for h, msg in commit_index:
+        if h == commit_hash or h.startswith(commit_hash) or commit_hash.startswith(h):
+            return msg
+    return None
+
+
+def commit_relates_to_cve(
+    repo_path: Path,
+    commit_hash: str,
+    cve_id: str,
+    bug_ids: List[str],
+    *,
+    commit_index: Optional[List[Tuple[str, str]]] = None,
+    timeout: int = 30,
+) -> bool:
+    """True when *commit_hash*'s message genuinely references this CVE.
+
+    A match counts when the message contains the exact CVE id (dashed or
+    dash-less) or a real Bugzilla id taken from the CVE's NVD references. This is
+    the gate that stops a loose search from silently returning an unrelated
+    commit (e.g. another CVE's fix, or a same-era but irrelevant change).
+    """
+    if not commit_hash:
+        return False
+    msg = _message_for_commit(commit_index, commit_hash)
+    if msg is None:
+        try:
+            r = subprocess.run(
+                ["git", "log", "-1", "--format=%B", commit_hash],
+                cwd=repo_path, capture_output=True,
+                encoding="utf-8", errors="replace", timeout=timeout,
+            )
+            msg = r.stdout if r.returncode == 0 else ""
+        except Exception:
+            msg = ""
+    if not msg:
+        return False
+    up = msg.upper()
+    if cve_id.upper() in up or cve_id.replace("-", "").upper() in up:
+        return True
+    for bz in bug_ids:
+        if re.search(rf"\b(?:BZ|BUG)[\s#]*0*{re.escape(bz)}\b", msg, re.IGNORECASE):
+            return True
+    return False
+
+
+def _search_commit_index_all(
+    index: List[Tuple[str, str]], search_term: str, *, use_regex: bool = False,
+) -> List[str]:
+    """Return ALL commit hashes whose message matches *search_term* (index order)."""
+    out: List[str] = []
+    if use_regex:
+        try:
+            pattern = re.compile(search_term)
+        except re.error:
+            return out
+        for h, m in index:
+            if pattern.search(m):
+                out.append(h)
+    else:
+        for h, m in index:
+            if search_term in m:
+                out.append(h)
+    return out
+
+
+def _gather_matches(
+    repo_path: Path, term: str, *, use_regex: bool = False,
+    commit_index: Optional[List[Tuple[str, str]]] = None, timeout: int = 60,
+) -> List[str]:
+    """All commits matching *term* — from the in-memory index when available,
+    else a single subprocess match (the no-index fallback keeps old behaviour)."""
+    if commit_index is not None:
+        return _search_commit_index_all(commit_index, term, use_regex=use_regex)
+    one = find_commit_by_message(repo_path, term, use_regex=use_regex, timeout=timeout)
+    return [one] if one else []
+
+
+def _commit_touches_source(
+    repo_path: Path, commit_hash: str, source_exts: List[str], *, timeout: int = 20,
+) -> bool:
+    """True when the commit's diff modifies a file with one of *source_exts*.
+
+    Distinguishes the primary CODE fix from follow-up commits that only touch
+    ChangeLog / NEWS / tests but still reference the same bug.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "show", "--name-only", "--format=", "--no-renames", commit_hash],
+            cwd=repo_path, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout,
+        )
+        if r.returncode != 0:
+            return False
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line and any(line.endswith(ext) for ext in source_exts):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _commit_timestamp(repo_path: Path, commit_hash: str, *, timeout: int = 20) -> Optional[int]:
+    """Return the commit's author UNIX timestamp (for ordering), or None."""
+    try:
+        r = subprocess.run(
+            ["git", "show", "-s", "--format=%at", commit_hash],
+            cwd=repo_path, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return int(r.stdout.strip().split("\n")[0])
+    except Exception:
+        pass
+    return None
+
+
+def _pick_primary_fix(
+    repo_path: Path, candidates: List[str], source_exts: List[str], *, timeout: int = 30,
+) -> Optional[str]:
+    """From commits that all reference the bug, pick the PRIMARY code fix.
+
+    Prefers the EARLIEST commit whose diff modifies a source file, so its parent
+    is genuinely the last vulnerable state. Without this, a later follow-up commit
+    (whose parent is already the real fix → a *patched* tree) could be chosen —
+    observed for CVE-2012-4412, where the recorded "vulnerable parent" was itself
+    the strcoll fix. Falls back to the earliest candidate, then the first.
+    """
+    # De-dup while preserving order; bound the work for pathological matches.
+    seen: List[str] = []
+    for c in candidates:
+        if c and c not in seen:
+            seen.append(c)
+    if not seen:
+        return None
+    if len(seen) == 1:
+        return seen[0]
+    scored = []
+    for c in seen[:25]:
+        scored.append((c, _commit_timestamp(repo_path, c, timeout=timeout),
+                       _commit_touches_source(repo_path, c, source_exts, timeout=timeout)))
+    source_commits = [s for s in scored if s[2]]
+    pool = source_commits if source_commits else scored
+    pool.sort(key=lambda s: (s[1] is None, s[1] if s[1] is not None else 0))
+    chosen = pool[0][0]
+    if len(seen) > 1:
+        logger.debug("Primary-fix selection among %d candidates -> %s", len(seen), chosen[:12])
+    return chosen
+
+
+# Red Hat Bugzilla ids whose "external trackers" often point at the upstream
+# (sourceware) bug for glibc and other GNU projects.
+_REDHAT_BUG_RE = re.compile(r"redhat\.com/show_bug\.cgi\?(?:[^#\s]*&)?id=(\d+)", re.IGNORECASE)
+
+
+def _resolve_upstream_bug_ids_online(
+    reference_urls: List[str],
+    native_hosts: List[str],
+    *,
+    timeout: int = 15,
+) -> List[str]:
+    """Best-effort, NETWORK: map a distro Bugzilla reference to upstream bug id(s).
+
+    Uses the Red Hat Bugzilla REST API (a cross-project distro tracker with a
+    public, no-auth API) to read a bug's ``external_bugs`` / ``see_also`` and
+    harvest any bug id whose tracker host matches the PROJECT's own native bug
+    host(s) — passed in from config (``commit_discovery.bugzilla_hosts``), never
+    hardcoded. So this works for any project: glibc → sourceware.org, another
+    project → its own tracker. Returns de-duplicated upstream ids, or [] on any
+    failure (the caller then routes the CVE to manual review). urllib only.
+    """
+    if not native_hosts:
+        return []
+    import json as _json
+    import urllib.parse
+    import urllib.request
+
+    hosts = [h.lower() for h in native_hosts]
+    rh_ids: List[str] = []
+    for url in reference_urls or []:
+        m = _REDHAT_BUG_RE.search(urllib.parse.unquote(url))
+        if m and m.group(1) not in rh_ids:
+            rh_ids.append(m.group(1))
+    if not rh_ids:
+        return []
+
+    def _host_native(text: str) -> bool:
+        return any(h in (text or "").lower() for h in hosts)
+
+    upstream: List[str] = []
+    for rh in rh_ids:
+        api = (
+            f"https://bugzilla.redhat.com/rest/bug/{rh}"
+            "?include_fields=external_bugs,see_also"
+        )
+        try:
+            req = urllib.request.Request(api, headers={"User-Agent": "ai-ssd-pipeline"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = _json.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception as exc:  # network/parse/anything — stay best-effort
+            logger.debug("RH Bugzilla lookup for %s failed: %s", rh, exc)
+            continue
+        bugs = (data or {}).get("bugs") or []
+        for bug in bugs:
+            for ext in bug.get("external_bugs", []) or []:
+                bz_id = str(ext.get("ext_bz_bug_id", "")).strip()
+                tracker_url = str(ext.get("type", {}).get("url", "")).lower()
+                if bz_id and _host_native(tracker_url) and bz_id not in upstream:
+                    upstream.append(bz_id)
+            for sa in bug.get("see_also", []) or []:
+                sa = str(sa)
+                if _host_native(sa):
+                    m = re.search(r"[?&]id=(\d+)", sa)
+                    if m and m.group(1) not in upstream:
+                        upstream.append(m.group(1))
+    return upstream
+
+
 def find_cve_fix_commit(
     repo_path: Path,
     cve_id: str,
@@ -321,65 +599,125 @@ def find_cve_fix_commit(
     allow_unscoped_extra_patterns: bool = False,
     timeout: int = 60,
     commit_index: Optional[List[Tuple[str, str]]] = None,
+    source_exts: Optional[List[str]] = None,
+    native_bug_hosts: Optional[List[str]] = None,
+    enable_online_bug_resolution: bool = False,
 ) -> Optional[str]:
-    """Multi-strategy search for a fix commit associated with *cve_id*.
+    """Multi-strategy search for a fix commit associated with *cve_id*, with a
+    validation gate AND primary-fix selection.
 
-    Strategies tried in order:
-      0. Commit hash embedded in NVD reference URLs
-      1. Exact CVE-ID in commit message
-      2. CVE-ID without dashes (e.g. CVE20231234)
-      3. Bug-tracker references (BZ#<number>)
-      4. Any user-supplied *extra_grep_patterns*
+    Strategies (first one producing a validated candidate wins):
+      0. Commit hash embedded in this CVE's NVD reference URLs — trusted as-is
+         (NVD curated the reference for this specific CVE).
+      1. Exact CVE-ID in the commit message (dashed or dash-less) — self-validating.
+      2. A REAL Bugzilla id taken from this CVE's NVD references — NOT the CVE's
+         numeric suffix (which is unrelated to the project's bug tracker).
+      3. Project-supplied *extra_grep_patterns*, scoped to the CVE.
+
+    Strategies 1–3 gather ALL matching commits and pick the PRIMARY code fix via
+    :func:`_pick_primary_fix` (earliest commit that touches a source file), so the
+    recorded fix's PARENT is genuinely the vulnerable state — a later follow-up
+    commit would have the real fix as its parent (a *patched* tree). Candidates
+    from strategies 2–3 must also pass :func:`commit_relates_to_cve`. When nothing
+    validates, returns ``None`` so the CVE is routed to manual review.
+
+    NOTE: the previous "BZ == CVE number" fallback was REMOVED — CVE ids and
+    project Bugzilla ids are unrelated namespaces, so it produced false positives.
     """
+    source_exts = source_exts or [".c", ".h"]
     if not repo_path.exists():
         logger.warning("Repository not found: %s", repo_path)
         return None
 
-    # Strategy 0 – commit hash from NVD reference URLs
+    # Strategy 0 – commit hash from this CVE's NVD reference URLs (strongest).
     if reference_urls:
         commit = extract_commit_from_references(repo_path, reference_urls)
         if commit:
             return commit
 
-    # Strategy 1 – exact CVE ID
-    commit = find_commit_by_message(repo_path, cve_id, timeout=timeout, commit_index=commit_index)
-    if commit:
-        return commit
+    bug_ids = extract_bug_ids_from_references(
+        reference_urls, native_hosts=native_bug_hosts
+    )
 
-    # Strategy 2 – without dashes
-    commit = find_commit_by_message(repo_path, cve_id.replace("-", ""), timeout=timeout, commit_index=commit_index)
-    if commit:
-        return commit
-
-    # Strategy 3 – bug-tracker reference (optional)
-    m = re.match(r"CVE-(\d{4})-(\d+)", cve_id)
-    cve_number = m.group(2) if m else ""
-    if enable_bz_fallback and cve_number:
-        commit = find_commit_by_message(
-            repo_path, f"BZ[^0-9]*{cve_number}([^0-9]|$)",
-            use_regex=True, timeout=timeout, commit_index=commit_index,
+    # Strategy 1 – exact CVE ID (with and without dashes). A commit message that
+    # contains the CVE id is inherently about this CVE; pick the primary among them.
+    cve_candidates: List[str] = []
+    for term in (cve_id, cve_id.replace("-", "")):
+        cve_candidates.extend(
+            _gather_matches(repo_path, term, commit_index=commit_index, timeout=timeout)
         )
-        if commit:
-            return commit
+    primary = _pick_primary_fix(repo_path, cve_candidates, source_exts, timeout=timeout)
+    if primary:
+        return primary
 
-    # Strategy 4 – extra patterns
+    # Strategy 2 – a REAL Bugzilla id from this CVE's references (sound). Gather
+    # all, validate each, then pick the primary code fix.
+    if enable_bz_fallback:
+        bz_candidates: List[str] = []
+        for bz in bug_ids:
+            for h in _gather_matches(
+                repo_path, rf"\b(?:BZ|bug)[\s#]*0*{re.escape(bz)}\b",
+                use_regex=True, commit_index=commit_index, timeout=timeout,
+            ):
+                if commit_relates_to_cve(
+                    repo_path, h, cve_id, bug_ids, commit_index=commit_index, timeout=timeout,
+                ):
+                    bz_candidates.append(h)
+        primary = _pick_primary_fix(repo_path, bz_candidates, source_exts, timeout=timeout)
+        if primary:
+            return primary
+
+    # Strategy 3 – extra patterns. Scoped patterns ({cve}/{cve_num}) are the
+    # project author's responsibility; an unscoped pattern (opt-in) must still
+    # validate against the CVE before it is accepted.
+    m = re.match(r"CVE-\d{4}-(\d+)", cve_id)
+    cve_number = m.group(1) if m else ""
     for pattern in (extra_grep_patterns or []):
         scoped = pattern
+        is_scoped = "{cve}" in pattern or ("{cve_num}" in pattern and cve_number)
         if "{cve}" in pattern:
             scoped = pattern.replace("{cve}", cve_id)
         elif "{cve_num}" in pattern and cve_number:
             scoped = pattern.replace("{cve_num}", cve_number)
         elif not allow_unscoped_extra_patterns:
             logger.debug(
-                "Skipping unscoped extra pattern '%s' for %s; use {cve}/{cve_num} or allow_unscoped_extra_patterns=true",
-                pattern,
-                cve_id,
+                "Skipping unscoped extra pattern '%s' for %s; use {cve}/{cve_num} "
+                "or allow_unscoped_extra_patterns=true", pattern, cve_id,
             )
             continue
 
-        commit = find_commit_by_message(repo_path, scoped, timeout=timeout, commit_index=commit_index)
-        if commit:
-            return commit
+        matches = _gather_matches(repo_path, scoped, commit_index=commit_index, timeout=timeout)
+        if not is_scoped:
+            matches = [h for h in matches if commit_relates_to_cve(
+                repo_path, h, cve_id, bug_ids, commit_index=commit_index, timeout=timeout)]
+        primary = _pick_primary_fix(repo_path, matches, source_exts, timeout=timeout)
+        if primary:
+            return primary
+
+    # Strategy 4 (opt-in, network) – follow a distro Bugzilla reference to the
+    # UPSTREAM bug, then find that bug's "[BZ #NNNN]" commit. Many old CVEs cite
+    # only a Red Hat bug (e.g. CVE-2010-3856/-4052) whose NVD references carry no
+    # native bug id and whose fix commit never mentions the CVE id — undiscoverable
+    # offline. The upstream bug id (sourceware) IS native, so this stays sound.
+    if enable_online_bug_resolution and reference_urls:
+        upstream = _resolve_upstream_bug_ids_online(
+            reference_urls, native_bug_hosts or [], timeout=timeout
+        )
+        if upstream:
+            logger.info(
+                "%s: resolved upstream bug id(s) %s via online bug tracker",
+                cve_id, ",".join(upstream),
+            )
+            up_candidates: List[str] = []
+            for bz in upstream:
+                for h in _gather_matches(
+                    repo_path, rf"\b(?:BZ|bug)[\s#]*0*{re.escape(bz)}\b",
+                    use_regex=True, commit_index=commit_index, timeout=timeout,
+                ):
+                    up_candidates.append(h)
+            primary = _pick_primary_fix(repo_path, up_candidates, source_exts, timeout=timeout)
+            if primary:
+                return primary
 
     logger.debug("No fix commit found for %s", cve_id)
     return None

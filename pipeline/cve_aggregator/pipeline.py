@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type
 
-from .modules.base import PipelineModule
+from .modules.base import PipelineModule, FatalPipelineError
 from .modules.cve_fetcher import CVEFetcher
 from .modules.commit_discovery import CommitDiscovery
 from .modules.poc_mapper import PoCMapper
@@ -140,10 +140,19 @@ class PipelineOrchestrator:
             t0 = time.time()
             try:
                 context = module.run(context)
+            except FatalPipelineError:
+                # Always halt — this condition invalidates the whole run, so
+                # ignore pipeline.abort_on_error (which only governs ordinary,
+                # non-fatal module hiccups).
+                logger.exception("[%d/%d] %s raised a FATAL error – aborting pipeline",
+                                 idx, total_modules, cls.__name__)
+                context["_pipeline_failed"] = True
+                break
             except Exception:
                 logger.exception("[%d/%d] %s failed", idx, total_modules, cls.__name__)
                 # Decide whether to continue or abort based on config
                 if self.config.get("pipeline", {}).get("abort_on_error", True):
+                    context["_pipeline_failed"] = True
                     break
             finally:
                 module.cleanup()

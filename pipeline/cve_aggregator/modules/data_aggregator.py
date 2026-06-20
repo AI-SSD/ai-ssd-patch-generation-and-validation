@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from ..models import CVEEntry, CVEMetadata, Dataset, ExploitInfo, ProjectState
+from ..utils.file_utils import classify_poc_runnability
 from .base import PipelineModule
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,7 @@ class DataAggregator(PipelineModule):
             entry = self._transform(raw, cfg)
 
             if cve_id in existing.cves:
-                existing.cves[cve_id] = self._merge(existing.cves[cve_id], entry)
+                existing.cves[cve_id] = self._merge(existing.cves[cve_id], entry, cve_id)
                 updated_count += 1
             else:
                 existing.cves[cve_id] = entry
@@ -141,7 +142,7 @@ class DataAggregator(PipelineModule):
         )
 
     @staticmethod
-    def _merge(existing: CVEEntry, new: CVEEntry) -> CVEEntry:
+    def _merge(existing: CVEEntry, new: CVEEntry, cve_id: str = "") -> CVEEntry:
         """Merge *new* data into *existing*, keeping the richer information."""
         # Keep existing metadata if not empty, else use new
         if new.metadata.description and not existing.metadata.description:
@@ -185,12 +186,35 @@ class DataAggregator(PipelineModule):
                 if new.project_state.vulnerable_functions:
                     existing.project_state.vulnerable_functions = new.project_state.vulnerable_functions
 
+        # Always take the latest run's regression-test set verbatim (even when
+        # empty). This (a) refreshes improved subdir/test resolution for known
+        # CVEs, and (b) lets disabling Option A (harvest_regression_tests=false)
+        # actually CLEAR previously-harvested tests on a re-run instead of leaving
+        # stale intree-test reproducers in the persisted map.
+        existing.project_state.regression_tests = getattr(
+            new.project_state, "regression_tests", []) or []
+
         # Merge exploits (avoid duplicates by exploit_id)
         existing_ids = {e.exploit_id for e in existing.exploits if e.exploit_id}
         for exp in new.exploits:
             if exp.exploit_id and exp.exploit_id not in existing_ids:
                 existing.exploits.append(exp)
                 existing_ids.add(exp.exploit_id)
+
+        # Re-validate the merged set against the runnability filter so prose
+        # write-ups / CVE-ID-mismatched entries accumulated by EARLIER runs are
+        # dropped too (the PoCMapper only filters the current run's results; the
+        # merge above would otherwise keep stale non-runnable entries and inflate
+        # has_poc). Only drop when content is present and clearly non-runnable —
+        # missing content is kept so we never wipe un-inspectable PoCs.
+        kept = []
+        for e in existing.exploits:
+            content = getattr(e, "source_code_content", None)
+            if content and not classify_poc_runnability(
+                    content, getattr(e, "file_path", "") or "", cve_id)[0]:
+                continue
+            kept.append(e)
+        existing.exploits = kept
 
         # Refresh flags
         existing.has_poc = len(existing.exploits) > 0

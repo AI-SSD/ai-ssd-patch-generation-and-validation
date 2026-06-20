@@ -184,6 +184,21 @@ poc_repair:
   # Maximum number of repair attempts per PoC before flagging for manual review
   max_repair_attempts: 3
 
+  # Per-attempt model escalation (optional) — mirrors Phase 2's
+  # feedback_loop.models_by_attempt. Keys are attempt numbers (1 = first repair,
+  # 2 = first retry, …), values model ids. An attempt not listed falls back to
+  # the base model for the active `provider`. Provider-agnostic: use OpenAI ids
+  # with provider: openai, or Ollama/local tags (any family) with provider:
+  # ollama. Leave empty to use the base model for every attempt.
+  # models_by_attempt:        # provider: openai
+  #   1: "gpt-4.1-mini"
+  #   2: "gpt-5-mini"
+  #   3: "gpt-4.1"
+  # models_by_attempt:        # provider: ollama
+  #   1: "qwen2.5-coder:7b"
+  #   2: "devstral:32k"
+  #   3: "qwen3-coder:30b"
+
   # Timeout for each LLM API call (seconds)
   api_timeout: 120
 
