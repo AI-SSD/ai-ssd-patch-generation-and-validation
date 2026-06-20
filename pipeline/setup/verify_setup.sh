@@ -10,7 +10,10 @@
 # Master Pipeline & Cleanup Utilities
 # =============================================================================
 
-set -e
+# NOTE: intentionally NO `set -e`. This is a tally script — every check handles
+# its own success/failure via the ERRORS/WARNINGS counters and it exits with
+# $ERRORS at the end. Under `set -e` a single failing probe (e.g. the NVD curl
+# timing out when the network is flaky) would abort the whole script mid-run.
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -20,6 +23,17 @@ NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIPELINE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Pipeline config whose phase0_config points at the project YAML (with the
+# sast: section). Override with: ./setup/verify_setup.sh --config <file>
+PIPELINE_CONFIG="$PIPELINE_ROOT/config.yaml"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --config) PIPELINE_CONFIG="$2"; shift 2 ;;
+        --config=*) PIPELINE_CONFIG="${1#*=}"; shift ;;
+        *) shift ;;
+    esac
+done
 
 echo ""
 echo "============================================="
@@ -127,13 +141,16 @@ else
     # 403/404 is a definitive rejection and breaks out immediately.
     NVD_CODE="000"
     for _try in 1 2 3; do
-        NVD_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
+        # Fail fast: bounded connect + total time so a slow/unreachable NVD
+        # can't make verification feel hung. `|| NVD_CODE=000` keeps a curl
+        # non-zero exit from aborting the loop.
+        NVD_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 12 \
             -H "apiKey: $NVD_KEY" \
-            "https://services.nvd.nist.gov/rest/json/cves/2.0?resultsPerPage=1" 2>/dev/null)
+            "https://services.nvd.nist.gov/rest/json/cves/2.0?resultsPerPage=1" 2>/dev/null) || NVD_CODE="000"
         NVD_CODE="${NVD_CODE:-000}"
         case "$NVD_CODE" in
             200|403|404) break ;;
-            *) [ "$_try" -lt 3 ] && sleep 3 ;;
+            *) [ "$_try" -lt 3 ] && sleep 2 ;;
         esac
     done
     if [ "$NVD_CODE" = "200" ]; then
@@ -258,22 +275,22 @@ else
     ERRORS=$((ERRORS + 1))
 fi
 
-# Check Cppcheck (SAST tool)
-echo -n "Checking Cppcheck (SAST)... "
-if command -v cppcheck &> /dev/null; then
-    echo -e "${GREEN}✓${NC} $(cppcheck --version)"
+# Check configured SAST tools (from the project YAML's sast: section).
+# A configured-but-missing tool is a hard ERROR: the project explicitly asked
+# for it, so Phase 3 must not run with reduced static-analysis coverage.
+if [ "$(cd "$PIPELINE_ROOT" && python3 -m master_pipeline.sast_config --config "$PIPELINE_CONFIG" --enabled 2>/dev/null)" = "true" ]; then
+    while IFS=$'\t' read -r name status hint; do
+        [ -z "$name" ] && continue
+        echo -n "Checking SAST tool '$name'... "
+        if [ "$status" = "OK" ]; then
+            echo -e "${GREEN}✓${NC} installed"
+        else
+            echo -e "${RED}✗ Not installed${NC} ($hint)"
+            ERRORS=$((ERRORS + 1))
+        fi
+    done < <(cd "$PIPELINE_ROOT" && python3 -m master_pipeline.sast_config --config "$PIPELINE_CONFIG" --check 2>/dev/null)
 else
-    echo -e "${YELLOW}⚠${NC} Not installed (run: apt install cppcheck)"
-    WARNINGS=$((WARNINGS + 1))
-fi
-
-# Check Flawfinder (SAST tool)
-echo -n "Checking Flawfinder (SAST)... "
-if command -v flawfinder &> /dev/null; then
-    echo -e "${GREEN}✓${NC} $(flawfinder --version 2>&1 | head -1)"
-else
-    echo -e "${YELLOW}⚠${NC} Not installed (run: pip3 install flawfinder)"
-    WARNINGS=$((WARNINGS + 1))
+    echo -e "Checking SAST tools... ${YELLOW}⚠${NC} disabled in project config (skipped)"
 fi
 
 # Check validation_builds directory

@@ -166,6 +166,8 @@ class PhaseExecutor:
             cmd.extend(['--run-timeout', str(self.config.run_timeout)])
             if self.config.cleanup:
                 cmd.append('--cleanup')
+            if getattr(self.config, 'force_baseline', False):
+                cmd.append('--force-baseline')
             # Pass excluded CVEs from manual verification
             if self.skipped_cves:
                 # Deduplicate to be safe

@@ -650,6 +650,7 @@ class ExecutionResult:
     negative_filter_source: Optional[str] = None  # "llm" | "regex" | "regex-fallback"
     needs_manual_revision: bool = False           # routed to manual revision
     poc_uses_project_build: Optional[str] = None  # "yes" | "no" (C PoCs) | None (interpreted/unknown)
+    baseline_cache_key: Optional[str] = None      # fingerprint for baseline memoization (image sig + runtime policy)
 
 
 # =============================================================================
@@ -2441,7 +2442,8 @@ class ImageManifest:
     def add_cve_image(self, vuln: VulnerabilityInfo, tag: str, status: str,
                       baseline_exit_code: Optional[int] = None,
                       needs_manual_revision: bool = False,
-                      poc_uses_project_build: Optional[str] = None):
+                      poc_uses_project_build: Optional[str] = None,
+                      baseline_cache_key: Optional[str] = None):
         """Record a CVE image entry.
 
         ``baseline_exit_code`` is the PoC exit code captured on the
@@ -2463,6 +2465,11 @@ class ImageManifest:
             "baseline_exit_code": baseline_exit_code,
             "needs_manual_revision": needs_manual_revision,
             "poc_uses_project_build": poc_uses_project_build,
+            # Baseline-memoization fingerprint: identifies the exact image
+            # (baked poc_signature) + runtime policy (run_timeout, memory
+            # ceiling, determinism budget) the baseline was measured under, so a
+            # later run can reuse it iff nothing that affects the verdict changed.
+            "baseline_cache_key": baseline_cache_key,
             # Phase 3 must re-run the inherited PoC the SAME way Phase 1 did, or
             # the exit-code comparison is invalid: privileged for namespace PoCs,
             # and the build arch (i386 images derive 32-bit automatically, but
@@ -3495,6 +3502,9 @@ class PipelineOrchestrator:
         self.build_timeout = args.build_timeout
         self.run_timeout = args.run_timeout
         self.cleanup = args.cleanup
+        # Baseline memoization is ON by default; --force-baseline re-measures
+        # even when an identical-image/identical-policy baseline already exists.
+        self.force_baseline = getattr(args, 'force_baseline', False)
         self.specific_cve = args.cve
         self.dry_run = getattr(args, 'dry_run', False)
         self.skipped_cves = getattr(args, 'skipped_cves', []) or []
@@ -3719,6 +3729,7 @@ class PipelineOrchestrator:
                 baseline_exit_code=result.baseline_exit_code,
                 needs_manual_revision=result.needs_manual_revision,
                 poc_uses_project_build=result.poc_uses_project_build,
+                baseline_cache_key=result.baseline_cache_key,
             )
             
             self.logger.info(f"Completed {vuln.cve}: {result.status} (duration: {result.execution_time_seconds:.1f}s)")
@@ -3833,6 +3844,60 @@ class PipelineOrchestrator:
                 label = f"exit={exit_code}"
             parts.append(f"{label}×{n}")
         return ", ".join(parts) if parts else "(none)"
+
+    def _baseline_cache_key(self, cve_tag: str) -> str:
+        """Fingerprint that says when a captured baseline may be reused.
+
+        Combines the image's baked ``poc_signature`` (an identical signature
+        means identical vulnerable build + PoC + run wrapper) with the runtime
+        policy that shapes the verdict: ``run_timeout`` (a shorter/longer
+        timeout can flip a hang into a completion or vice-versa), the container
+        memory ceiling (an OOM-kill at a lower limit changes the exit code) and
+        the determinism budget (``baseline_runs``/``baseline_min_agree``). A
+        change to ANY of these can legitimately change the baseline, so it must
+        invalidate the memo. Returns ``""`` when the signature is unavailable
+        (older/missing image), which disables memoization for that CVE.
+        """
+        try:
+            labels = self.docker_mgr.client.images.get(cve_tag).labels or {}
+        except Exception:
+            return ""
+        sig = labels.get("ai-ssd.poc_signature", "")
+        if not sig:
+            return ""
+        return (
+            f"sig={sig}|rt={self.run_timeout}|mem={_CONTAINER_MEM_LIMIT}"
+            f"|runs={self._baseline_runs}|agree={self._baseline_min_agree}"
+        )
+
+    def _lookup_memoized_baseline(self, vuln: VulnerabilityInfo, cve_tag: str,
+                                  current_key: str) -> Optional[dict]:
+        """Return a prior manifest entry whose baseline can be reused, else None.
+
+        Conservative by design: only a prior *reproduced* baseline — one with a
+        concrete ``baseline_exit_code`` that was NOT routed to manual revision —
+        for the SAME image tag (so Phase 3 still derives from it) under an
+        identical cache key is reused. Non-reproduced / manual-revision outcomes
+        are always re-measured (they are usually cheap, and re-running keeps the
+        door open for a flaky PoC to stabilize). The manifest is loaded from the
+        previous run in ``ImageManifest.__init__``; ``add_cve_image`` only
+        overwrites this CVE's entry AFTER this method runs.
+        """
+        if not current_key:
+            return None
+        for entry in self._manifest.data.get("cve_images", []):
+            if entry.get("cve") != vuln.cve:
+                continue
+            if entry.get("needs_manual_revision"):
+                return None
+            if entry.get("baseline_exit_code") is None:
+                return None
+            if entry.get("tag") != cve_tag:
+                return None
+            if entry.get("baseline_cache_key") != current_key:
+                return None
+            return entry
+        return None
 
     def _capture_baseline(self, vuln: VulnerabilityInfo, cve_tag: str):
         """Run the baseline PoC repeatedly until its exit-code signature is
@@ -4293,6 +4358,35 @@ class PipelineOrchestrator:
             # repeatedly and require a stable exit-code signature before trusting
             # it; a PoC that never stabilizes is routed to manual revision.
             cve_tag = vuln.cve_image_tag
+
+            # ---- Baseline memoization -----------------------------------------
+            # Capturing the baseline re-runs the PoC up to ``baseline_runs``
+            # times, each bounded by ``run_timeout`` — for a hang/timeout PoC
+            # that is baseline_runs × run_timeout of pure waiting, the dominant
+            # Phase 1 cost. When a prior run already established a baseline for an
+            # IDENTICAL image (same baked poc_signature) under an identical
+            # runtime policy, the verdict is reproducible by construction, so
+            # reuse it instead of paying that cost again on every warm re-run.
+            # --force-baseline skips the memo and re-measures from scratch.
+            result.baseline_cache_key = self._baseline_cache_key(cve_tag)
+            if not self.force_baseline:
+                memo = self._lookup_memoized_baseline(
+                    vuln, cve_tag, result.baseline_cache_key
+                )
+                if memo is not None:
+                    result.poc_executed = True
+                    result.baseline_exit_code = memo.get("baseline_exit_code")
+                    result.vulnerability_reproduced = True
+                    result.status = ExecutionStatus.SUCCESS.value
+                    self.logger.info(
+                        f"  {vuln.cve}: reusing memoized baseline "
+                        f"(exit={result.baseline_exit_code}) — identical image + "
+                        f"runtime policy; skipped up to "
+                        f"{self._baseline_runs}×{self.run_timeout}s PoC re-run "
+                        f"[--force-baseline to re-measure]"
+                    )
+                    return result
+            # -------------------------------------------------------------------
             chosen, sig_counts, baseline_runs = self._capture_baseline(vuln, cve_tag)
 
             result.poc_executed = True
@@ -4660,7 +4754,15 @@ Examples:
         action='store_true',
         help='Enable verbose output'
     )
-    
+
+    parser.add_argument(
+        '--force-baseline',
+        action='store_true',
+        help='Re-measure the Phase 1 baseline even when an identical-image, '
+             'identical-policy baseline is already recorded (disables baseline '
+             'memoization for this run)'
+    )
+
     args = parser.parse_args()
     
     # Set default paths relative to base directory

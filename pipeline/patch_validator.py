@@ -49,6 +49,9 @@ except ImportError:
 _BASE_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(_BASE_DIR))
 from master_pipeline.config import load_pipeline_config, cfg_section  # noqa: E402
+from master_pipeline.sast_config import (  # noqa: E402
+    load_sast_config, SastTool, SastConfig,
+)
 from poc_analyzer import PoCAnalyzer  # noqa: E402  (same negative filter Phase 1 uses)
 
 _cfg = load_pipeline_config(_BASE_DIR)
@@ -111,22 +114,24 @@ def _resolve_phase1_layout(base_dir: Path) -> Dict[str, Any]:
     }
 
 
-# SAST Tools Configuration — run HOST-SIDE on the patched source file.
-# Static analysis of a single C file needs no container; running on the host
-# avoids installing analysis tools into EOL-distro images and keeps tool
+# SAST tooling — run HOST-SIDE on the patched source file.
+#
+# Static analysis of a single source file needs no container; running on the
+# host avoids installing analysis tools into EOL-distro images and keeps tool
 # versions consistent across all CVEs.
-SAST_TOOLS = {
-    "cppcheck": {
-        "cmd": ["cppcheck", "--enable=all", "--xml", "--xml-version=2", "{file}"],
-        "fallback_cmd": None,
-        "description": "Static analysis tool for C/C++ code",
-    },
-    "flawfinder": {
-        "cmd": ["flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"],
-        "fallback_cmd": [sys.executable, "-m", "flawfinder",
-                         "--minlevel=1", "--dataonly", "--quiet", "{file}"],
-        "description": "Examines C/C++ source code for security weaknesses",
-    },
+#
+# The tool list is NOT hardcoded here — it is project-/language-specific and is
+# declared in the active project's Phase 0 YAML (``sast:`` section), resolved by
+# master_pipeline.sast_config. This module only knows how to *run* a command and
+# *parse* one of the supported output formats (see _parse_sast_output).
+_SAST_CONFIG: SastConfig = load_sast_config(pipeline_config_path=_BASE_DIR / "config.yaml")
+
+# Map a fail_on severity class -> the SASTResult counter it sums (see _run_sast_tool).
+_SEVERITY_COUNT_ATTR = {
+    "critical": "critical_count",
+    "high": "high_count",
+    "medium": "medium_count",
+    "low": "low_count",
 }
 
 
@@ -764,9 +769,12 @@ RUN bash /build_intree.sh > /tmp/ssd_rebuild.log 2>&1; \\
 class ValidationDockerManager:
     """Manages Docker operations for patch validation"""
     
-    def __init__(self, logger: logging.Logger, timeout: int = 3600):
+    def __init__(self, logger: logging.Logger, timeout: int = 3600,
+                 sast_config: Optional[SastConfig] = None):
         self.logger = logger
         self.timeout = timeout
+        # Project-/language-specific SAST tool list (from the project YAML).
+        self.sast_config = sast_config if sast_config is not None else _SAST_CONFIG
         # Same negative filter Phase 1 uses to prove the exploit WORKED — here it
         # proves the exploit no longer works (output shows explicit failure).
         self.poc_analyzer = PoCAnalyzer(logger)
@@ -1175,20 +1183,21 @@ class ValidationDockerManager:
         self.logger.info(f"Running SAST analysis for {patch_info.cve_id}/{patch_info.model_name}...")
 
         results = []
-        for tool_name, tool_config in SAST_TOOLS.items():
-            result = self._run_sast_tool(patched_file, tool_name, tool_config)
+        for tool in self.sast_config.tools:
+            result = self._run_sast_tool(patched_file, tool)
             results.append(result)
         return results
 
     def _run_sast_tool(
         self,
         patched_file: Path,
-        tool_name: str,
-        tool_config: Dict[str, Any]
+        tool: SastTool,
     ) -> SASTResult:
-        """Run a single SAST tool on the host via subprocess."""
+        """Run a single configured SAST tool on the host via subprocess."""
         import time
         sast_start_time = time.time()
+        tool_name = tool.name
+        timeout = self.sast_config.tool_timeout
         self.logger.debug(f"Running {tool_name}...")
 
         result = SASTResult(
@@ -1199,31 +1208,30 @@ class ValidationDockerManager:
             raw_output=""
         )
 
-        # Resolve the command: primary binary, else fallback (e.g. python -m)
-        cmd_template = None
-        if shutil.which(tool_config["cmd"][0]):
-            cmd_template = tool_config["cmd"]
-        elif tool_config.get("fallback_cmd"):
-            cmd_template = tool_config["fallback_cmd"]
+        # Resolve the command: primary binary, else fallback (e.g. python -m).
+        file_str = str(patched_file)
+        cmd = None
+        if shutil.which(tool.detect):
+            cmd = tool.resolved_cmd(file_str)
+        else:
+            cmd = tool.resolved_fallback(file_str)
 
-        if cmd_template is None:
+        if not cmd:
             result.error_message = (
                 f"{tool_name} not installed on host — skipped "
-                f"(install it to enable this check)"
+                f"({tool.install_hint()})"
             )
             self.logger.warning(result.error_message)
             return result
 
-        cmd = [arg.format(file=str(patched_file)) for arg in cmd_template]
-
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=120
+                cmd, capture_output=True, text=True, timeout=timeout
             )
             output = (proc.stdout or "") + (proc.stderr or "")
             result.raw_output = output
 
-            result.findings = self._parse_sast_output(tool_name, output)
+            result.findings = self._parse_sast_output(tool, output)
             result.success = True
 
             # Count by severity
@@ -1246,7 +1254,7 @@ class ValidationDockerManager:
             )
 
         except subprocess.TimeoutExpired:
-            result.error_message = f"{tool_name} timed out after 120s"
+            result.error_message = f"{tool_name} timed out after {timeout}s"
             self.logger.warning(result.error_message)
         except Exception as e:
             sast_duration = time.time() - sast_start_time
@@ -1255,18 +1263,119 @@ class ValidationDockerManager:
 
         return result
     
-    def _parse_sast_output(self, tool_name: str, output: str) -> List[SASTFinding]:
-        """Parse SAST tool output into findings"""
-        findings = []
-        
-        if tool_name == "cppcheck":
-            findings = self._parse_cppcheck_output(output)
-        elif tool_name == "flawfinder":
-            findings = self._parse_flawfinder_output(output)
-        
+    def _parse_sast_output(self, tool: SastTool, output: str) -> List[SASTFinding]:
+        """Parse a tool's output into findings, dispatched by its configured
+        ``parser`` strategy so new tools need no Python change."""
+        parser = (tool.parser or "").lower()
+        if parser == "cppcheck-xml":
+            return self._parse_cppcheck_output(output, tool.name)
+        if parser == "flawfinder":
+            return self._parse_flawfinder_output(output, tool.name)
+        if parser == "sarif":
+            return self._parse_sarif_output(output, tool.name)
+        if parser == "regex":
+            return self._parse_regex_output(output, tool)
+        self.logger.warning(
+            f"SAST tool '{tool.name}' has unknown parser '{tool.parser}' — no findings parsed"
+        )
+        return []
+
+    def _parse_sarif_output(self, output: str, tool_name: str) -> List[SASTFinding]:
+        """Parse SARIF 2.1.0 JSON (the de-facto interchange format emitted by
+        semgrep, CodeQL, many modern analysers). Tool-agnostic."""
+        import json
+        findings: List[SASTFinding] = []
+        # SARIF level -> our severity class.
+        level_map = {"error": "high", "warning": "medium", "note": "low",
+                     "none": "low"}
+        try:
+            data = json.loads(output)
+        except Exception:
+            # Tools (semgrep, pmd, …) often interleave progress/log lines on the
+            # same stream as the SARIF document. Extract the outermost JSON object
+            # and retry before giving up.
+            start = output.find("{")
+            end = output.rfind("}")
+            if start == -1 or end <= start:
+                return findings
+            try:
+                data = json.loads(output[start:end + 1])
+            except Exception:
+                return findings
+        for run in data.get("runs", []) or []:
+            # Build ruleId -> CWE map from the rule metadata when present.
+            rule_cwe: Dict[str, Optional[str]] = {}
+            driver = (run.get("tool") or {}).get("driver") or {}
+            for rule in driver.get("rules", []) or []:
+                rid = rule.get("id")
+                tags = ((rule.get("properties") or {}).get("tags")) or []
+                cwe = next((t for t in tags if str(t).upper().startswith("CWE")), None)
+                if rid:
+                    rule_cwe[rid] = cwe
+            for res in run.get("results", []) or []:
+                level = str(res.get("level", "warning")).lower()
+                severity = level_map.get(level, "medium")
+                msg = (res.get("message") or {}).get("text", "")
+                rule_id = res.get("ruleId")
+                line = None
+                file_path = None
+                locs = res.get("locations") or []
+                if locs:
+                    phys = (locs[0].get("physicalLocation") or {})
+                    region = phys.get("region") or {}
+                    line = region.get("startLine")
+                    file_path = ((phys.get("artifactLocation") or {}).get("uri"))
+                findings.append(SASTFinding(
+                    tool=tool_name,
+                    severity=severity,
+                    message=f"[{rule_id}] {msg}" if rule_id else msg,
+                    line=int(line) if line else None,
+                    cwe_id=rule_cwe.get(rule_id),
+                    file_path=file_path,
+                ))
         return findings
-    
-    def _parse_cppcheck_output(self, output: str) -> List[SASTFinding]:
+
+    def _parse_regex_output(self, output: str, tool: SastTool) -> List[SASTFinding]:
+        """Parse line-oriented output using a tool-supplied regex + group map.
+        Lets a brand-new tool be wired up entirely from YAML."""
+        findings: List[SASTFinding] = []
+        if not tool.regex:
+            return findings
+        try:
+            pattern = re.compile(tool.regex)
+        except re.error as exc:
+            self.logger.warning(f"SAST tool '{tool.name}' has invalid regex: {exc}")
+            return findings
+        g = tool.groups
+
+        def _group(match, key):
+            idx = g.get(key)
+            if not idx:
+                return None
+            try:
+                return match.group(idx)
+            except (IndexError, Exception):
+                return None
+
+        for raw_line in output.split("\n"):
+            match = pattern.search(raw_line.strip())
+            if not match:
+                continue
+            sev_raw = (_group(match, "severity") or "").strip().lower()
+            severity = tool.severity_map.get(sev_raw, sev_raw) or "low"
+            line_val = _group(match, "line")
+            col_val = _group(match, "column")
+            findings.append(SASTFinding(
+                tool=tool.name,
+                severity=severity,
+                message=(_group(match, "message") or raw_line.strip()),
+                line=int(line_val) if line_val and str(line_val).isdigit() else None,
+                column=int(col_val) if col_val and str(col_val).isdigit() else None,
+                file_path=_group(match, "file"),
+            ))
+        return findings
+
+    def _parse_cppcheck_output(self, output: str, tool_name: str = "cppcheck") -> List[SASTFinding]:
         """Parse cppcheck XML output"""
         findings = []
         
@@ -1288,7 +1397,7 @@ class ValidationDockerManager:
                     file_path = location.get('file')
                 
                 findings.append(SASTFinding(
-                    tool="cppcheck",
+                    tool=tool_name,
                     severity=severity,
                     message=msg,
                     line=line,
@@ -1300,14 +1409,14 @@ class ValidationDockerManager:
             for line in output.split('\n'):
                 if 'error' in line.lower() or 'warning' in line.lower():
                     findings.append(SASTFinding(
-                        tool="cppcheck",
+                        tool=tool_name,
                         severity="warning",
                         message=line.strip()
                     ))
-        
+
         return findings
-    
-    def _parse_flawfinder_output(self, output: str) -> List[SASTFinding]:
+
+    def _parse_flawfinder_output(self, output: str, tool_name: str = "flawfinder") -> List[SASTFinding]:
         """Parse flawfinder output"""
         findings = []
         
@@ -1329,14 +1438,14 @@ class ValidationDockerManager:
                     severity = "low"
                 
                 findings.append(SASTFinding(
-                    tool="flawfinder",
+                    tool=tool_name,
                     severity=severity,
                     message=f"[{category}] {msg}",
                     line=int(line_num),
                     column=int(col),
                     file_path=file_path
                 ))
-        
+
         return findings
     
     def cleanup_image(self, patch_info: PatchInfo):
@@ -1533,8 +1642,13 @@ class ValidationPipeline:
         self.run_timeout = args.run_timeout
         self.cleanup = args.cleanup
         self.specific_cve = args.cve
-        self.skip_sast = args.skip_sast
-        
+
+        # Project-/language-specific SAST policy (tools, fail_on, timeout) from
+        # the active project's Phase 0 YAML. SAST is skipped if the CLI requests
+        # it OR the project disables it (sast.enabled: false).
+        self.sast_config = load_sast_config(pipeline_config_path=_BASE_DIR / "config.yaml")
+        self.skip_sast = bool(args.skip_sast) or not self.sast_config.enabled
+
         # Setup directories
         self.validation_builds_dir = self.base_dir / "validation_builds"
         self.results_dir = self.base_dir / "validation_results"
@@ -1550,7 +1664,8 @@ class ValidationPipeline:
         self.csv_parser = CSVParser(self.csv_path, self.logger)
         self.patch_discovery = PatchDiscovery(self.patches_dir, self.logger)
         self.dockerfile_gen = PatchedDockerfileGenerator(self.logger, self.phase1_layout)
-        self.docker_mgr = ValidationDockerManager(self.logger, self.build_timeout)
+        self.docker_mgr = ValidationDockerManager(self.logger, self.build_timeout,
+                                                  sast_config=self.sast_config)
         self.report_gen = ValidationReportGenerator(self.results_dir, self.logger)
         self.manifest = ImageManifest(
             self.phase1_layout["image_manifest_path"], self.logger
@@ -1615,11 +1730,32 @@ class ValidationPipeline:
         self.logger.info(f"Results saved to: {report_path}")
         self.logger.info("=" * 60)
     
+    def _sast_gate(self, sast_results: "List[SASTResult]") -> Tuple[bool, str]:
+        """Apply the project's configured ``fail_on`` severity gate.
+
+        Returns ``(passed, message)``. A patch passes when none of the
+        ``fail_on`` severity classes (e.g. critical/high) have any findings;
+        medium/low are reported but never fail (they existed in the original
+        code too). The set of failing classes comes from the project YAML, not
+        from hardcoded C/C++ assumptions.
+        """
+        fail_on = self.docker_mgr.sast_config.fail_on
+        totals = {cls: 0 for cls in _SEVERITY_COUNT_ATTR}
+        for sr in sast_results:
+            for cls, attr in _SEVERITY_COUNT_ATTR.items():
+                totals[cls] += getattr(sr, attr, 0)
+        fail_total = sum(totals[c] for c in fail_on if c in totals)
+        if fail_total == 0:
+            return True, ""
+        parts = [f"{totals[c]} {c}" for c in sorted(fail_on) if totals.get(c)]
+        return False, f"SAST found {', '.join(parts)} severity issue(s)"
+
     def _apply_sast(self, patch_info: "PatchInfo", result: "ValidationResult") -> None:
         """Run SAST on the patched file and set result.sast_* + final status.
 
         Shared by the in-tree validation path; mirrors the standard Step 7 logic
-        (SUCCESS only when the dynamic check passed AND no critical/high findings).
+        (SUCCESS only when the dynamic check passed AND the configured SAST
+        severity gate passed).
         """
         if self.skip_sast:
             result.sast_passed = True
@@ -1628,7 +1764,6 @@ class ValidationPipeline:
             sast_results = self.docker_mgr.run_sast(patch_info, patch_info.patched_file)
             result.sast_results = []
             result.sast_findings = []
-            total_critical = total_high = 0
             for sr in sast_results:
                 result.sast_results.append({
                     "tool": sr.tool, "success": sr.success,
@@ -1642,16 +1777,12 @@ class ValidationPipeline:
                         "line": f.line, "column": f.column, "cwe_id": f.cwe_id,
                         "file_path": f.file_path,
                     })
-                total_critical += sr.critical_count
-                total_high += sr.high_count
-            result.sast_passed = (total_critical == 0 and total_high == 0)
+            result.sast_passed, _sast_msg = self._sast_gate(sast_results)
             if not result.sast_passed and result.status != ValidationStatus.POC_STILL_WORKS.value:
                 if result.status not in (ValidationStatus.EXECUTION_ERROR.value,
                                          ValidationStatus.BUILD_ERROR.value):
                     result.status = ValidationStatus.SAST_FAILED.value
-                    result.error_message = (
-                        f"SAST found {total_critical} critical and {total_high} high severity issues"
-                    )
+                    result.error_message = _sast_msg
         if result.poc_blocked and result.sast_passed:
             result.status = ValidationStatus.SUCCESS.value
             self.logger.info(f"✓✓ VALIDATION SUCCESSFUL for {patch_info.log_label}")
@@ -1880,9 +2011,7 @@ class ValidationPipeline:
                 # Convert SAST results to serializable format with detailed findings
                 result.sast_results = []
                 result.sast_findings = []
-                total_critical = 0
-                total_high = 0
-                
+
                 for sast_result in sast_results:
                     # Summary format
                     result.sast_results.append({
@@ -1895,7 +2024,7 @@ class ValidationPipeline:
                         "findings_count": len(sast_result.findings),
                         "error": sast_result.error_message,
                     })
-                    
+
                     # Detailed findings for feedback loop
                     for finding in sast_result.findings:
                         result.sast_findings.append({
@@ -1907,14 +2036,11 @@ class ValidationPipeline:
                             "cwe_id": finding.cwe_id,
                             "file_path": finding.file_path,
                         })
-                    
-                    total_critical += sast_result.critical_count
-                    total_high += sast_result.high_count
-                
-                # SAST passes if no critical or high severity issues
-                # (Low/Medium issues are acceptable - they existed in original code too)
-                result.sast_passed = (total_critical == 0 and total_high == 0)
-                
+
+                # SAST passes when none of the configured fail_on severity
+                # classes have findings (medium/low existed in the original too).
+                result.sast_passed, _sast_msg = self._sast_gate(sast_results)
+
                 if not result.sast_passed:
                     # Set status but don't return - we've already collected all data.
                     # A dynamic-check failure (still works / hang) is more
@@ -1923,12 +2049,11 @@ class ValidationPipeline:
                                      ValidationStatus.POC_HANG.value)
                     if result.status not in _dynamic_fail:
                         result.status = ValidationStatus.SAST_FAILED.value
-                        result.error_message = f"SAST found {total_critical} critical and {total_high} high severity issues"
+                        result.error_message = _sast_msg
                     else:
                         # Both the dynamic check and SAST failed
                         result.error_message = (
-                            f"{result.error_message} AND "
-                            f"SAST found {total_critical} critical, {total_high} high severity issues"
+                            f"{result.error_message} AND {_sast_msg}"
                         )
                     self.logger.warning(f"✗ SAST failed for {patch_info.cve_id}/{patch_info.model_name}")
                 else:

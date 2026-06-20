@@ -137,6 +137,7 @@ class DataAggregator(PipelineModule):
             has_vulnerable_code=bool(ps.vulnerable_files_content),
             has_vulnerable_functions=bool(ps.vulnerable_functions),
             poc_count=len(exploits),
+            manual_poc_leads=list(raw.get("manual_poc_leads", []) or []),
             first_seen=raw.get("first_seen", datetime.now().isoformat()),
             last_checked=datetime.now().isoformat(),
         )
@@ -208,13 +209,37 @@ class DataAggregator(PipelineModule):
         # has_poc). Only drop when content is present and clearly non-runnable —
         # missing content is kept so we never wipe un-inspectable PoCs.
         kept = []
+        merge_leads: List[Dict[str, Any]] = []
         for e in existing.exploits:
             content = getattr(e, "source_code_content", None)
-            if content and not classify_poc_runnability(
-                    content, getattr(e, "file_path", "") or "", cve_id)[0]:
-                continue
+            if content:
+                runnable, why = classify_poc_runnability(
+                    content, getattr(e, "file_path", "") or "", cve_id)
+                if not runnable:
+                    # Mirror PoCMapper: a dropped *verified* entry that is about
+                    # this CVE remains a manual-supervision lead, not a discard.
+                    if getattr(e, "verified", False) and not why.startswith("cve_id_mismatch"):
+                        merge_leads.append({
+                            "exploit_id": getattr(e, "exploit_id", "") or "",
+                            "file_path": getattr(e, "file_path", "") or "",
+                            "exploitdb_url": getattr(e, "exploitdb_url", "") or "",
+                            "source_url": getattr(e, "source_url", "") or "",
+                            "description": getattr(e, "description", "") or "",
+                            "drop_reason": why,
+                        })
+                    continue
             kept.append(e)
         existing.exploits = kept
+
+        # Union manual-PoC leads across runs (existing ∪ new ∪ merge-dropped),
+        # de-duplicated by exploit id, so the lead survives persisted re-runs.
+        leads_by_id: Dict[str, Dict[str, Any]] = {}
+        # Freshest source last so it wins on key collision: merge backstop, then
+        # the persisted entry, then this run's PoCMapper output (richest).
+        for lead in (merge_leads + list(existing.manual_poc_leads or [])
+                     + list(new.manual_poc_leads or [])):
+            leads_by_id[lead.get("exploit_id") or lead.get("file_path") or repr(lead)] = lead
+        existing.manual_poc_leads = list(leads_by_id.values())
 
         # Refresh flags
         existing.has_poc = len(existing.exploits) > 0

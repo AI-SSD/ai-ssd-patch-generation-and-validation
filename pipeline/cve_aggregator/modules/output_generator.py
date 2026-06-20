@@ -124,6 +124,81 @@ class OutputGenerator(PipelineModule):
     # Filtered dataset
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _manual_poc_sourcing_needed(entry: CVEEntry, cfg: Dict) -> bool:
+        """True when a CVE should be routed to manual supervision to source a PoC.
+
+        The CVE meets every requirement except a runnable PoC: it has a fix
+        commit and extracted vulnerable functions, and at least one *verified*
+        ExploitDB entry was mapped to it but dropped by the runnability filter
+        (a write-up / non-runnable artifact, recorded as a ``manual_poc_leads``
+        entry). Such CVEs are flagged for manual review instead of discarded.
+        Gated by ``flag_unvalidated_edb_for_manual_review`` (default on).
+        """
+        if not cfg.get("flag_unvalidated_edb_for_manual_review", True):
+            return False
+        if entry.has_poc:
+            return False
+        if not (entry.has_commits and entry.has_vulnerable_functions):
+            return False
+        return bool(getattr(entry, "manual_poc_leads", None))
+
+    def _write_manual_poc_report(self, cve_id: str, entry: CVEEntry, cfg: Dict) -> None:
+        """Write a human-facing manual-supervision report for a CVE that needs a
+        PoC sourced. Uses the ``<CVE>_syntax_report.txt`` name the Phase 0
+        manual-verification menu already recognises (so it shows under [V] View
+        and suppresses the orchestrator's generic missing-PoC report)."""
+        supervision_dir = Path(cfg.get("manual_supervision_dir", "manual_supervision"))
+        try:
+            supervision_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.logger.warning("Could not create manual_supervision dir: %s", exc)
+            return
+        leads = getattr(entry, "manual_poc_leads", None) or []
+        ps = entry.project_state
+        lines = [
+            f"MANUAL POC SOURCING REQUIRED — {cve_id}",
+            "=" * 70,
+            "",
+            "This CVE has everything needed to patch and validate EXCEPT a runnable",
+            "PoC: a fix commit and vulnerable functions were extracted, and a",
+            "verified ExploitDB entry exists — but that entry failed runnability",
+            "validation (it is a prose write-up / non-runnable artifact that links",
+            "to the real exploit rather than containing it).",
+            "",
+            f"Fix commit:        {ps.fix_commit_hash or 'N/A'}",
+            f"Vulnerable commit: {ps.vulnerable_commit_hash or 'N/A'}",
+            "",
+            "Verified ExploitDB lead(s) — fetch the real PoC from here:",
+        ]
+        for lead in leads:
+            lines.append(f"  - {lead.get('exploit_id') or '(no EDB id)'} "
+                         f"[{lead.get('drop_reason', '')}]")
+            if lead.get("exploitdb_url"):
+                lines.append(f"      ExploitDB: {lead['exploitdb_url']}")
+            if lead.get("source_url"):
+                lines.append(f"      Source:    {lead['source_url']}")
+            if lead.get("description"):
+                lines.append(f"      Title:     {lead['description']}")
+        lines += [
+            "",
+            "To approve:",
+            f"  1. Obtain a runnable PoC and save it as manual_supervision/{cve_id}.<ext>",
+            "     (or directly into exploits/).",
+            f"  2. Approve via the Phase 0 menu, or run: touch manual_supervision/{cve_id}.ok",
+            "",
+            "If no runnable PoC can be produced, exclude the CVE from the menu.",
+        ]
+        try:
+            (supervision_dir / f"{cve_id}_syntax_report.txt").write_text(
+                "\n".join(lines) + "\n", encoding="utf-8")
+            self.logger.info(
+                "%s: no runnable PoC but verified ExploitDB lead exists — "
+                "routed to manual supervision (PoC sourcing)", cve_id)
+        except OSError as exc:
+            self.logger.warning("Failed to write manual PoC report for %s: %s",
+                                cve_id, exc)
+
     def _create_filtered(self, full: Dataset, cfg: Dict) -> Dataset:
         """Create filtered dataset according to configurable criteria."""
         project_name = self.config.get("project", {}).get("name", "custom")
@@ -134,6 +209,13 @@ class OutputGenerator(PipelineModule):
         def include_entry(entry: CVEEntry) -> bool:
             if require_commit and not entry.has_commits:
                 return False
+            # Manual-supervision lead: the CVE has everything needed (commit +
+            # extracted vulnerable functions) AND a verified ExploitDB entry, but
+            # that entry failed runnability validation (a prose write-up, etc.) so
+            # no runnable PoC survived. Rather than discard it, keep it so the CSV
+            # carries a manual-review row and a human can supply the real PoC.
+            if self._manual_poc_sourcing_needed(entry, cfg):
+                return True
             # Option A: a regression test the fixing commit ships is a valid,
             # authoritative reproducer — so a CVE with one is kept even when it
             # has no ExploitDB PoC (the majority of glibc CVEs). Phase 1 runs it
@@ -390,8 +472,14 @@ class OutputGenerator(PipelineModule):
         # fixing commit ships (Option A). The latter lets CVEs with no ExploitDB
         # entry (the majority of glibc CVEs) still reach Phase 1.
         reg_tests = list(getattr(ps, "regression_tests", None) or [])
+        # ...unless the CVE qualifies for manual PoC sourcing: it has the commit +
+        # vulnerable functions and a verified-but-unrunnable ExploitDB lead. Then
+        # we still emit a row (flagged for manual review) so it isn't discarded.
+        manual_poc_sourcing = self._manual_poc_sourcing_needed(entry, cfg)
         if not entry.exploits and not reg_tests:
-            return None
+            if not manual_poc_sourcing:
+                return None
+            self._write_manual_poc_report(cve_id, entry, cfg)
 
         # ---- Save ALL PoC files and collect per-exploit info ----
         poc_infos: List[Dict[str, Any]] = []  # one dict per valid exploit
@@ -532,13 +620,16 @@ class OutputGenerator(PipelineModule):
             saved_idx += 1
 
         # If no valid PoC could be extracted, still keep one placeholder
-        # so the CVE is not silently dropped from the CSV.
+        # so the CVE is not silently dropped from the CSV. When the CVE qualifies
+        # for manual PoC sourcing, the placeholder carries the manual-review flag
+        # so Phase 0 pauses for a human to supply the real PoC (and Phase 1 skips
+        # it until then).
         if not poc_infos:
             poc_infos.append({
                 "poc_index": 0,
                 "poc_path": "",
                 "poc_language": "unknown",
-                "needs_manual": False,
+                "needs_manual": manual_poc_sourcing,
                 "poc_saved": False,
             })
 

@@ -377,6 +377,20 @@ output:
   filtered_require_poc: true
   filtered_require_verified_poc: true
 
+  # When a CVE has a fix commit + extracted vulnerable functions AND a verified
+  # ExploitDB entry, but that entry fails runnability validation (a prose
+  # write-up that links to the real PoC, e.g. EDB-39454/CVE-2015-7547), route it
+  # to Phase 0 manual supervision instead of silently discarding it: a CSV row is
+  # emitted with manual_review_required=yes / manual_verified=pending and a report
+  # is written to manual_supervision/ pointing at the ExploitDB lead so a human
+  # can supply the real PoC. Phase 1 skips it until approved. Set false to revert
+  # to discard-on-no-runnable-PoC.
+  flag_unvalidated_edb_for_manual_review: true
+
+  # Directory for manual-supervision reports/markers (mirrors
+  # syntax_validator.manual_supervision_dir; both must point at the same place).
+  manual_supervision_dir: "manual_supervision"
+
   # Export PoC rows/files even when commit discovery failed.
   # Useful for PoC inventory workflows; disable for strict patch-pipeline-only mode.
   allow_poc_without_commit: false
@@ -408,6 +422,64 @@ output:
     - "TEST_SUBDIR"
     - "manual_review_required"
     - "manual_verified"
+
+# ---------------------------------------------------------------------------
+# Phase 3 (patch_validator.py) – SAST (static analysis) tooling
+# ---------------------------------------------------------------------------
+# Project-/language-specific: glibc is C, so it uses C/C++ analysers. A Java
+# project would instead list e.g. spotbugs/semgrep here with parser: sarif.
+# The pipeline code is tool-agnostic — it only knows how to *run* a command and
+# *parse* one of the supported output formats. Consumed by patch_validator.py,
+# the startup preflight, and setup/verify_setup.sh (via master_pipeline.sast_config).
+#
+#   parser: one of  cppcheck-xml | flawfinder | sarif | regex
+#   install: how setup.sh installs it (apt | pip | script: <shell command>)
+#   {file}   -> the patched source file        {python} -> the running interpreter
+#
+# Tool selection (C). SAST runs host-side on a single patched source file with
+# NO build, so only source-level analysers fit. Whole-program/build-coupled
+# tools (CodeQL, Infer) are intentionally excluded — they need a compiled
+# database. The stack mixes a maintained classic (cppcheck) with modern
+# analysers (clang-tidy = LLVM static analyser, semgrep = AST security rules):
+#   - cppcheck   : actively maintained (kept; apt ships <2.16 so XML, not SARIF)
+#   - clang-tidy : LLVM clang-analyzer / bugprone / cert checks
+#   - semgrep    : modern multi-language AST scanner, SARIF native
+#   - flawfinder : lightweight lexical CWE pass (kept for continuity; weakest)
+sast:
+  enabled: true
+  fail_on: [critical, high]      # severity classes that fail a patch (medium/low are reported only)
+  tool_timeout: 180              # per-tool subprocess timeout (seconds); semgrep fetches rules
+  tools:
+    - name: cppcheck
+      detect: cppcheck
+      cmd: ["cppcheck", "--enable=all", "--xml", "--xml-version=2", "{file}"]
+      parser: cppcheck-xml
+      install: { apt: cppcheck }
+    - name: clang-tidy
+      detect: clang-tidy
+      # No compile DB: the trailing "--" runs the checks directly. The regex only
+      # matches real check diagnostics (trailing "[check-name]"), so missing-header
+      # parse errors on stderr are ignored rather than counted as findings.
+      cmd: ["clang-tidy", "--quiet", "--checks=clang-analyzer-*,bugprone-*,cert-*", "{file}", "--"]
+      parser: regex
+      regex: '^(.+?):(\d+):(\d+):\s+(warning|error):\s+(.+?)\s+\[([^\]]+)\]$'
+      groups: { file: 1, line: 2, column: 3, severity: 4, message: 5 }
+      severity_map: { warning: medium, error: high }
+      install: { apt: clang-tidy }
+    - name: semgrep
+      detect: semgrep
+      # p/c = Semgrep registry C ruleset (downloaded at scan time → needs network;
+      # for fully offline/deterministic runs, vendor semgrep-rules and point
+      # --config at a local path instead). Avoid --config=auto (requires login).
+      cmd: ["semgrep", "scan", "--sarif", "--quiet", "--metrics=off", "--config=p/c", "{file}"]
+      parser: sarif
+      install: { pip: semgrep }
+    - name: flawfinder
+      detect: flawfinder
+      cmd: ["flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      fallback_cmd: ["{python}", "-m", "flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      parser: flawfinder
+      install: { pip: flawfinder }
 
 # ---------------------------------------------------------------------------
 # Phase 1 (orchestrator.py) – project-specific settings

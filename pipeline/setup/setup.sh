@@ -17,6 +17,10 @@ set -e  # Exit on any error
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIPELINE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Pipeline config that points (via its phase0_config key) at the project YAML
+# whose SAST tools we install. Override with: sudo ./setup/setup.sh --config <file>
+PIPELINE_CONFIG="$PIPELINE_ROOT/config.yaml"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -53,7 +57,18 @@ update_system() {
 # Install Docker
 install_docker() {
     log_info "Installing Docker..."
-    
+
+    # Idempotent guard: if Docker is already installed AND the daemon responds,
+    # do NOT reinstall. The reinstall path below runs `rm -rf /var/lib/docker`,
+    # which wipes every image/container — destructive to re-run on a live host.
+    if command -v docker &> /dev/null && docker info &> /dev/null; then
+        log_info "Docker already installed and running — skipping (re)install"
+        if [ -n "$SUDO_USER" ]; then
+            usermod -aG docker "$SUDO_USER" 2>/dev/null || true
+        fi
+        return
+    fi
+
     # Remove old versions if present
     apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
     
@@ -146,10 +161,12 @@ install_python() {
         python3 \
         python3-pip \
         python3-venv \
-        python3-dev \
-        python3-full
-    
-    # For Ubuntu 24.04+ which uses python3.12
+        python3-dev
+
+    # Optional metapackages absent on older releases — install if available,
+    # never abort the run when they don't exist (python3-full is 22.04+, focal
+    # has no such package; python3.12-venv only on 24.04+).
+    apt-get install -y python3-full 2>/dev/null || true
     apt-get install -y python3.12-venv 2>/dev/null || true
 
     # Install required Python packages (system-wide for root, or use pip with break-system-packages)
@@ -213,54 +230,77 @@ install_build_deps() {
     log_info "Build dependencies installed successfully"
 }
 
-# Install SAST (Static Application Security Testing) tools for Phase 3
+# Install SAST (Static Application Security Testing) tools for Phase 3.
+#
+# The tool list is NOT hardcoded here — it is project-/language-specific and is
+# declared in the active project's Phase 0 YAML (sast: section), resolved from
+# $PIPELINE_CONFIG via master_pipeline.sast_config. This keeps setup agnostic:
+# a C project installs cppcheck/flawfinder, a Java project spotbugs/semgrep, etc.
 install_sast_tools() {
-    log_info "Installing SAST tools for Phase 3 validation..."
-    
-    # Install Cppcheck
-    log_info "Installing Cppcheck..."
-    apt-get install -y cppcheck || {
-        log_warn "Cppcheck not in apt, attempting manual install..."
-        # Install from source if apt fails
-        cd /tmp
-        git clone https://github.com/danmar/cppcheck.git
-        cd cppcheck
-        make MATCHCOMPILER=yes FILESDIR=/usr/share/cppcheck HAVE_RULES=yes -j$(nproc)
-        make install FILESDIR=/usr/share/cppcheck
-        cd /
-        rm -rf /tmp/cppcheck
-    }
-    
-    # Verify Cppcheck installation
-    if command -v cppcheck &> /dev/null; then
-        log_info "Cppcheck installed: $(cppcheck --version)"
-    else
-        log_error "Cppcheck installation failed"
+    log_info "Installing SAST tools for Phase 3 (from project config: $PIPELINE_CONFIG)..."
+
+    local enabled
+    enabled="$(cd "$PIPELINE_ROOT" && python3 -m master_pipeline.sast_config --config "$PIPELINE_CONFIG" --enabled 2>/dev/null)"
+    if [ "$enabled" != "true" ]; then
+        log_warn "SAST disabled in project config (or config unreadable) — skipping SAST tool installation"
+        return
     fi
-    
-    # Install Flawfinder
-    log_info "Installing Flawfinder..."
-    pip3 install flawfinder --break-system-packages 2>/dev/null || \
-        pip3 install flawfinder 2>/dev/null || \
-        apt-get install -y flawfinder 2>/dev/null || {
-            log_warn "Flawfinder installation via pip/apt failed, trying alternative..."
-            # Download and install manually
-            cd /tmp
-            wget https://github.com/david-a-wheeler/flawfinder/archive/refs/heads/master.zip -O flawfinder.zip
-            unzip flawfinder.zip
-            cd flawfinder-master
-            python3 setup.py install 2>/dev/null || pip3 install . --break-system-packages 2>/dev/null
-            cd /
-            rm -rf /tmp/flawfinder*
-        }
-    
-    # Verify Flawfinder installation
-    if command -v flawfinder &> /dev/null; then
-        log_info "Flawfinder installed: $(flawfinder --version 2>&1 | head -1)"
-    else
-        log_error "Flawfinder installation failed"
+
+    # First, report current state — tools already present are left untouched.
+    local any_missing=0 any_tool=0
+    while IFS=$'\t' read -r name status hint; do
+        [ -z "$name" ] && continue
+        any_tool=1
+        if [ "$status" = "OK" ]; then
+            log_info "SAST tool '$name': already installed — skipping"
+        else
+            any_missing=1
+            log_info "SAST tool '$name': missing — will install ($hint)"
+        fi
+    done < <(cd "$PIPELINE_ROOT" && python3 -m master_pipeline.sast_config --config "$PIPELINE_CONFIG" --check 2>/dev/null)
+
+    if [ "$any_tool" -eq 0 ]; then
+        log_warn "No SAST tools declared in project config"
+        return
     fi
-    
+    if [ "$any_missing" -eq 0 ]; then
+        log_info "All configured SAST tools already present — nothing to install"
+        return
+    fi
+
+    # Install ONLY the missing tools (--missing-only filters out present ones).
+    while IFS=$'\t' read -r name method spec; do
+        [ -z "$name" ] && continue
+        log_info "Installing SAST tool '$name' ($method)..."
+        case "$method" in
+            apt)
+                apt-get install -y "$spec" || log_warn "apt install '$spec' failed for $name"
+                ;;
+            pip)
+                pip3 install "$spec" --break-system-packages 2>/dev/null \
+                    || pip3 install "$spec" 2>/dev/null \
+                    || log_warn "pip install '$spec' failed for $name"
+                ;;
+            script)
+                bash -c "$spec" || log_warn "script install failed for $name"
+                ;;
+            *)
+                log_warn "Unknown install method '$method' for $name — install it manually"
+                ;;
+        esac
+    done < <(cd "$PIPELINE_ROOT" && python3 -m master_pipeline.sast_config --config "$PIPELINE_CONFIG" --list-install --missing-only 2>/dev/null)
+
+    # Final verification — every configured tool must now resolve.
+    log_info "Verifying SAST tools..."
+    while IFS=$'\t' read -r name status hint; do
+        [ -z "$name" ] && continue
+        if [ "$status" = "OK" ]; then
+            log_info "SAST tool '$name': installed"
+        else
+            log_error "SAST tool '$name': NOT installed ($hint)"
+        fi
+    done < <(cd "$PIPELINE_ROOT" && python3 -m master_pipeline.sast_config --config "$PIPELINE_CONFIG" --check 2>/dev/null)
+
     log_info "SAST tools installation completed"
 }
 
@@ -316,7 +356,18 @@ update_system() {
 # Install Docker
 install_docker() {
     log_info "Installing Docker..."
-    
+
+    # Idempotent guard: if Docker is already installed AND the daemon responds,
+    # do NOT reinstall. The reinstall path below runs `rm -rf /var/lib/docker`,
+    # which wipes every image/container — destructive to re-run on a live host.
+    if command -v docker &> /dev/null && docker info &> /dev/null; then
+        log_info "Docker already installed and running — skipping (re)install"
+        if [ -n "$SUDO_USER" ]; then
+            usermod -aG docker "$SUDO_USER" 2>/dev/null || true
+        fi
+        return
+    fi
+
     # Remove old versions if present
     apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
     
@@ -409,10 +460,12 @@ install_python() {
         python3 \
         python3-pip \
         python3-venv \
-        python3-dev \
-        python3-full
-    
-    # For Ubuntu 24.04+ which uses python3.12
+        python3-dev
+
+    # Optional metapackages absent on older releases — install if available,
+    # never abort the run when they don't exist (python3-full is 22.04+, focal
+    # has no such package; python3.12-venv only on 24.04+).
+    apt-get install -y python3-full 2>/dev/null || true
     apt-get install -y python3.12-venv 2>/dev/null || true
 
     # Install required Python packages (system-wide for root, or use pip with break-system-packages)
@@ -476,54 +529,77 @@ install_build_deps() {
     log_info "Build dependencies installed successfully"
 }
 
-# Install SAST (Static Application Security Testing) tools for Phase 3
+# Install SAST (Static Application Security Testing) tools for Phase 3.
+#
+# The tool list is NOT hardcoded here — it is project-/language-specific and is
+# declared in the active project's Phase 0 YAML (sast: section), resolved from
+# $PIPELINE_CONFIG via master_pipeline.sast_config. This keeps setup agnostic:
+# a C project installs cppcheck/flawfinder, a Java project spotbugs/semgrep, etc.
 install_sast_tools() {
-    log_info "Installing SAST tools for Phase 3 validation..."
-    
-    # Install Cppcheck
-    log_info "Installing Cppcheck..."
-    apt-get install -y cppcheck || {
-        log_warn "Cppcheck not in apt, attempting manual install..."
-        # Install from source if apt fails
-        cd /tmp
-        git clone https://github.com/danmar/cppcheck.git
-        cd cppcheck
-        make MATCHCOMPILER=yes FILESDIR=/usr/share/cppcheck HAVE_RULES=yes -j$(nproc)
-        make install FILESDIR=/usr/share/cppcheck
-        cd /
-        rm -rf /tmp/cppcheck
-    }
-    
-    # Verify Cppcheck installation
-    if command -v cppcheck &> /dev/null; then
-        log_info "Cppcheck installed: $(cppcheck --version)"
-    else
-        log_error "Cppcheck installation failed"
+    log_info "Installing SAST tools for Phase 3 (from project config: $PIPELINE_CONFIG)..."
+
+    local enabled
+    enabled="$(cd "$PIPELINE_ROOT" && python3 -m master_pipeline.sast_config --config "$PIPELINE_CONFIG" --enabled 2>/dev/null)"
+    if [ "$enabled" != "true" ]; then
+        log_warn "SAST disabled in project config (or config unreadable) — skipping SAST tool installation"
+        return
     fi
-    
-    # Install Flawfinder
-    log_info "Installing Flawfinder..."
-    pip3 install flawfinder --break-system-packages 2>/dev/null || \
-        pip3 install flawfinder 2>/dev/null || \
-        apt-get install -y flawfinder 2>/dev/null || {
-            log_warn "Flawfinder installation via pip/apt failed, trying alternative..."
-            # Download and install manually
-            cd /tmp
-            wget https://github.com/david-a-wheeler/flawfinder/archive/refs/heads/master.zip -O flawfinder.zip
-            unzip flawfinder.zip
-            cd flawfinder-master
-            python3 setup.py install 2>/dev/null || pip3 install . --break-system-packages 2>/dev/null
-            cd /
-            rm -rf /tmp/flawfinder*
-        }
-    
-    # Verify Flawfinder installation
-    if command -v flawfinder &> /dev/null; then
-        log_info "Flawfinder installed: $(flawfinder --version 2>&1 | head -1)"
-    else
-        log_error "Flawfinder installation failed"
+
+    # First, report current state — tools already present are left untouched.
+    local any_missing=0 any_tool=0
+    while IFS=$'\t' read -r name status hint; do
+        [ -z "$name" ] && continue
+        any_tool=1
+        if [ "$status" = "OK" ]; then
+            log_info "SAST tool '$name': already installed — skipping"
+        else
+            any_missing=1
+            log_info "SAST tool '$name': missing — will install ($hint)"
+        fi
+    done < <(cd "$PIPELINE_ROOT" && python3 -m master_pipeline.sast_config --config "$PIPELINE_CONFIG" --check 2>/dev/null)
+
+    if [ "$any_tool" -eq 0 ]; then
+        log_warn "No SAST tools declared in project config"
+        return
     fi
-    
+    if [ "$any_missing" -eq 0 ]; then
+        log_info "All configured SAST tools already present — nothing to install"
+        return
+    fi
+
+    # Install ONLY the missing tools (--missing-only filters out present ones).
+    while IFS=$'\t' read -r name method spec; do
+        [ -z "$name" ] && continue
+        log_info "Installing SAST tool '$name' ($method)..."
+        case "$method" in
+            apt)
+                apt-get install -y "$spec" || log_warn "apt install '$spec' failed for $name"
+                ;;
+            pip)
+                pip3 install "$spec" --break-system-packages 2>/dev/null \
+                    || pip3 install "$spec" 2>/dev/null \
+                    || log_warn "pip install '$spec' failed for $name"
+                ;;
+            script)
+                bash -c "$spec" || log_warn "script install failed for $name"
+                ;;
+            *)
+                log_warn "Unknown install method '$method' for $name — install it manually"
+                ;;
+        esac
+    done < <(cd "$PIPELINE_ROOT" && python3 -m master_pipeline.sast_config --config "$PIPELINE_CONFIG" --list-install --missing-only 2>/dev/null)
+
+    # Final verification — every configured tool must now resolve.
+    log_info "Verifying SAST tools..."
+    while IFS=$'\t' read -r name status hint; do
+        [ -z "$name" ] && continue
+        if [ "$status" = "OK" ]; then
+            log_info "SAST tool '$name': installed"
+        else
+            log_error "SAST tool '$name': NOT installed ($hint)"
+        fi
+    done < <(cd "$PIPELINE_ROOT" && python3 -m master_pipeline.sast_config --config "$PIPELINE_CONFIG" --check 2>/dev/null)
+
     log_info "SAST tools installation completed"
 }
 
@@ -614,20 +690,20 @@ verify_installations() {
         echo -e "GCC:         ${RED}✗ Not installed${NC}"
     fi
     
-    # Cppcheck (Phase 3)
-    if command -v cppcheck &> /dev/null; then
-        echo -e "Cppcheck:    ${GREEN}✓${NC} $(cppcheck --version)"
+    # SAST tools (Phase 3) — driven by the project YAML's sast: section
+    if [ "$(cd "$PIPELINE_ROOT" && python3 -m master_pipeline.sast_config --config "$PIPELINE_CONFIG" --enabled 2>/dev/null)" = "true" ]; then
+        while IFS=$'\t' read -r name status hint; do
+            [ -z "$name" ] && continue
+            if [ "$status" = "OK" ]; then
+                echo -e "SAST $name: ${GREEN}✓${NC} installed"
+            else
+                echo -e "SAST $name: ${RED}✗ Not installed${NC} ($hint)"
+            fi
+        done < <(cd "$PIPELINE_ROOT" && python3 -m master_pipeline.sast_config --config "$PIPELINE_CONFIG" --check 2>/dev/null)
     else
-        echo -e "Cppcheck:    ${RED}✗ Not installed${NC}"
+        echo -e "SAST:        ${YELLOW}disabled in project config${NC}"
     fi
-    
-    # Flawfinder (Phase 3)
-    if command -v flawfinder &> /dev/null; then
-        echo -e "Flawfinder:  ${GREEN}✓${NC} $(flawfinder --version 2>&1 | head -1)"
-    else
-        echo -e "Flawfinder:  ${RED}✗ Not installed${NC}"
-    fi
-    
+
     echo "============================================="
     echo ""
 }
@@ -672,6 +748,16 @@ setup_project_structure() {
 
 # Main execution
 main() {
+    # Parse args — only --config so far: selects the pipeline config whose
+    # phase0_config points at the project YAML whose SAST tools we install.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --config) PIPELINE_CONFIG="$2"; shift 2 ;;
+            --config=*) PIPELINE_CONFIG="${1#*=}"; shift ;;
+            *) shift ;;
+        esac
+    done
+
     echo ""
     echo "============================================="
     echo "AI-SSD Complete Pipeline Setup"

@@ -288,6 +288,44 @@ output:
     - "manual_verified"
 
 # ---------------------------------------------------------------------------
+# Phase 3 (patch_validator.py) – SAST (static analysis) tooling
+# ---------------------------------------------------------------------------
+# JAVA project — so it uses Java analysers, NOT the C tools (cppcheck/flawfinder).
+# This is exactly why the tool list is per-project: the pipeline code is
+# language-agnostic; the recipe lives here.
+#
+# SAST runs host-side on a single patched .java SOURCE file with NO build. That
+# rules out the usual Java security scanner SpotBugs + find-sec-bugs, which
+# analyse compiled .class BYTECODE, not source — they need a build we don't do.
+# CodeQL/Infer are excluded for the same reason (they need a build database).
+# Source-level analysers that DO fit:
+#   - semgrep : modern multi-language AST scanner with Java security rules, SARIF
+#   - pmd     : Java source analyser (v7), SARIF output; needs a JVM (installed
+#               by the script recipe below)
+#   parser: sarif | regex | cppcheck-xml | flawfinder
+#   install: apt | pip | script: <shell command>     {file} -> patched source file
+sast:
+  enabled: true
+  fail_on: [critical, high]      # severity classes that fail a patch (medium/low reported only)
+  tool_timeout: 300              # per-tool subprocess timeout (seconds); JVM/rule fetch is slower
+  tools:
+    - name: semgrep
+      detect: semgrep
+      # p/java = Semgrep registry Java ruleset (downloaded at scan time → needs
+      # network; vendor semgrep-rules locally for offline runs). Not --config=auto.
+      cmd: ["semgrep", "scan", "--sarif", "--quiet", "--metrics=off", "--config=p/java", "{file}"]
+      parser: sarif
+      install: { pip: semgrep }
+    - name: pmd
+      detect: pmd
+      cmd: ["pmd", "check", "-d", "{file}", "-f", "sarif", "-R", "rulesets/java/quickstart.xml", "--no-progress"]
+      parser: sarif
+      # PMD is a JVM app shipped as a release zip — install a headless JRE and
+      # unpack a pinned PMD 7 build, exposing `pmd` on PATH.
+      install:
+        script: "apt-get install -y default-jre-headless unzip wget && wget -q https://github.com/pmd/pmd/releases/download/pmd_releases%2F7.13.0/pmd-dist-7.13.0-bin.zip -O /tmp/pmd.zip && unzip -oq /tmp/pmd.zip -d /opt && ln -sf /opt/pmd-bin-7.13.0/bin/pmd /usr/local/bin/pmd && rm -f /tmp/pmd.zip"
+
+# ---------------------------------------------------------------------------
 # Phase 1 (orchestrator.py) – project-specific settings
 # ---------------------------------------------------------------------------
 phase1:

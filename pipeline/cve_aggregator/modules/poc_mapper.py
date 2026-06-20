@@ -113,17 +113,35 @@ class PoCMapper(PipelineModule):
                 # different one (EDB-15274) — counting those as PoCs inflates the
                 # funnel. Dropped entries are logged for traceability.
                 kept: List[Dict] = []
+                leads: List[Dict] = []
                 for e in exploits:
                     runnable, why = classify_poc_runnability(
                         e.get("source_code_content"), e.get("file_path", ""), cve_id)
                     if runnable:
                         kept.append(e)
-                    else:
-                        dropped_nonrunnable += 1
-                        self.logger.info(
-                            "  %s: dropping non-runnable ExploitDB entry %s (%s)",
-                            cve_id, e.get("exploit_id") or e.get("file_path") or "?", why)
+                        continue
+                    dropped_nonrunnable += 1
+                    self.logger.info(
+                        "  %s: dropping non-runnable ExploitDB entry %s (%s)",
+                        cve_id, e.get("exploit_id") or e.get("file_path") or "?", why)
+                    # A *verified* ExploitDB entry that isn't runnable (a prose
+                    # write-up linking to the real PoC, an empty/HTML page, …) is
+                    # still proof an exploit exists. Retain it as a "manual PoC
+                    # lead" so OutputGenerator can route the CVE to manual
+                    # supervision instead of discarding it — but only when the
+                    # entry is actually about THIS CVE (cve_id_mismatch entries are
+                    # about a different one, so they are no lead for this CVE).
+                    if e.get("verified") and not why.startswith("cve_id_mismatch"):
+                        leads.append({
+                            "exploit_id": e.get("exploit_id", ""),
+                            "file_path": e.get("file_path", ""),
+                            "exploitdb_url": e.get("exploitdb_url", ""),
+                            "source_url": e.get("source_url", ""),
+                            "description": e.get("description", ""),
+                            "drop_reason": why,
+                        })
                 exploits = kept
+                cve["manual_poc_leads"] = leads
 
             cve["exploits"] = exploits
             cve["has_poc"] = len(exploits) > 0
@@ -227,6 +245,10 @@ class PoCMapper(PipelineModule):
             "verified": row.get("verified", "0") == "1",
             "match_type": "csv_metadata",
             "exploitdb_url": f"https://www.exploit-db.com/exploits/{eid}" if eid else "",
+            # External link the ExploitDB write-up points at (the real PoC for
+            # write-up-only entries, e.g. a GitHub repo). Surfaced to the human
+            # when such an entry is routed to manual supervision.
+            "source_url": (row.get("source_url", "") or "").strip(),
             "companion_archive": companion_archive,
         }
 

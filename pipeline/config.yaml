@@ -154,21 +154,11 @@ validation:
   poc_timeout: 300            # PoC execution timeout (seconds)
 
   # SAST Configuration
-  sast:
-    enabled: true
-
-    cppcheck:
-      enabled: true
-      enable_checks: "all"
-      suppress: []
-      max_errors: 0
-      max_warnings: 10
-
-    flawfinder:
-      enabled: true
-      min_level: 1
-      max_high_severity: 0
-      max_total_hits: 50
+  # The SAST tool list, severity gate (fail_on) and per-tool timeout are
+  # project-/language-specific, so they live in the active project's Phase 0
+  # YAML under its `sast:` section (e.g. cve_aggregator/glibc_config.yaml),
+  # resolved via the `phase0_config` pointer above. Nothing SAST-related is
+  # configured here — see master_pipeline/sast_config.py.
 
   # Baseline comparison
   baseline:

@@ -1240,10 +1240,10 @@ RECOMMENDED ACTIONS:
         """Validate prerequisites before running the pipeline.
 
         Builds a dependency report scoped to the phases actually being run and
-        prints it up front. REQUIRED items that are missing abort the run;
+        prints it up front. REQUIRED items that are missing abort the run
+        (including any SAST tool the project YAML declares for Phase 3);
         OPTIONAL items that are missing are *reported* (not silently skipped)
-        so the user is told NOW instead of discovering a skipped step mid-run —
-        e.g. a Phase-3 SAST tool that is not installed on the host.
+        so the user is told NOW instead of discovering a skipped step mid-run.
 
         All checks are host-level and project-agnostic (tools, services, Python
         modules); nothing project-specific lives here.
@@ -1315,10 +1315,13 @@ RECOMMENDED ACTIONS:
             optional.append("[phase 0] gcc not found — SyntaxValidator cannot "
                             "syntax-check C PoCs (apt install gcc)")
         if 3 in phases:
+            # Configured SAST tools are REQUIRED: the project YAML explicitly
+            # asked for them, so a missing tool aborts rather than silently
+            # running Phase 3 with reduced static-analysis coverage.
             for name, present, hint in self._sast_tool_status():
                 if not present:
-                    optional.append(f"[phase 3] {name} not found — SAST '{name}' "
-                                    f"will be skipped ({hint})")
+                    required.append(f"[phase 3] SAST tool '{name}' not installed — "
+                                    f"{hint} (declared in the project YAML 'sast:' section)")
         if 4 in phases:
             if not _module("matplotlib"):
                 optional.append("[phase 4] matplotlib not found — report charts "
@@ -1331,38 +1334,25 @@ RECOMMENDED ACTIONS:
         return not required
 
     def _sast_tool_status(self):
-        """Probe each Phase-3 SAST tool exactly as ``patch_validator`` does —
-        primary binary on PATH, else a ``python -m <module>`` fallback — and
-        yield ``(tool_name, present, remediation_hint)``.
+        """Probe each configured Phase-3 SAST tool (from the active project's
+        Phase 0 YAML ``sast:`` section) and yield ``(tool_name, present,
+        install_hint)``. Yields nothing when SAST is disabled for the project.
 
-        Derived from ``patch_validator.SAST_TOOLS`` so the preflight and the
-        real Phase-3 run never drift; falls back to a minimal mirror if that
-        module can't be imported.
+        Single source of truth: ``master_pipeline.sast_config`` — the same
+        loader/detection the real Phase-3 run uses, so preflight never drifts.
         """
-        import shutil
-        import importlib.util
-
-        hints = {"cppcheck": "apt install cppcheck",
-                 "flawfinder": "pip install flawfinder"}
         try:
-            from patch_validator import SAST_TOOLS as tools
+            from master_pipeline.sast_config import load_sast_config, detect_tool
         except Exception:
-            tools = {"cppcheck": {"cmd": ["cppcheck"], "fallback_cmd": None},
-                     "flawfinder": {"cmd": ["flawfinder"],
-                                    "fallback_cmd": ["python3", "-m", "flawfinder"]}}
-        for name, cfg in tools.items():
-            present = bool(shutil.which(cfg["cmd"][0]))
-            if not present:
-                fb = cfg.get("fallback_cmd")
-                if fb and len(fb) >= 3 and fb[1] == "-m":
-                    # e.g. [python, "-m", "flawfinder", ...] — check the module
-                    try:
-                        present = importlib.util.find_spec(fb[2]) is not None
-                    except Exception:
-                        present = False
-                elif fb:
-                    present = bool(shutil.which(fb[0]))
-            yield name, present, hints.get(name, f"install {name}")
+            return
+        phase0 = Path(self.config.phase0_config)
+        if not phase0.is_absolute():
+            phase0 = BASE_DIR / phase0
+        cfg = load_sast_config(phase0_config_path=phase0)
+        if not cfg.enabled:
+            return
+        for tool in cfg.tools:
+            yield tool.name, detect_tool(tool), tool.install_hint()
 
     def _print_prerequisite_report(self, phases, required: List[str],
                                    optional: List[str]) -> None:

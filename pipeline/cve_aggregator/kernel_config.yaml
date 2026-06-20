@@ -304,6 +304,46 @@ output:
     - "manual_verified"
 
 # ---------------------------------------------------------------------------
+# Phase 3 (patch_validator.py) – SAST (static analysis) tooling
+# ---------------------------------------------------------------------------
+# C project (same stack as glibc). SAST runs host-side on a single patched
+# source file with NO build, so only source-level analysers fit; build-coupled
+# tools (CodeQL, Infer) are excluded. Consumed by patch_validator.py, the
+# startup preflight, and setup/verify_setup.sh via master_pipeline.sast_config.
+#   parser: cppcheck-xml | flawfinder | sarif | regex
+#   install: apt | pip | script: <shell command>
+#   {file} -> patched source file   {python} -> running interpreter
+sast:
+  enabled: true
+  fail_on: [critical, high]      # severity classes that fail a patch (medium/low reported only)
+  tool_timeout: 180              # per-tool subprocess timeout (seconds); semgrep fetches rules
+  tools:
+    - name: cppcheck
+      detect: cppcheck
+      cmd: ["cppcheck", "--enable=all", "--xml", "--xml-version=2", "{file}"]
+      parser: cppcheck-xml
+      install: { apt: cppcheck }
+    - name: clang-tidy
+      detect: clang-tidy
+      cmd: ["clang-tidy", "--quiet", "--checks=clang-analyzer-*,bugprone-*,cert-*", "{file}", "--"]
+      parser: regex
+      regex: '^(.+?):(\d+):(\d+):\s+(warning|error):\s+(.+?)\s+\[([^\]]+)\]$'
+      groups: { file: 1, line: 2, column: 3, severity: 4, message: 5 }
+      severity_map: { warning: medium, error: high }
+      install: { apt: clang-tidy }
+    - name: semgrep
+      detect: semgrep
+      cmd: ["semgrep", "scan", "--sarif", "--quiet", "--metrics=off", "--config=p/c", "{file}"]
+      parser: sarif
+      install: { pip: semgrep }
+    - name: flawfinder
+      detect: flawfinder
+      cmd: ["flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      fallback_cmd: ["{python}", "-m", "flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      parser: flawfinder
+      install: { pip: flawfinder }
+
+# ---------------------------------------------------------------------------
 # Phase 1 (orchestrator.py) – project-specific settings
 # ---------------------------------------------------------------------------
 phase1:

@@ -32,6 +32,10 @@ class ExploitInfo:
     platform: str = ""
     exploit_type: str = ""
     exploitdb_url: str = ""
+    # External link from the ExploitDB CSV ``source_url`` column. For write-up
+    # entries this points at the real PoC (e.g. a GitHub repo); surfaced to the
+    # human when the entry is routed to manual supervision.
+    source_url: str = ""
     match_type: str = ""         # How this exploit was matched (csv_metadata, content_search, …)
     verified: bool = False
     # Companion archive name from the ExploitDB CSV ``aliases`` column (e.g.
@@ -130,6 +134,13 @@ class CVEEntry:
     has_vulnerable_code: bool = False
     has_vulnerable_functions: bool = False
     poc_count: int = 0
+    # ExploitDB entries that were mapped to this CVE (and verified) but dropped by
+    # the runnability filter — a prose write-up, empty/HTML page, etc. They are NOT
+    # runnable PoCs, but they prove a real exploit exists, so when the CVE otherwise
+    # has everything (commit + vulnerable functions) it is routed to manual
+    # supervision instead of being silently discarded. Each item carries the EDB id
+    # and URLs a human needs to fetch the real PoC. See OutputGenerator.
+    manual_poc_leads: List[Dict[str, Any]] = dc.field(default_factory=list)
     first_seen: str = ""
     last_checked: str = ""
 
@@ -145,6 +156,7 @@ class CVEEntry:
             "has_vulnerable_code": self.has_vulnerable_code,
             "has_vulnerable_functions": self.has_vulnerable_functions,
             "poc_count": self.poc_count,
+            "manual_poc_leads": self.manual_poc_leads,
             "first_seen": self.first_seen,
             "last_checked": self.last_checked,
         }
@@ -156,7 +168,7 @@ class CVEEntry:
         entry.project_state = ProjectState.from_dict(data.get("project_state", {}))
         entry.exploits = [ExploitInfo.from_dict(e) for e in data.get("exploits", [])]
         for field in ("has_poc", "has_commits", "has_vulnerable_code",
-                       "has_vulnerable_functions", "poc_count",
+                       "has_vulnerable_functions", "poc_count", "manual_poc_leads",
                        "first_seen", "last_checked"):
             if field in data:
                 setattr(entry, field, data[field])

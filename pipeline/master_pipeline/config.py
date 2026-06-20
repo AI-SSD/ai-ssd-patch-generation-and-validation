@@ -131,6 +131,9 @@ class PipelineConfig:
     phases: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4])
     verbose: bool = False
     cleanup: bool = False
+    # When True, Phase 1 re-measures the baseline even if an identical-image /
+    # identical-policy baseline is already recorded (disables memoization).
+    force_baseline: bool = False
     skip_sast: bool = False
     dry_run: bool = False
     build_timeout: int = int(_cfg.get("build_timeout", 3600))

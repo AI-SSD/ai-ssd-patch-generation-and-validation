@@ -110,7 +110,15 @@ Examples:
         action='store_true',
         help='Clean up Docker images and containers after execution'
     )
-    
+
+    parser.add_argument(
+        '--force-baseline',
+        action='store_true',
+        help='Re-measure the Phase 1 baseline even when an identical-image, '
+             'identical-policy baseline is already recorded (disables baseline '
+             'memoization)'
+    )
+
     parser.add_argument(
         '--dry-run',
         action='store_true',
@@ -179,6 +187,7 @@ def main():
         phases=sorted(args.phases),
         verbose=args.verbose,
         cleanup=args.cleanup,
+        force_baseline=args.force_baseline,
         skip_sast=args.skip_sast,
         dry_run=args.dry_run,
         build_timeout=args.build_timeout,
@@ -201,6 +210,7 @@ def main():
     logger.info(f"  Run Timeout: {config.run_timeout}s")
     logger.info(f"  Skip SAST: {config.skip_sast}")
     logger.info(f"  Cleanup: {config.cleanup}")
+    logger.info(f"  Force baseline (no memoization): {config.force_baseline}")
     logger.info(f"  Verbose: {config.verbose}")
     logger.info(f"  Feedback Loop: {'Enabled' if config.enable_feedback_loop else 'Disabled'}")
     if config.enable_feedback_loop:
