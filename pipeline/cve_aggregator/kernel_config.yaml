@@ -304,6 +304,26 @@ output:
     - "manual_verified"
 
 # ---------------------------------------------------------------------------
+# Phase 2 (patch_generator.py) – LLM patch generation (project/language-specific)
+# ---------------------------------------------------------------------------
+# The Linux kernel is C. `language: c` keeps the host-side gcc syntax check on;
+# the generic `fatal error: *.h` regex already treats missing kernel-internal
+# headers as an environment limitation (Phase 3's in-container build is the real
+# arbiter), so no explicit internal_headers list is needed. The prompts are the
+# role preamble only; the pipeline appends the fixed SEARCH/REPLACE edit format.
+phase2:
+  language: "c"
+  system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for the Linux kernel. Your task is to fix a security vulnerability by making
+    the SMALLEST POSSIBLE EDIT to the vulnerable function — never by rewriting it.
+  feedback_system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for the Linux kernel. Your previous patch attempt FAILED validation. Analyze
+    the failure and produce an improved fix as MINIMAL edits — never rewrite the
+    whole function.
+
+# ---------------------------------------------------------------------------
 # Phase 3 (patch_validator.py) – SAST (static analysis) tooling
 # ---------------------------------------------------------------------------
 # C project (same stack as glibc). SAST runs host-side on a single patched
@@ -328,7 +348,7 @@ sast:
       cmd: ["clang-tidy", "--quiet", "--checks=clang-analyzer-*,bugprone-*,cert-*", "{file}", "--"]
       parser: regex
       regex: '^(.+?):(\d+):(\d+):\s+(warning|error):\s+(.+?)\s+\[([^\]]+)\]$'
-      groups: { file: 1, line: 2, column: 3, severity: 4, message: 5 }
+      groups: { file: 1, line: 2, column: 3, severity: 4, message: 5, rule: 6 }
       severity_map: { warning: medium, error: high }
       install: { apt: clang-tidy }
     - name: semgrep

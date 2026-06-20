@@ -76,6 +76,36 @@ def cfg_section(section: str, base_dir: Optional[Path] = None) -> Dict[str, Any]
     return val if isinstance(val, dict) else {}
 
 
+def resolve_phase0_config_path(base_dir: Optional[Path] = None) -> Optional[Path]:
+    """Follow ``config.yaml``'s ``phase0_config`` pointer to the active project YAML.
+
+    The pointer is relative to the pipeline root (where the ``cve_aggregator/*_config.yaml``
+    files live), not ``base_dir`` (which may be a per-project working dir).
+    """
+    cfg = get_config(base_dir)
+    rel = str(cfg.get("phase0_config", "cve_aggregator/glibc_config.yaml"))
+    p = Path(rel)
+    if not p.is_absolute():
+        p = BASE_DIR / rel
+    return p if p.exists() else None
+
+
+def project_section(section: str, base_dir: Optional[Path] = None,
+                    phase0_config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Return a section (e.g. ``phase2``, ``phase1``) from the active PROJECT YAML.
+
+    Unlike :func:`cfg_section` (which reads ``config.yaml``), this reads the
+    per-project Phase 0 YAML — the home of project-specific sections. An explicit
+    ``phase0_config_path`` wins (e.g. a phase passed ``--phase0-config``);
+    otherwise the ``config.yaml`` pointer is followed.
+    """
+    path = phase0_config_path or resolve_phase0_config_path(base_dir)
+    if not path or not Path(path).exists():
+        return {}
+    val = _load_yaml(Path(path)).get(section, {})
+    return val if isinstance(val, dict) else {}
+
+
 # ---------------------------------------------------------------------------
 # Derived constants – kept as module-level variables for backwards
 # compatibility.  Values are populated from config.yaml at import time

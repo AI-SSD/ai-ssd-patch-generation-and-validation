@@ -176,6 +176,14 @@ class PhaseExecutor:
         
         elif phase == 2:  # Patch Generator
             cmd.extend(['--base-dir', str(self.config.base_dir)])
+            # Pass the active project Phase 0 YAML so Phase 2 reads the right
+            # phase2: section (prompts/language) instead of the config.yaml default.
+            phase0_config_path = (
+                Path(self.config.phase0_config)
+                if Path(self.config.phase0_config).is_absolute()
+                else self._pipeline_root / self.config.phase0_config
+            )
+            cmd.extend(['--phase0-config', str(phase0_config_path)])
             phase0_csv = self.config.resolve_phase0_outputs().get("csv_path")
             if phase0_csv:
                 cmd.extend(['--csv', str(phase0_csv)])

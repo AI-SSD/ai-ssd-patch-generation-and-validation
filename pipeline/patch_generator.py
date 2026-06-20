@@ -34,7 +34,9 @@ BASE_DIR = Path(__file__).parent.resolve()
 
 # Import the shared config loader
 sys.path.insert(0, str(BASE_DIR))
-from master_pipeline.config import load_pipeline_config, cfg_section  # noqa: E402
+from master_pipeline.config import (  # noqa: E402
+    load_pipeline_config, cfg_section, project_section, _load_yaml,
+)
 
 # Structural-analysis view: blanks comment interiors and non-first
 # preprocessor branches while preserving offsets, so brace matching is not
@@ -172,17 +174,57 @@ EDIT RULES:
 6. Output ONLY the SEARCH/REPLACE block(s) — no prose, no explanations, no markdown code fences."""
 
 
-SYSTEM_PROMPT = """You are an expert C security engineer specializing in vulnerability patching for the GNU C Library (glibc). Your task is to fix a security vulnerability by making the SMALLEST POSSIBLE EDIT to the vulnerable function — never by rewriting it.
+# ---------------------------------------------------------------------------
+# Phase 2 prompts + language are PROJECT-SUPPLIED (project YAML phase2: section);
+# the code carries only GENERIC defaults so nothing here is glibc/C-specific.
+# The role preamble comes from config; the SEARCH/REPLACE format (the parser
+# contract) and the feedback tail stay in code so every project emits the edit
+# format Phase 2's extractor expects. glibc keeps its exact wording via its YAML.
+# ---------------------------------------------------------------------------
+_DEFAULT_SYSTEM_PREAMBLE = (
+    "You are an expert security engineer specializing in fixing software "
+    "vulnerabilities. Your task is to fix a security vulnerability by making the "
+    "SMALLEST POSSIBLE EDIT to the vulnerable function — never by rewriting it."
+)
+_DEFAULT_FEEDBACK_PREAMBLE = (
+    "You are an expert security engineer specializing in fixing software "
+    "vulnerabilities. Your previous patch attempt FAILED validation. Analyze the "
+    "failure and produce an improved fix as MINIMAL edits — never rewrite the "
+    "whole function."
+)
+_FEEDBACK_TAIL = (
+    "\n\nCarefully read the FAILURE ANALYSIS: if the PoC still works your fix was "
+    "insufficient; if the build failed your edit introduced a compile error (often "
+    "by quoting SEARCH text that did not match, or by editing lines you should have "
+    "left alone)."
+)
 
-""" + _SEARCH_REPLACE_FORMAT
+# Populated by _apply_phase2() at import (and re-applied in main() once the
+# active --phase0-config is known). Module globals so functions read the current
+# value at call time.
+SYSTEM_PROMPT = ""
+FEEDBACK_SYSTEM_PROMPT = ""
+PATCH_LANGUAGE = "c"
+# Project-internal headers that don't exist host-side (only the C/gcc validation
+# path consults this; the generic missing-header regex is the primary arbiter).
+INTERNAL_HEADERS: set = set()
 
 
-# System prompt for retry/feedback loop with failure context
-FEEDBACK_SYSTEM_PROMPT = """You are an expert C security engineer specializing in vulnerability patching for the GNU C Library (glibc). Your previous patch attempt FAILED validation. Analyze the failure and produce an improved fix as MINIMAL edits — never rewrite the whole function.
+def _apply_phase2(cfg2: Dict[str, Any]) -> None:
+    """Assemble the prompts/language/headers from a project ``phase2:`` dict."""
+    global SYSTEM_PROMPT, FEEDBACK_SYSTEM_PROMPT, PATCH_LANGUAGE, INTERNAL_HEADERS
+    cfg2 = cfg2 or {}
+    PATCH_LANGUAGE = str(cfg2.get("language", "c")).lower()
+    sys_pre = cfg2.get("system_prompt") or _DEFAULT_SYSTEM_PREAMBLE
+    fb_pre = cfg2.get("feedback_system_prompt") or _DEFAULT_FEEDBACK_PREAMBLE
+    SYSTEM_PROMPT = sys_pre + "\n\n" + _SEARCH_REPLACE_FORMAT
+    FEEDBACK_SYSTEM_PROMPT = fb_pre + "\n\n" + _SEARCH_REPLACE_FORMAT + _FEEDBACK_TAIL
+    INTERNAL_HEADERS = set(cfg2.get("internal_headers") or [])
 
-""" + _SEARCH_REPLACE_FORMAT + """
 
-Carefully read the FAILURE ANALYSIS: if the PoC still works your fix was insufficient; if the build failed your edit introduced a compile error (often by quoting SEARCH text that did not match, or by editing lines you should have left alone)."""
+# Import-time default: read phase2 from config.yaml's active phase0_config pointer.
+# main() re-applies this once an explicit --phase0-config is parsed.
+_apply_phase2(project_section("phase2", BASE_DIR))
 
 
 def _find_poc_source(cve_id: str, max_len: int = 3000) -> str:
@@ -416,36 +458,27 @@ def _build_failure_analysis(failure_context: Dict[str, Any]) -> str:
     elif failure_context.get("poc_blocked") is True:
         lines.append("\n[DYNAMIC CHECK PASSED - PoC Blocked]")
     
-    # SAST (Static Check) Results
-    sast_results = failure_context.get("sast_results", [])
+    # SAST (Static Check) Results — only patch-INTRODUCED ("new") findings are
+    # fed back. Pre-existing issues from the original code are out of scope for
+    # this patch and must NOT be sent to the LLM (they are unrelated to it).
     sast_passed = failure_context.get("sast_passed", True)
-    
-    if not sast_passed and sast_results:
-        lines.append("\n[STATIC CHECK FAILED - SAST Found Issues]")
-        lines.append("Your patch INTRODUCED new security vulnerabilities:")
-        
-        for sast in sast_results:
-            tool = sast.get("tool", "Unknown")
-            critical = sast.get("critical_count", 0)
-            high = sast.get("high_count", 0)
-            medium = sast.get("medium_count", 0)
-            
-            if critical > 0 or high > 0:
-                lines.append(f"\n  {tool}:")
-                lines.append(f"    Critical: {critical}, High: {high}, Medium: {medium}")
-                
-                # Include findings details if available
-                findings = sast.get("findings", [])
-                for finding in findings[:5]:  # Limit to 5 findings per tool
-                    severity = finding.get("severity", "unknown")
-                    message = finding.get("message", "")
-                    line_num = finding.get("line")
-                    if line_num:
-                        lines.append(f"    Line {line_num} [{severity}]: {message[:100]}")
-                    else:
-                        lines.append(f"    [{severity}]: {message[:100]}")
+    sast_new = failure_context.get("sast_new", [])
+
+    if not sast_passed and sast_new:
+        lines.append("\n[STATIC CHECK FAILED - Patch Introduced NEW Vulnerabilities]")
+        lines.append("Your patch added the following NEW issues that were NOT in the original code.")
+        lines.append("Fix ONLY these; do not modify code for any pre-existing issue:")
+        for finding in sast_new[:10]:  # cap prompt size
+            tool = finding.get("tool", "?")
+            severity = finding.get("severity", "?")
+            message = finding.get("message", "")
+            line_num = finding.get("line")
+            cwe = finding.get("cwe_id")
+            loc = f"line {line_num} " if line_num else ""
+            cwe_s = f" ({cwe})" if cwe else ""
+            lines.append(f"  [{tool}/{severity}]{cwe_s} {loc}: {message[:140]}")
     elif sast_passed:
-        lines.append("\n[STATIC CHECK PASSED - No New Vulnerabilities]")
+        lines.append("\n[STATIC CHECK PASSED - No New Vulnerabilities Introduced]")
     
     # Build error (if applicable)
     if not failure_context.get("build_success", True):
@@ -805,7 +838,7 @@ def _call_openai_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[
     return None, metadata
 
 
-def call_llm_api(model: str, user_prompt: str, system_prompt: str = SYSTEM_PROMPT,
+def call_llm_api(model: str, user_prompt: str, system_prompt: Optional[str] = None,
                  model_override: Optional[str] = None) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Call the configured LLM backend (Ollama or OpenAI) with retry logic.
@@ -829,6 +862,10 @@ def call_llm_api(model: str, user_prompt: str, system_prompt: str = SYSTEM_PROMP
     Returns:
         Tuple of (response_content, metadata_dict)
     """
+    # Resolve the default at CALL time so a project-specific prompt applied after
+    # import (main() re-applies phase2 once --phase0-config is known) is honored.
+    if system_prompt is None:
+        system_prompt = SYSTEM_PROMPT
     if LLM_PROVIDER == "openai":
         return _call_openai_api(model_override or OPENAI_MODEL, user_prompt, system_prompt)
     return _call_ollama_api(model_override or model, user_prompt, system_prompt)
@@ -1370,29 +1407,18 @@ def _extract_function_text(file_content: str, function_name: str) -> str:
 # Syntax Validation
 # =============================================================================
 
-# Headers that are internal to glibc and won't exist on standard systems
-GLIBC_INTERNAL_HEADERS = {
-    'kernel-features.h', 'xlocale.h', 'bits/libc-lock.h', 'kernel_stat.h',
-    'libc-symbols.h', 'shlib-compat.h', 'bp-sym.h', 'bp-asm.h',
-    'sysdep.h', 'tls.h', 'lowlevellock.h', 'ldsodefs.h', 'dl-hash.h',
-    'math_private.h', 'math_ldbl_opt.h', 'ieee754.h', 'fenv_private.h',
-    'locale/localeinfo.h', 'localeinfo.h', 'setlocale.h', 'ctype/ctype.h',
-    'gconv_int.h', 'iconvconfig.h', 'elf/ldsodefs.h', 'dl-machine.h',
-    'nss/nss.h', 'nss.h', 'resolv/resolv-internal.h', 'resolv-internal.h',
-    'arpa/nameser_compat.h', 'hp-timing.h', 'atomic.h', 'unwind.h',
-    'stackinfo.h', 'dl-sysdep.h', 'not-cancel.h', 'kernel-posix-timers.h',
-    'pthread-functions.h', 'nptl/pthreadP.h', 'pthreadP.h', 'fork.h',
-    'stdio-common/printf-parse.h', 'printf-parse.h', 'libioP.h'
-}
-
-
 def is_missing_header_error(error_msg: str) -> bool:
     """
-    Check if the error is due to a missing glibc-internal header.
-    
+    Check if the error is due to a missing project-internal header.
+
+    The project-internal header list is project-supplied (project YAML
+    ``phase2.internal_headers`` -> the ``INTERNAL_HEADERS`` global); the generic
+    "fatal error: <name>.h" regex below is the primary, project-agnostic arbiter,
+    so even an empty list catches missing-header errors.
+
     Args:
         error_msg: The GCC error message
-    
+
     Returns:
         True if the error is about a missing internal header
     """
@@ -1406,8 +1432,8 @@ def is_missing_header_error(error_msg: str) -> bool:
     if re.search(r'fatal error:\s*[^\n:]+\.h', error_msg):
         return True
 
-    # Check if any known internal header is mentioned
-    for header in GLIBC_INTERNAL_HEADERS:
+    # Check if any known project-internal header is mentioned
+    for header in INTERNAL_HEADERS:
         if header in error_msg:
             return True
 
@@ -1508,7 +1534,16 @@ def validate_syntax(full_file_code: str, function_name: str, patched_function: s
     # Check for markdown artifacts in full file
     if '```' in full_file_code:
         return False, "Code contains markdown artifacts (```)"
-    
+
+    # GCC syntax checking only applies to C (project YAML phase2.language). For
+    # other languages the brace/paren structural check above is the host-side
+    # arbiter; Phase 3's in-container rebuild is the real compile gate. Keeps the
+    # validator project-agnostic — no language toolchain assumption in code.
+    if PATCH_LANGUAGE != "c":
+        if patched_function:
+            return validate_function_structure(patched_function, function_name)
+        return True, ""
+
     # Try GCC validation
     try:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False) as f:
@@ -1605,23 +1640,25 @@ def save_patch_artifacts(
     output_path = OUTPUT_DIR / cve_id / model_safe
     output_path.mkdir(parents=True, exist_ok=True)
     
-    # Determine output filename
+    # Determine output filename. Derive the extension from the actual vulnerable
+    # file (e.g. .c, .java) so the artifacts are not hardcoded to C.
     original_filename = Path(original_filepath).name
     base_name = Path(original_filename).stem
-    
+    ext = Path(original_filename).suffix or ".c"
+
     if is_valid:
         patch_filename = original_filename
     else:
-        patch_filename = f"{base_name}_invalid.c"
-    
+        patch_filename = f"{base_name}_invalid{ext}"
+
     # Save the full patched file (complete file with function replaced)
     patch_file = output_path / patch_filename
     with open(patch_file, 'w') as f:
         f.write(full_patched_file)
     logger.info(f"Saved full patched file: {patch_file}")
-    
+
     # Also save just the patched function for reference
-    function_file = output_path / f"{base_name}_function_only.c"
+    function_file = output_path / f"{base_name}_function_only{ext}"
     with open(function_file, 'w') as f:
         f.write(patched_function)
     logger.debug(f"Saved patched function: {function_file}")
@@ -1994,19 +2031,20 @@ def generate_patch_with_feedback(
     retry_output_path = output_dir / cve_id / f"{model_safe}_retry{attempt_number}"
     retry_output_path.mkdir(parents=True, exist_ok=True)
     
-    # Save artifacts with retry-specific naming
+    # Save artifacts with retry-specific naming (extension from the vuln file)
     original_filename = Path(original_filepath).name
     base_name = Path(original_filename).stem
-    
-    patch_filename = original_filename if is_valid else f"{base_name}_invalid.c"
-    
+    ext = Path(original_filename).suffix or ".c"
+
+    patch_filename = original_filename if is_valid else f"{base_name}_invalid{ext}"
+
     # Save the full patched file
     patch_file = retry_output_path / patch_filename
     with open(patch_file, 'w') as f:
         f.write(full_patched_file)
-    
+
     # Save function only
-    function_file = retry_output_path / f"{base_name}_function_only.c"
+    function_file = retry_output_path / f"{base_name}_function_only{ext}"
     with open(function_file, 'w') as f:
         f.write(patched_function)
     
@@ -2335,9 +2373,24 @@ Examples:
         action='store_true',
         help='Enable verbose/debug logging output'
     )
-    
+
+    parser.add_argument(
+        '--phase0-config',
+        type=str,
+        default=None,
+        help='Path to the active project Phase 0 YAML; its phase2: section '
+             '(prompts, language, internal_headers) overrides the defaults.'
+    )
+
     args = parser.parse_args()
-    
+
+    # Re-apply the project phase2 config now that the active project YAML is
+    # known (the import-time default followed config.yaml's pointer, which may
+    # not be the project this run targets, e.g. tomcat vs the glibc default).
+    if args.phase0_config:
+        p0 = Path(args.phase0_config)
+        _apply_phase2((_load_yaml(p0).get("phase2") if p0.exists() else {}) or {})
+
     # Set up paths based on base-dir
     base_dir = Path(args.base_dir)
     csv_path = Path(args.csv) if args.csv else CSV_PATH

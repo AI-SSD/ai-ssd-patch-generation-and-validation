@@ -424,6 +424,75 @@ output:
     - "manual_verified"
 
 # ---------------------------------------------------------------------------
+# Phase 2 (patch_generator.py) – LLM patch generation (project/language-specific)
+# ---------------------------------------------------------------------------
+# The pipeline code carries only GENERIC defaults; the project supplies the
+# language framing here. `language` gates host-side validation (c → gcc syntax
+# check; anything else → structural brace check only, since the real compile
+# gate is Phase 3's in-container rebuild). `system_prompt`/`feedback_system_prompt`
+# are the ROLE PREAMBLE only — the pipeline appends the fixed SEARCH/REPLACE edit
+# format (the parser contract) and, for feedback, the failure-analysis tail.
+# `internal_headers` are project-internal headers absent host-side; the generic
+# `fatal error: *.h` regex is the primary arbiter, so this list is belt-and-braces.
+phase2:
+  language: "c"
+  system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for the GNU C Library (glibc). Your task is to fix a security vulnerability by
+    making the SMALLEST POSSIBLE EDIT to the vulnerable function — never by
+    rewriting it.
+  feedback_system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for the GNU C Library (glibc). Your previous patch attempt FAILED validation.
+    Analyze the failure and produce an improved fix as MINIMAL edits — never
+    rewrite the whole function.
+  internal_headers:
+    - "kernel-features.h"
+    - "xlocale.h"
+    - "bits/libc-lock.h"
+    - "kernel_stat.h"
+    - "libc-symbols.h"
+    - "shlib-compat.h"
+    - "bp-sym.h"
+    - "bp-asm.h"
+    - "sysdep.h"
+    - "tls.h"
+    - "lowlevellock.h"
+    - "ldsodefs.h"
+    - "dl-hash.h"
+    - "math_private.h"
+    - "math_ldbl_opt.h"
+    - "ieee754.h"
+    - "fenv_private.h"
+    - "locale/localeinfo.h"
+    - "localeinfo.h"
+    - "setlocale.h"
+    - "ctype/ctype.h"
+    - "gconv_int.h"
+    - "iconvconfig.h"
+    - "elf/ldsodefs.h"
+    - "dl-machine.h"
+    - "nss/nss.h"
+    - "nss.h"
+    - "resolv/resolv-internal.h"
+    - "resolv-internal.h"
+    - "arpa/nameser_compat.h"
+    - "hp-timing.h"
+    - "atomic.h"
+    - "unwind.h"
+    - "stackinfo.h"
+    - "dl-sysdep.h"
+    - "not-cancel.h"
+    - "kernel-posix-timers.h"
+    - "pthread-functions.h"
+    - "nptl/pthreadP.h"
+    - "pthreadP.h"
+    - "fork.h"
+    - "stdio-common/printf-parse.h"
+    - "printf-parse.h"
+    - "libioP.h"
+
+# ---------------------------------------------------------------------------
 # Phase 3 (patch_validator.py) – SAST (static analysis) tooling
 # ---------------------------------------------------------------------------
 # Project-/language-specific: glibc is C, so it uses C/C++ analysers. A Java
@@ -463,7 +532,7 @@ sast:
       cmd: ["clang-tidy", "--quiet", "--checks=clang-analyzer-*,bugprone-*,cert-*", "{file}", "--"]
       parser: regex
       regex: '^(.+?):(\d+):(\d+):\s+(warning|error):\s+(.+?)\s+\[([^\]]+)\]$'
-      groups: { file: 1, line: 2, column: 3, severity: 4, message: 5 }
+      groups: { file: 1, line: 2, column: 3, severity: 4, message: 5, rule: 6 }
       severity_map: { warning: medium, error: high }
       install: { apt: clang-tidy }
     - name: semgrep
@@ -561,7 +630,7 @@ phase1:
     || ( echo "=== All configure strategies failed ==="; grep -iE "error|fail|cannot|not found|unsupported" config.log 2>/dev/null | tail -20; tail -50 config.log 2>/dev/null; exit 1 )
     make -j"$(nproc)" -k > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
     make install -k > /build/make_install.log 2>&1; echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status
-    if ls "$PFX"/lib/libc.so.6 >/dev/null 2>&1 || ls "$BD"/libc.so >/dev/null 2>&1; then echo "PROJECT_LIBC_INSTALLED=yes" >> /build/build_status; else echo "PROJECT_LIBC_INSTALLED=no" >> /build/build_status; fi
+    if ls "$PFX"/lib/libc.so.6 >/dev/null 2>&1 || ls "$BD"/libc.so >/dev/null 2>&1; then echo "PROJECT_BUILD_INSTALLED=yes" >> /build/build_status; else echo "PROJECT_BUILD_INSTALLED=no" >> /build/build_status; fi
     # locale-gen via the build's OWN localedef (locale-dependent PoCs)
     if [ -x "$PFX/bin/localedef" ]; then
       mkdir -p "$PFX/lib/locale"; I18N="$SRC/localedata"
@@ -570,8 +639,193 @@ phase1:
     fi
     echo "build complete"
 
+  # ---- C PoC compile/link recipe (PROJECT-SUPPLIED) ----
+  # The ONLY place PoC compiler/link commands live. Run as poc_prepare.sh in the
+  # CVE image for compiled (C) PoCs. The pipeline stages the primary PoC at
+  # /poc/exploit_raw.c (+ any alternatives/companions in /poc) and exports:
+  #   INSTALL_PREFIX, BUILD_ARCH  (from the image header)
+  #   POC_ALTS        space-separated alternative PoC filenames in /poc
+  #   POC_COMPANIONS  space-separated companion/helper filenames in /poc
+  # It MUST produce /poc/exploit and write /poc/.ssd_poc_uses_build (yes|no), the
+  # honesty marker Phase 1/3 read (does the PoC resolve the project libc at run
+  # time). Faithful port of the former hardcoded CVE_DOCKERFILE_C chain: fragment
+  # main()-wrap, i386 inline-asm detection, 5-strategy link against the build
+  # glibc, alternative-PoC fallback, companion build, then the honesty probe.
+  # i386 builds prefix gcc with -m32 via $BUILD_ARCH. Exit non-zero only when NO
+  # exploit could be produced (that fails the image build = unrunnable PoC).
+  poc_prepare_script: |
+    #!/bin/bash
+    PFX="$INSTALL_PREFIX"
+    M32=""; [ "$BUILD_ARCH" = "i386" ] && M32="-m32"
+    cd /poc
+
+    # Wrap a code-fragment PoC (no main()) in a harness.
+    if grep -qE '^[[:space:]]*(int|void)?[[:space:]]*main[[:space:]]*\(' /poc/exploit_raw.c; then
+      echo "PoC has main() - using as-is"; cp /poc/exploit_raw.c /poc/exploit.c
+    else
+      echo "WARNING: PoC missing main() - wrapping in test harness"
+      echo '/* Auto-generated wrapper for PoC code fragment */' > /poc/exploit.c
+      echo '#include <stdio.h>' >> /poc/exploit.c
+      echo '#include <stdlib.h>' >> /poc/exploit.c
+      echo '#include <string.h>' >> /poc/exploit.c
+      echo '#include <unistd.h>' >> /poc/exploit.c
+      echo '' >> /poc/exploit.c
+      cat /poc/exploit_raw.c >> /poc/exploit.c
+      echo '' >> /poc/exploit.c
+      echo 'int main(int argc, char *argv[]) {' >> /poc/exploit.c
+      echo '    puts("PoC code fragment loaded - vulnerability path exists in binary");' >> /poc/exploit.c
+      echo '    return 0;' >> /poc/exploit.c
+      echo '}' >> /poc/exploit.c
+    fi
+
+    # i386 inline-asm → install 32-bit dev libs.
+    if grep -qE 'int \$0x80|%eax|%ebx|%ecx|%edx|%esi|%edi|%esp|%ebp' /poc/exploit.c 2>/dev/null; then
+      echo "Detected i386 inline assembly — installing 32-bit development libraries"
+      dpkg --add-architecture i386 && apt-get update -qq && apt-get install -y gcc-multilib libc6-dev-i386 2>/dev/null || true
+    fi
+
+    DYNAMIC_LINKER=$(find "$PFX"/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1)
+    rm -f /poc/exploit
+    echo "=== Compilation Strategy 1: Link against vulnerable glibc (all libs) ==="
+    if [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then
+      gcc $M32 -o exploit exploit.c -Wl,-rpath,"$PFX"/lib -Wl,--dynamic-linker=$DYNAMIC_LINKER -L"$PFX"/lib -I"$PFX"/include -ldl -lpthread -lm -lrt 2>&1 ||
+      gcc $M32 -o exploit exploit.c -Wl,-rpath,"$PFX"/lib -Wl,--dynamic-linker=$DYNAMIC_LINKER -L"$PFX"/lib -I"$PFX"/include -ldl -lpthread 2>&1 ||
+      gcc $M32 -o exploit exploit.c -Wl,-rpath,"$PFX"/lib -Wl,--dynamic-linker=$DYNAMIC_LINKER -L"$PFX"/lib -I"$PFX"/include -ldl 2>&1 ||
+      gcc $M32 -o exploit exploit.c -Wl,-rpath,"$PFX"/lib -Wl,--dynamic-linker=$DYNAMIC_LINKER -L"$PFX"/lib -I"$PFX"/include 2>&1 ||
+      echo "Vulnerable glibc linking failed, trying relaxed flags..."
+    fi
+    if [ ! -f /poc/exploit ] && [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then
+      echo "=== Compilation Strategy 2: Relaxed flags (-w -fpermissive) ==="
+      gcc $M32 -o exploit exploit.c -w -fpermissive -Wl,-rpath,"$PFX"/lib -Wl,--dynamic-linker=$DYNAMIC_LINKER -L"$PFX"/lib -I"$PFX"/include -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 ||
+      echo "Relaxed compilation also failed"
+    fi
+    if [ ! -f /poc/exploit ]; then
+      echo "=== Compilation Strategy 3: System glibc ==="
+      gcc $M32 -o exploit exploit.c -ldl -lpthread -lm -lrt 2>&1 ||
+      gcc $M32 -o exploit exploit.c -ldl -lpthread 2>&1 ||
+      gcc $M32 -o exploit exploit.c -ldl -lm 2>&1 ||
+      gcc $M32 -o exploit exploit.c -ldl 2>&1 ||
+      gcc $M32 -o exploit exploit.c -lm 2>&1 ||
+      gcc $M32 -o exploit exploit.c 2>&1 ||
+      gcc $M32 -o exploit exploit.c -w -fpermissive -D_GNU_SOURCE 2>&1 ||
+      echo "System glibc compilation also failed"
+    fi
+    if [ ! -f /poc/exploit ]; then
+      echo "=== Compilation Strategy 4: C99/GNU99 mode ==="
+      gcc $M32 -std=gnu99 -o exploit exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 ||
+      gcc $M32 -std=gnu99 -o exploit exploit.c -w -D_GNU_SOURCE 2>&1 ||
+      echo "All C99/GNU99 strategies exhausted"
+    fi
+    if [ ! -f /poc/exploit ] && { which gcc-multilib >/dev/null 2>&1 || dpkg -l gcc-multilib 2>/dev/null | grep -q ^ii; }; then
+      echo "=== Compilation Strategy 5: 32-bit (-m32) for i386 PoCs ==="
+      gcc -m32 -o exploit exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 ||
+      gcc -m32 -o exploit exploit.c -w -D_GNU_SOURCE -ldl -lpthread 2>&1 ||
+      gcc -m32 -o exploit exploit.c -w -D_GNU_SOURCE -ldl 2>&1 ||
+      gcc -m32 -o exploit exploit.c -w -D_GNU_SOURCE 2>&1 ||
+      gcc -m32 -std=gnu99 -o exploit exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 ||
+      echo "32-bit compilation also failed"
+    fi
+
+    # Alternative-PoC fallback: if the primary didn't compile, try each in turn.
+    if [ ! -f /poc/exploit ]; then
+      echo "Primary PoC failed to compile — trying alternatives..."
+      for alt in $POC_ALTS; do
+        echo "=== Trying alternative PoC: $alt ==="
+        cp "/poc/$alt" /poc/exploit.c
+        gcc $M32 -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 ||
+        gcc $M32 -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl -lpthread 2>&1 ||
+        gcc $M32 -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl 2>&1 ||
+        gcc $M32 -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE 2>&1 ||
+        gcc -m32 -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 ||
+        gcc $M32 -std=gnu99 -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 || true
+        [ -f /poc/exploit ] && { echo "SUCCESS: Compiled alternative PoC"; break; }
+      done
+    fi
+
+    if [ -f /poc/exploit ]; then
+      echo "SUCCESS: Exploit binary created"; file /poc/exploit
+    else
+      echo "ERROR: Failed to compile exploit!"
+      echo "=== Source file head ==="; head -30 /poc/exploit.c
+      echo "=== Verbose compilation attempt ==="; gcc $M32 -v -o exploit exploit.c -w 2>&1 || true
+      exit 1
+    fi
+
+    # Companion/helper files (multi-file PoCs): build C/C++ to same-stem binaries,
+    # make scripts executable. A failed helper is a soft warning.
+    for c in $POC_COMPANIONS; do
+      stem="${c%.*}"
+      case "$c" in
+        *.c)   ( gcc -O0 -g -w -o "/poc/$stem" "/poc/$c" -ldl -lpthread -lm 2>&1 || gcc -O0 -g -w -o "/poc/$stem" "/poc/$c" 2>&1 || echo "WARN: companion $c failed to build" ) ;;
+        *.cpp|*.cc|*.cxx|*.c++) ( g++ -O0 -g -w -o "/poc/$stem" "/poc/$c" 2>&1 || echo "WARN: companion $c failed to build" ) ;;
+        *.sh|*.py|*.pl|*.rb) chmod +x "/poc/$c" 2>/dev/null || true ;;
+      esac
+    done
+
+    # Honesty marker: run the PoC through the project loader and confirm it maps
+    # the project libc (LD_LIBRARY_PATH ldd fallback). Keep in sync with the Phase
+    # 3 marker + read_poc_uses_build().
+    LOADER=$(find "$PFX"/lib -maxdepth 1 -name 'ld-*.so*' 2>/dev/null | head -1)
+    USES=no
+    if [ -n "$LOADER" ] && "$LOADER" --library-path "$PFX"/lib --list /poc/exploit 2>/dev/null | grep -q "$PFX"; then USES=yes
+    elif LD_LIBRARY_PATH="$PFX"/lib ldd /poc/exploit 2>/dev/null | grep -q "$PFX"; then USES=yes; fi
+    echo "$USES" > /poc/.ssd_poc_uses_build
+    echo "poc_uses_project_build: $USES"
+
+  # ---- Compiled-PoC LAUNCH recipe (PROJECT-SUPPLIED) ----
+  # Baked into the Phase 1 run wrapper for compiled (C) PoCs. Decides HOW to
+  # execute /poc/exploit so it exercises the project glibc. Inputs: $RUN_LIB
+  # (= install_prefix/lib). Outputs (consumed by the generic wrapper):
+  #   SSD_EXEC_PREFIX       launch prefix prepended to ./exploit ("" = run directly)
+  #   SSD_LD_LIBRARY_PATH   LD_LIBRARY_PATH for the run (pre-set to $RUN_LIB)
+  # glibc runs the PoC through the project's OWN ld.so (--library-path) so the
+  # freshly-built loader+libc are always exercised — UNLESS the binary's ELF
+  # interpreter (PT_INTERP) already points into the project build, in which case
+  # it runs directly so argv[0] and any /proc/self/exe self-re-exec stay correct
+  # (LPE PoCs that re-invoke themselves break under an explicit "ld.so ./exploit").
+  # Faithful port of the former hardcoded run-wrapper loader-prefix block.
+  poc_launch_script: |
+    LOADER=$(find "$RUN_LIB" -maxdepth 1 -name 'ld-*.so*' 2>/dev/null | head -1)
+    INTERP=$(readelf -l /poc/exploit 2>/dev/null | sed -n 's/.*program interpreter: \(.*\)]/\1/p' | head -1)
+    case "$INTERP" in
+      "$RUN_LIB"/*) SSD_EXEC_PREFIX=; echo "  PoC uses project interpreter ($INTERP) — running directly" ;;
+      *) if [ -n "$LOADER" ] && [ -x "$LOADER" ]; then SSD_EXEC_PREFIX="$LOADER --library-path $RUN_LIB"; echo "  Forcing project loader (binary interpreter: ${INTERP:-none})"; else SSD_EXEC_PREFIX=; fi ;;
+    esac
+
   # Build system tag (informational; pipeline uses build_script above, not this).
   build_system: "autotools"
+
+  # ---- Phase 3 patched-image rebuild recipe (PROJECT-SUPPLIED) ----
+  # The patched validation image derives FROM the Phase 1 CVE image (so the
+  # SOURCE_DIR/BUILD_DIR/INSTALL_PREFIX env are inherited) and copies the patched
+  # file over its in-tree path. This script does the INCREMENTAL rebuild + the
+  # verification markers Phase 3 reads. $VULN_FILE is the patched file (relative
+  # to the source tree). Tolerant (-k) like Phase 1 and never exits non-zero on a
+  # mere compile failure — that is surfaced via the empty /tmp/ssd_obj_rebuilt
+  # marker, not by failing the image build. Mirrors the Phase 1 honesty gate.
+  patch_rebuild_script: |
+    #!/bin/bash
+    cd "$BUILD_DIR" || { echo "no build dir" > /tmp/ssd_rebuild.log; }
+    make -j"$(nproc)" -k > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
+    make install -k > /tmp/ssd_install.log 2>&1; echo "install exit: $?"; tail -10 /tmp/ssd_install.log
+    # Compiler errors for the feedback loop (real gcc diagnostics, not make noise).
+    grep -B2 -A8 "error:" /tmp/ssd_rebuild.log 2>/dev/null | head -100 > /tmp/ssd_build_errors; true
+    # Object-rebuilt check — only meaningful for .c (a header patch rebuilds many
+    # objects with unrelated names). Empty marker = the patched object didn't build.
+    case "$VULN_FILE" in
+      *.c) OBJ="$(basename "$VULN_FILE" .c).o"
+           find "$BUILD_DIR" -name "$OBJ" -newer "$SOURCE_DIR/$VULN_FILE" -print -quit > /tmp/ssd_obj_rebuilt
+           echo "obj_rebuilt: $(cat /tmp/ssd_obj_rebuilt)" ;;
+      *)   echo skip > /tmp/ssd_obj_rebuilt ;;
+    esac
+    # Honesty re-check: run the PoC through the project's own loader and confirm it
+    # maps the project libc (LD_LIBRARY_PATH ldd fallback). Keep in sync with the
+    # Phase 1 marker + read_poc_uses_build.
+    LOADER=$(find "$INSTALL_PREFIX"/lib -maxdepth 1 -name 'ld-*.so*' 2>/dev/null | head -1)
+    USES=no
+    if [ -n "$LOADER" ] && "$LOADER" --library-path "$INSTALL_PREFIX"/lib --list /poc/exploit 2>/dev/null | grep -q "$INSTALL_PREFIX"; then USES=yes
+    elif LD_LIBRARY_PATH="$INSTALL_PREFIX"/lib ldd /poc/exploit 2>/dev/null | grep -q "$INSTALL_PREFIX"; then USES=yes; fi
+    echo "$USES" > /tmp/ssd_poc_uses_build; echo "poc_uses_build: $USES"
 
   # Option A — in-tree regression-test reproducer (poc_language: intree-test).
   # PROJECT-SPECIFIC RECIPE lives HERE, not in the pipeline code. The pipeline
@@ -853,6 +1107,16 @@ phase1:
   # the glibc-version → Ubuntu shipping map; mismatch here is what triggers the
   # loader-vDSO crash, so keep it aligned with which Ubuntu ships each glibc.
   version_era_map:
+    # Pre-2.15 floor. glibc older than 2.15 shipped on Ubuntu releases earlier
+    # than 12.04, but 12.04 is our OLDEST base image — and it builds these old
+    # trees cleanly. Without a key <= the tree version, map_version_to_era()
+    # returns None and Gate B wrongly falls back to the COMMIT DATE: a 2011-dated
+    # 2.14.90 tree (CVE-2009-5029) then lands on 14.04, whose binutils/gcc fail
+    # its intl PIC build (no libc.so.6 -> false "manual revision"). Verified:
+    # 2.14.90 builds rc=0 with libc.so.6 on 12.04, fails on 14.04. So pin the
+    # whole pre-2.15 range to 12.04 (the closest-older match makes 2.0..2.14.x
+    # resolve here).
+    "2.0": "12.04"
     "2.15": "12.04"
     "2.19": "14.04"
     "2.23": "16.04"

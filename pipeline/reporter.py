@@ -150,6 +150,12 @@ class Phase3Result:
     execution_time_seconds: float
     timestamp: str
     patch_file: str
+    # SAST baseline classification (only `new` affects pass/fail; the rest are
+    # documented for visibility into pre-existing debt and patch improvements).
+    sast_new_count: int = 0
+    sast_resolved_count: int = 0
+    sast_preexisting_count: int = 0
+    sast_baseline_count: int = 0
 
 @dataclass
 class ModelStats:
@@ -363,6 +369,7 @@ class DataLoader:
                             error=sast.get('error')
                         ))
                     
+                    sast_counts = item.get('sast_counts', {}) or {}
                     results.append(Phase3Result(
                         cve_id=item.get('cve_id', cve_id),
                         model_name=item.get('model_name', ''),
@@ -376,7 +383,11 @@ class DataLoader:
                         error_message=item.get('error_message'),
                         execution_time_seconds=item.get('execution_time_seconds', 0),
                         timestamp=item.get('timestamp', ''),
-                        patch_file=item.get('patch_file', '')
+                        patch_file=item.get('patch_file', ''),
+                        sast_new_count=sast_counts.get('new', 0),
+                        sast_resolved_count=sast_counts.get('resolved', 0),
+                        sast_preexisting_count=sast_counts.get('preexisting', 0),
+                        sast_baseline_count=sast_counts.get('baseline', 0),
                     ))
             
             logger.info(f"Loaded {len(results)} Phase 3 results")
@@ -1000,7 +1011,7 @@ class ReportGenerator:
         # SAST Analysis
         report.append("\n---\n")
         report.append("## SAST Analysis Summary\n")
-        report.append(self._generate_sast_section(sast_summary))
+        report.append(self._generate_sast_section(sast_summary, phase3_results))
         
         if 'sast_findings' in chart_paths:
             report.append(f"\n![SAST Findings]({chart_paths['sast_findings'].name})\n")
@@ -1199,14 +1210,32 @@ class ReportGenerator:
         
         return '\n'.join(lines)
     
-    def _generate_sast_section(self, sast_summary: Dict[str, Dict[str, int]]) -> str:
+    def _generate_sast_section(self, sast_summary: Dict[str, Dict[str, int]],
+                               phase3_results: Optional[List[Phase3Result]] = None) -> str:
         """Generate SAST analysis section."""
         lines = []
-        
+
         if not sast_summary:
             lines.append("*No SAST results available.*")
             return '\n'.join(lines)
-        
+
+        # Baseline delta: Phase 3 only fails on NEW findings (introduced by the
+        # patch). Pre-existing issues and patch-resolved issues are documented
+        # here for visibility but never penalise a patch.
+        if phase3_results:
+            total_new = sum(r.sast_new_count for r in phase3_results)
+            total_resolved = sum(r.sast_resolved_count for r in phase3_results)
+            total_pre = sum(r.sast_preexisting_count for r in phase3_results)
+            lines.append("### SAST Baseline Delta (patch impact)\n")
+            lines.append("Findings classified against the Phase 1 baseline (the unpatched file). "
+                         "Only **new** findings affect pass/fail.\n")
+            lines.append("| Category | Count | Effect |")
+            lines.append("|----------|-------|--------|")
+            lines.append(f"| 🆕 New (introduced by patch) | {total_new} | **fails Phase 3 + fed back to LLM** |")
+            lines.append(f"| ✅ Resolved by patch | {total_resolved} | documented (security improvement) |")
+            lines.append(f"| ➖ Pre-existing (unchanged) | {total_pre} | documented, not penalised |")
+            lines.append("")
+
         lines.append("### SAST Tool Results\n")
         lines.append("| Tool | Runs | Critical | High | Medium | Low | Total |")
         lines.append("|------|------|----------|------|--------|-----|-------|")

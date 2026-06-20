@@ -50,8 +50,9 @@ _BASE_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(_BASE_DIR))
 from master_pipeline.config import load_pipeline_config, cfg_section  # noqa: E402
 from master_pipeline.sast_config import (  # noqa: E402
-    load_sast_config, SastTool, SastConfig,
+    load_sast_config, SastConfig,
 )
+from master_pipeline import sast_runner  # noqa: E402  (shared Phase 1/3 SAST run + classify)
 from poc_analyzer import PoCAnalyzer  # noqa: E402  (same negative filter Phase 1 uses)
 
 _cfg = load_pipeline_config(_BASE_DIR)
@@ -111,6 +112,11 @@ def _resolve_phase1_layout(base_dir: Path) -> Dict[str, Any]:
         "build_dir_name": p1.get("build_dir_name", _DEFAULT_BUILD_DIR_NAME),
         "install_prefix": p1.get("install_prefix", _DEFAULT_INSTALL_PREFIX),
         "image_manifest_path": manifest_path,
+        # Project-supplied incremental rebuild recipe for the patched image (the
+        # ONLY place build-system commands live in Phase 3). Run as patch_rebuild.sh
+        # with the SOURCE_DIR/BUILD_DIR/INSTALL_PREFIX env inherited from the Phase 1
+        # image + VULN_FILE; must write the /tmp/ssd_* markers the validator reads.
+        "patch_rebuild_script": p1.get("patch_rebuild_script") or None,
     }
 
 
@@ -122,17 +128,9 @@ def _resolve_phase1_layout(base_dir: Path) -> Dict[str, Any]:
 #
 # The tool list is NOT hardcoded here — it is project-/language-specific and is
 # declared in the active project's Phase 0 YAML (``sast:`` section), resolved by
-# master_pipeline.sast_config. This module only knows how to *run* a command and
-# *parse* one of the supported output formats (see _parse_sast_output).
+# master_pipeline.sast_config. Execution, parsing, baseline classification and
+# the fail_on gate all live in master_pipeline.sast_runner (shared with Phase 1).
 _SAST_CONFIG: SastConfig = load_sast_config(pipeline_config_path=_BASE_DIR / "config.yaml")
-
-# Map a fail_on severity class -> the SASTResult counter it sums (see _run_sast_tool).
-_SEVERITY_COUNT_ATTR = {
-    "critical": "critical_count",
-    "high": "high_count",
-    "medium": "medium_count",
-    "low": "low_count",
-}
 
 
 class ValidationStatus(Enum):
@@ -210,7 +208,7 @@ class PatchInfo:
     def image_name(self) -> str:
         """Generate Docker image name for this patch"""
         safe_model = self.model_name.replace(":", "_").replace(".", "_")
-        return f"glibc-patch/{self.cve_id.lower()}-{safe_model}:latest"
+        return f"ai-ssd-patch/{self.cve_id.lower()}-{safe_model}:latest"
     
     @property
     def container_name(self) -> str:
@@ -219,30 +217,9 @@ class PatchInfo:
         return f"patch-test-{self.cve_id.lower()}-{safe_model}"
 
 
-@dataclass
-class SASTFinding:
-    """Data class for a single SAST finding"""
-    tool: str
-    severity: str
-    message: str
-    line: Optional[int] = None
-    column: Optional[int] = None
-    cwe_id: Optional[str] = None
-    file_path: Optional[str] = None
-
-
-@dataclass
-class SASTResult:
-    """Data class for SAST analysis results"""
-    tool: str
-    success: bool
-    findings: List[SASTFinding] = field(default_factory=list)
-    error_message: Optional[str] = None
-    raw_output: str = ""
-    critical_count: int = 0
-    high_count: int = 0
-    medium_count: int = 0
-    low_count: int = 0
+# SAST findings are plain dicts produced by master_pipeline.sast_runner
+# ({tool, severity, message, line, column, cwe_id, rule_id, file_path}); no
+# local dataclass is needed — Phase 1 and Phase 3 exchange them via the manifest.
 
 
 @dataclass
@@ -263,7 +240,13 @@ class ValidationResult:
     timestamp: str = ""
     patch_file: str = ""
     # New fields for feedback loop support
-    sast_findings: List[Dict[str, Any]] = field(default_factory=list)  # Detailed SAST findings
+    sast_findings: List[Dict[str, Any]] = field(default_factory=list)  # All findings on the patched file
+    # SAST baseline comparison (methodology: score the patch's delta, not the
+    # codebase's pre-existing debt). Classified against the Phase 1 baseline:
+    sast_baseline_findings: List[Dict[str, Any]] = field(default_factory=list)  # Phase 1 (unpatched) findings
+    sast_preexisting: List[Dict[str, Any]] = field(default_factory=list)        # in both → unchanged debt
+    sast_resolved: List[Dict[str, Any]] = field(default_factory=list)           # in baseline, gone after patch
+    sast_new: List[Dict[str, Any]] = field(default_factory=list)                # introduced by patch → gates + feeds back
     build_logs: Optional[str] = None  # Build error logs for feedback
     attempt_number: int = 1  # Track which attempt this is
     is_retry: bool = False  # Whether this was a retry validation
@@ -286,6 +269,16 @@ class ValidationResult:
             "sast_passed": self.sast_passed,
             "sast_results": self.sast_results,
             "sast_findings": self.sast_findings,
+            # Baseline-classified SAST (only `sast_new` affects pass/fail):
+            "sast_preexisting": self.sast_preexisting,
+            "sast_resolved": self.sast_resolved,
+            "sast_new": self.sast_new,
+            "sast_counts": {
+                "baseline": len(self.sast_baseline_findings),
+                "preexisting": len(self.sast_preexisting),
+                "resolved": len(self.sast_resolved),
+                "new": len(self.sast_new),
+            },
             "poc_exit_code": self.poc_exit_code,
             "baseline_exit_code": self.baseline_exit_code,
             "poc_output": self.poc_output[:2000] if self.poc_output else None,  # Truncate long outputs
@@ -319,6 +312,9 @@ class ValidationResult:
             "sast_passed": self.sast_passed,
             "sast_results": self.sast_results,
             "sast_findings": self.sast_findings,
+            # Feedback must target ONLY patch-introduced findings — pre-existing
+            # issues are out of scope for the patch and are never sent to the LLM.
+            "sast_new": self.sast_new,
             "error_message": self.error_message,
             "attempt_number": self.attempt_number,
             "nf_failed": self.nf_failed,
@@ -590,44 +586,27 @@ LABEL model="{model_name}"
 
 # Apply the patch over the vulnerable source file. `touch` guarantees the
 # file is newer than every existing build artifact (COPY may preserve an
-# older mtime, which would make the incremental rebuild skip it).
+# older mtime, which would make the incremental rebuild skip it). The COPY
+# dest carries the file's real extension (e.g. .c / .java); the context name
+# is a fixed staging name.
 COPY patched_source.c /build/{source_dir}/{vuln_file_path}
 RUN touch /build/{source_dir}/{vuln_file_path}
 
-# Tolerant incremental rebuild + install, mirroring the Phase 1 invocation
-# (-k): old source trees often carry PRE-EXISTING subdir failures unrelated
-# to the patch (Phase 1 built this same tree the same way). Whether the
-# PATCH itself compiled is verified separately below via its object file.
-WORKDIR /build/{build_dir}
-RUN make -j$(nproc) -k > /tmp/ssd_rebuild.log 2>&1; \\
-    echo "rebuild exit: $?" && tail -30 /tmp/ssd_rebuild.log; true
-RUN make install -k > /tmp/ssd_install.log 2>&1; \\
-    echo "install exit: $?" && tail -10 /tmp/ssd_install.log; true
+# The patched file (relative to the source tree) for the rebuild script's checks.
+ENV VULN_FILE={vuln_file_path}
 
-# Extract compiler errors from the rebuild log so the feedback loop receives
-# the actual gcc diagnostics rather than make recursion noise.
-RUN grep -B2 -A8 "error:" /tmp/ssd_rebuild.log 2>/dev/null | head -100 \\
-    > /tmp/ssd_build_errors; true
-
-# Verification artifact 1: was the patched file's object rebuilt AFTER the
-# patch was applied? Empty marker = the patch did not compile.
-RUN {obj_check_cmd}
-
-# Verification artifact 2: does the PoC exercise the project build at RUNTIME?
-# Mirrors the Phase 1 honesty marker — the inherited wrapper runs the PoC
-# through the project's own loader (ld.so --library-path), so we check that the
-# same loader maps the project libc (LD_LIBRARY_PATH ldd fallback). If neither
-# resolves the project build, a source patch can never change the PoC's
-# behavior — the validator surfaces this as a non-retryable environment
-# condition. Keep in sync with orchestrator.py's marker + read_poc_uses_build.
-RUN LOADER=$(find {install_prefix}/lib -maxdepth 1 -name 'ld-*.so*' 2>/dev/null | head -1); \\
-    USES=no; \\
-    if [ -n "$LOADER" ] && "$LOADER" --library-path {install_prefix}/lib --list /poc/exploit 2>/dev/null | grep -q "{install_prefix}"; then \\
-        USES=yes; \\
-    elif LD_LIBRARY_PATH={install_prefix}/lib ldd /poc/exploit 2>/dev/null | grep -q "{install_prefix}"; then \\
-        USES=yes; \\
-    fi; \\
-    echo "$USES" > /tmp/ssd_poc_uses_build; echo "poc_uses_build: $USES"
+# Project-supplied incremental rebuild (phase1.patch_rebuild_script) — the ONLY
+# place build-system/compiler commands live in Phase 3. Reuses the
+# SOURCE_DIR/BUILD_DIR/INSTALL_PREFIX env baked into the Phase 1 image. It MUST
+# write the markers the validator + feedback loop read:
+#   /tmp/ssd_rebuild.log     full build trace
+#   /tmp/ssd_build_errors    compiler diagnostics (feedback context)
+#   /tmp/ssd_obj_rebuilt     did the patched object rebuild? (empty = didn't compile)
+#   /tmp/ssd_poc_uses_build  honesty re-check (does the PoC resolve the project build?)
+# Tolerant by design: a non-compiling PATCH must NOT fail the image build (it is
+# surfaced via the markers), so the script exits 0. No build commands in code.
+COPY patch_rebuild.sh /patch_rebuild.sh
+RUN bash /patch_rebuild.sh
 
 # Restore the parent image's working directory: the inherited run wrapper
 # executes the PoC via relative path (./exploit) from /poc.
@@ -663,28 +642,12 @@ WORKDIR /poc
             f"derived from {cve_image_tag} (patching {vuln_file_path})"
         )
 
-        # Object-rebuilt check: only meaningful for .c files (a header patch
-        # rebuilds many objects with unrelated names).
-        if vuln_file_path.endswith(".c"):
-            obj_stem = Path(vuln_file_path).stem
-            obj_check_cmd = (
-                f'find /build/{self.layout["build_dir_name"]} -name "{obj_stem}.o" '
-                f'-newer /build/{self.layout["source_dir_name"]}/{vuln_file_path} '
-                f'-print -quit > /tmp/ssd_obj_rebuilt; '
-                f'echo "obj_rebuilt: $(cat /tmp/ssd_obj_rebuilt)"'
-            )
-        else:
-            obj_check_cmd = 'echo skip > /tmp/ssd_obj_rebuilt'
-
         dockerfile_content = self.DOCKERFILE_TEMPLATE.format(
             cve=patch_info.cve_id,
             model_name=patch_info.model_name,
             cve_image_tag=cve_image_tag,
             source_dir=self.layout["source_dir_name"],
-            build_dir=self.layout["build_dir_name"],
-            install_prefix=self.layout["install_prefix"],
             vuln_file_path=vuln_file_path,
-            obj_check_cmd=obj_check_cmd,
         )
 
         # Create output directory
@@ -695,6 +658,25 @@ WORKDIR /poc
         dockerfile_path = build_dir / "Dockerfile"
         with open(dockerfile_path, 'w') as f:
             f.write(dockerfile_content)
+
+        # Project-supplied rebuild recipe (phase1.patch_rebuild_script). No recipe
+        # configured → a stub that fails loudly rather than silently producing an
+        # unrebuilt image (which would validate the patch against the OLD binary).
+        rebuild_script = self.layout.get("patch_rebuild_script")
+        if rebuild_script and rebuild_script.strip():
+            patch_rebuild = rebuild_script
+        else:
+            self.logger.error(
+                f"{patch_info.cve_id}: phase1.patch_rebuild_script is not configured "
+                "for this project — cannot rebuild the patched image"
+            )
+            patch_rebuild = (
+                "#!/bin/bash\n"
+                "echo 'ERROR: no phase1.patch_rebuild_script configured' >&2\n"
+                "echo '' > /tmp/ssd_obj_rebuilt\n"
+                "exit 1\n"
+            )
+        (build_dir / "patch_rebuild.sh").write_text(patch_rebuild)
 
         self.logger.debug(f"Dockerfile written to: {dockerfile_path}")
         return build_dir
@@ -1170,283 +1152,18 @@ class ValidationDockerManager:
     def run_sast(
         self,
         patch_info: PatchInfo,
-        patched_file: Path
-    ) -> List[SASTResult]:
-        """
-        Run SAST tools HOST-SIDE on the patched source file.
+        patched_file: Path,
+    ) -> Dict[str, Any]:
+        """Run the configured SAST tools HOST-SIDE on `patched_file`.
 
-        Static analysis of a single C file needs no container: running on
-        the host avoids installing tools into EOL-distro images and keeps
-        tool versions consistent across CVEs. Tools missing from the host
-        are recorded (success=False) and logged, not treated as findings.
+        Static analysis of a single source file needs no container. Delegates to
+        the shared ``master_pipeline.sast_runner`` so Phase 1 (baseline) and
+        Phase 3 (patched) run identical tools/parsers. Returns
+        ``{"findings": [...], "tool_results": [...]}``.
         """
         self.logger.info(f"Running SAST analysis for {patch_info.cve_id}/{patch_info.model_name}...")
+        return sast_runner.run_sast_file(patched_file, self.sast_config, self.logger)
 
-        results = []
-        for tool in self.sast_config.tools:
-            result = self._run_sast_tool(patched_file, tool)
-            results.append(result)
-        return results
-
-    def _run_sast_tool(
-        self,
-        patched_file: Path,
-        tool: SastTool,
-    ) -> SASTResult:
-        """Run a single configured SAST tool on the host via subprocess."""
-        import time
-        sast_start_time = time.time()
-        tool_name = tool.name
-        timeout = self.sast_config.tool_timeout
-        self.logger.debug(f"Running {tool_name}...")
-
-        result = SASTResult(
-            tool=tool_name,
-            success=False,
-            findings=[],
-            error_message=None,
-            raw_output=""
-        )
-
-        # Resolve the command: primary binary, else fallback (e.g. python -m).
-        file_str = str(patched_file)
-        cmd = None
-        if shutil.which(tool.detect):
-            cmd = tool.resolved_cmd(file_str)
-        else:
-            cmd = tool.resolved_fallback(file_str)
-
-        if not cmd:
-            result.error_message = (
-                f"{tool_name} not installed on host — skipped "
-                f"({tool.install_hint()})"
-            )
-            self.logger.warning(result.error_message)
-            return result
-
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout
-            )
-            output = (proc.stdout or "") + (proc.stderr or "")
-            result.raw_output = output
-
-            result.findings = self._parse_sast_output(tool, output)
-            result.success = True
-
-            # Count by severity
-            for finding in result.findings:
-                severity = finding.severity.lower()
-                if severity in ['critical', 'error']:
-                    result.critical_count += 1
-                elif severity == 'high':
-                    result.high_count += 1
-                elif severity in ['medium', 'warning']:
-                    result.medium_count += 1
-                else:
-                    result.low_count += 1
-
-            sast_duration = time.time() - sast_start_time
-            self.logger.debug(
-                f"{tool_name}: {len(result.findings)} findings "
-                f"(C:{result.critical_count} H:{result.high_count} M:{result.medium_count} L:{result.low_count}) "
-                f"in {sast_duration:.2f}s"
-            )
-
-        except subprocess.TimeoutExpired:
-            result.error_message = f"{tool_name} timed out after {timeout}s"
-            self.logger.warning(result.error_message)
-        except Exception as e:
-            sast_duration = time.time() - sast_start_time
-            self.logger.warning(f"SAST tool {tool_name} failed after {sast_duration:.2f}s: {e}")
-            result.error_message = str(e)
-
-        return result
-    
-    def _parse_sast_output(self, tool: SastTool, output: str) -> List[SASTFinding]:
-        """Parse a tool's output into findings, dispatched by its configured
-        ``parser`` strategy so new tools need no Python change."""
-        parser = (tool.parser or "").lower()
-        if parser == "cppcheck-xml":
-            return self._parse_cppcheck_output(output, tool.name)
-        if parser == "flawfinder":
-            return self._parse_flawfinder_output(output, tool.name)
-        if parser == "sarif":
-            return self._parse_sarif_output(output, tool.name)
-        if parser == "regex":
-            return self._parse_regex_output(output, tool)
-        self.logger.warning(
-            f"SAST tool '{tool.name}' has unknown parser '{tool.parser}' — no findings parsed"
-        )
-        return []
-
-    def _parse_sarif_output(self, output: str, tool_name: str) -> List[SASTFinding]:
-        """Parse SARIF 2.1.0 JSON (the de-facto interchange format emitted by
-        semgrep, CodeQL, many modern analysers). Tool-agnostic."""
-        import json
-        findings: List[SASTFinding] = []
-        # SARIF level -> our severity class.
-        level_map = {"error": "high", "warning": "medium", "note": "low",
-                     "none": "low"}
-        try:
-            data = json.loads(output)
-        except Exception:
-            # Tools (semgrep, pmd, …) often interleave progress/log lines on the
-            # same stream as the SARIF document. Extract the outermost JSON object
-            # and retry before giving up.
-            start = output.find("{")
-            end = output.rfind("}")
-            if start == -1 or end <= start:
-                return findings
-            try:
-                data = json.loads(output[start:end + 1])
-            except Exception:
-                return findings
-        for run in data.get("runs", []) or []:
-            # Build ruleId -> CWE map from the rule metadata when present.
-            rule_cwe: Dict[str, Optional[str]] = {}
-            driver = (run.get("tool") or {}).get("driver") or {}
-            for rule in driver.get("rules", []) or []:
-                rid = rule.get("id")
-                tags = ((rule.get("properties") or {}).get("tags")) or []
-                cwe = next((t for t in tags if str(t).upper().startswith("CWE")), None)
-                if rid:
-                    rule_cwe[rid] = cwe
-            for res in run.get("results", []) or []:
-                level = str(res.get("level", "warning")).lower()
-                severity = level_map.get(level, "medium")
-                msg = (res.get("message") or {}).get("text", "")
-                rule_id = res.get("ruleId")
-                line = None
-                file_path = None
-                locs = res.get("locations") or []
-                if locs:
-                    phys = (locs[0].get("physicalLocation") or {})
-                    region = phys.get("region") or {}
-                    line = region.get("startLine")
-                    file_path = ((phys.get("artifactLocation") or {}).get("uri"))
-                findings.append(SASTFinding(
-                    tool=tool_name,
-                    severity=severity,
-                    message=f"[{rule_id}] {msg}" if rule_id else msg,
-                    line=int(line) if line else None,
-                    cwe_id=rule_cwe.get(rule_id),
-                    file_path=file_path,
-                ))
-        return findings
-
-    def _parse_regex_output(self, output: str, tool: SastTool) -> List[SASTFinding]:
-        """Parse line-oriented output using a tool-supplied regex + group map.
-        Lets a brand-new tool be wired up entirely from YAML."""
-        findings: List[SASTFinding] = []
-        if not tool.regex:
-            return findings
-        try:
-            pattern = re.compile(tool.regex)
-        except re.error as exc:
-            self.logger.warning(f"SAST tool '{tool.name}' has invalid regex: {exc}")
-            return findings
-        g = tool.groups
-
-        def _group(match, key):
-            idx = g.get(key)
-            if not idx:
-                return None
-            try:
-                return match.group(idx)
-            except (IndexError, Exception):
-                return None
-
-        for raw_line in output.split("\n"):
-            match = pattern.search(raw_line.strip())
-            if not match:
-                continue
-            sev_raw = (_group(match, "severity") or "").strip().lower()
-            severity = tool.severity_map.get(sev_raw, sev_raw) or "low"
-            line_val = _group(match, "line")
-            col_val = _group(match, "column")
-            findings.append(SASTFinding(
-                tool=tool.name,
-                severity=severity,
-                message=(_group(match, "message") or raw_line.strip()),
-                line=int(line_val) if line_val and str(line_val).isdigit() else None,
-                column=int(col_val) if col_val and str(col_val).isdigit() else None,
-                file_path=_group(match, "file"),
-            ))
-        return findings
-
-    def _parse_cppcheck_output(self, output: str, tool_name: str = "cppcheck") -> List[SASTFinding]:
-        """Parse cppcheck XML output"""
-        findings = []
-        
-        # Try to parse XML
-        try:
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(output)
-            
-            for error in root.findall('.//error'):
-                severity = error.get('severity', 'unknown')
-                msg = error.get('msg', '')
-                cwe = error.get('cwe', '')
-                
-                location = error.find('location')
-                line = None
-                file_path = None
-                if location is not None:
-                    line = int(location.get('line', 0)) or None
-                    file_path = location.get('file')
-                
-                findings.append(SASTFinding(
-                    tool=tool_name,
-                    severity=severity,
-                    message=msg,
-                    line=line,
-                    cwe_id=f"CWE-{cwe}" if cwe else None,
-                    file_path=file_path
-                ))
-        except Exception:
-            # Fall back to line-by-line parsing
-            for line in output.split('\n'):
-                if 'error' in line.lower() or 'warning' in line.lower():
-                    findings.append(SASTFinding(
-                        tool=tool_name,
-                        severity="warning",
-                        message=line.strip()
-                    ))
-
-        return findings
-
-    def _parse_flawfinder_output(self, output: str, tool_name: str = "flawfinder") -> List[SASTFinding]:
-        """Parse flawfinder output"""
-        findings = []
-        
-        # Flawfinder output format: file:line:column: [level] (category) message
-        pattern = r'^(.+):(\d+):(\d+):\s*\[(\d+)\]\s*\(([^)]+)\)\s*(.+)$'
-        
-        for line in output.split('\n'):
-            match = re.match(pattern, line.strip())
-            if match:
-                file_path, line_num, col, level, category, msg = match.groups()
-                
-                # Map level to severity
-                level_int = int(level)
-                if level_int >= 4:
-                    severity = "high"
-                elif level_int >= 2:
-                    severity = "medium"
-                else:
-                    severity = "low"
-                
-                findings.append(SASTFinding(
-                    tool=tool_name,
-                    severity=severity,
-                    message=f"[{category}] {msg}",
-                    line=int(line_num),
-                    column=int(col),
-                    file_path=file_path
-                ))
-
-        return findings
     
     def cleanup_image(self, patch_info: PatchInfo):
         """Remove Docker image"""
@@ -1730,59 +1447,58 @@ class ValidationPipeline:
         self.logger.info(f"Results saved to: {report_path}")
         self.logger.info("=" * 60)
     
-    def _sast_gate(self, sast_results: "List[SASTResult]") -> Tuple[bool, str]:
-        """Apply the project's configured ``fail_on`` severity gate.
+    def _evaluate_sast(self, patch_info: "PatchInfo", result: "ValidationResult",
+                       baseline_findings: List[Dict[str, Any]]) -> Tuple[bool, str]:
+        """Run SAST on the patched file, classify against the Phase 1 baseline,
+        and gate on the NEWLY-introduced findings only.
 
-        Returns ``(passed, message)``. A patch passes when none of the
-        ``fail_on`` severity classes (e.g. critical/high) have any findings;
-        medium/low are reported but never fail (they existed in the original
-        code too). The set of failing classes comes from the project YAML, not
-        from hardcoded C/C++ assumptions.
-        """
-        fail_on = self.docker_mgr.sast_config.fail_on
-        totals = {cls: 0 for cls in _SEVERITY_COUNT_ATTR}
-        for sr in sast_results:
-            for cls, attr in _SEVERITY_COUNT_ATTR.items():
-                totals[cls] += getattr(sr, attr, 0)
-        fail_total = sum(totals[c] for c in fail_on if c in totals)
-        if fail_total == 0:
-            return True, ""
-        parts = [f"{totals[c]} {c}" for c in sorted(fail_on) if totals.get(c)]
-        return False, f"SAST found {', '.join(parts)} severity issue(s)"
-
-    def _apply_sast(self, patch_info: "PatchInfo", result: "ValidationResult") -> None:
-        """Run SAST on the patched file and set result.sast_* + final status.
-
-        Shared by the in-tree validation path; mirrors the standard Step 7 logic
-        (SUCCESS only when the dynamic check passed AND the configured SAST
-        severity gate passed).
+        Populates result.sast_results / sast_findings / sast_baseline_findings /
+        sast_preexisting / sast_resolved / sast_new and result.sast_passed.
+        Returns ``(passed, message)``. Pre-existing and resolved findings are
+        documented but never fail the patch — only the delta the patch
+        introduces gates (and later feeds back). When there is no baseline the
+        baseline is empty, so every finding is treated as new (strict).
         """
         if self.skip_sast:
             result.sast_passed = True
             result.sast_results = [{"status": "skipped"}]
-        else:
-            sast_results = self.docker_mgr.run_sast(patch_info, patch_info.patched_file)
-            result.sast_results = []
-            result.sast_findings = []
-            for sr in sast_results:
-                result.sast_results.append({
-                    "tool": sr.tool, "success": sr.success,
-                    "critical_count": sr.critical_count, "high_count": sr.high_count,
-                    "medium_count": sr.medium_count, "low_count": sr.low_count,
-                    "findings_count": len(sr.findings), "error": sr.error_message,
-                })
-                for f in sr.findings:
-                    result.sast_findings.append({
-                        "tool": f.tool, "severity": f.severity, "message": f.message,
-                        "line": f.line, "column": f.column, "cwe_id": f.cwe_id,
-                        "file_path": f.file_path,
-                    })
-            result.sast_passed, _sast_msg = self._sast_gate(sast_results)
-            if not result.sast_passed and result.status != ValidationStatus.POC_STILL_WORKS.value:
-                if result.status not in (ValidationStatus.EXECUTION_ERROR.value,
-                                         ValidationStatus.BUILD_ERROR.value):
-                    result.status = ValidationStatus.SAST_FAILED.value
-                    result.error_message = _sast_msg
+            return True, ""
+
+        sast = self.docker_mgr.run_sast(patch_info, patch_info.patched_file)
+        current = sast["findings"]
+        result.sast_results = sast["tool_results"]
+        result.sast_findings = current
+        result.sast_baseline_findings = baseline_findings or []
+
+        classified = sast_runner.classify(baseline_findings or [], current)
+        result.sast_preexisting = classified["preexisting"]
+        result.sast_resolved = classified["resolved"]
+        result.sast_new = classified["new"]
+
+        passed, msg = sast_runner.gate(result.sast_new,
+                                       self.docker_mgr.sast_config.fail_on)
+        result.sast_passed = passed
+        self.logger.info(
+            f"SAST {patch_info.cve_id}: baseline={len(result.sast_baseline_findings)} "
+            f"preexisting={len(result.sast_preexisting)} resolved={len(result.sast_resolved)} "
+            f"new={len(result.sast_new)} → {'PASS' if passed else 'FAIL'}"
+        )
+        return passed, msg
+
+    def _apply_sast(self, patch_info: "PatchInfo", result: "ValidationResult",
+                    baseline_findings: List[Dict[str, Any]]) -> None:
+        """Run + classify SAST and set final status (in-tree validation path).
+
+        Mirrors the standard Step 7 logic: SUCCESS only when the dynamic check
+        passed AND the patch introduced no new findings in a ``fail_on`` class.
+        """
+        passed, msg = self._evaluate_sast(patch_info, result, baseline_findings)
+        if not self.skip_sast and not passed \
+                and result.status != ValidationStatus.POC_STILL_WORKS.value:
+            if result.status not in (ValidationStatus.EXECUTION_ERROR.value,
+                                     ValidationStatus.BUILD_ERROR.value):
+                result.status = ValidationStatus.SAST_FAILED.value
+                result.error_message = msg
         if result.poc_blocked and result.sast_passed:
             result.status = ValidationStatus.SUCCESS.value
             self.logger.info(f"✓✓ VALIDATION SUCCESSFUL for {patch_info.log_label}")
@@ -1858,6 +1574,10 @@ class ValidationPipeline:
                 )
                 return result
             result.baseline_exit_code = baseline_exit_code
+            # Phase 1 SAST baseline for this CVE (findings on the UNPATCHED file).
+            # Phase 3 classifies the patched-file findings against it; only the
+            # delta gates. Missing/old manifests → empty → all findings are new.
+            baseline_sast = (manifest_entry or {}).get("sast_baseline") or []
 
             # Option A: in-tree regression-test CVEs validate differently — rebuild
             # the Phase 1 in-tree image with the patch and re-run the project's OWN
@@ -1900,7 +1620,7 @@ class ValidationPipeline:
                     result.status = ValidationStatus.POC_STILL_WORKS.value
                     result.error_message = "In-tree regression test still FAILS on the patched build"
                 # SAST + final status (shared helper)
-                self._apply_sast(patch_info, result)
+                self._apply_sast(patch_info, result, baseline_sast)
                 return result
 
             # Step 3: Generate Dockerfile (derived FROM the Phase 1 CVE image)
@@ -2004,42 +1724,11 @@ class ValidationPipeline:
             else:
                 self.logger.info(f"✓ PoC blocked for {patch_info.cve_id}/{patch_info.model_name}")
             
-            # Step 7: Run SAST tools (Static Check B) - ALWAYS run for complete feedback
+            # Step 7: Run SAST (Static Check B) - ALWAYS run for complete feedback.
+            # Classify against the Phase 1 baseline; only patch-introduced
+            # ("new") findings can fail Phase 3 — pre-existing debt does not.
             if not self.skip_sast:
-                sast_results = self.docker_mgr.run_sast(patch_info, patch_info.patched_file)
-                
-                # Convert SAST results to serializable format with detailed findings
-                result.sast_results = []
-                result.sast_findings = []
-
-                for sast_result in sast_results:
-                    # Summary format
-                    result.sast_results.append({
-                        "tool": sast_result.tool,
-                        "success": sast_result.success,
-                        "critical_count": sast_result.critical_count,
-                        "high_count": sast_result.high_count,
-                        "medium_count": sast_result.medium_count,
-                        "low_count": sast_result.low_count,
-                        "findings_count": len(sast_result.findings),
-                        "error": sast_result.error_message,
-                    })
-
-                    # Detailed findings for feedback loop
-                    for finding in sast_result.findings:
-                        result.sast_findings.append({
-                            "tool": finding.tool,
-                            "severity": finding.severity,
-                            "message": finding.message,
-                            "line": finding.line,
-                            "column": finding.column,
-                            "cwe_id": finding.cwe_id,
-                            "file_path": finding.file_path,
-                        })
-
-                # SAST passes when none of the configured fail_on severity
-                # classes have findings (medium/low existed in the original too).
-                result.sast_passed, _sast_msg = self._sast_gate(sast_results)
+                _passed, _sast_msg = self._evaluate_sast(patch_info, result, baseline_sast)
 
                 if not result.sast_passed:
                     # Set status but don't return - we've already collected all data.

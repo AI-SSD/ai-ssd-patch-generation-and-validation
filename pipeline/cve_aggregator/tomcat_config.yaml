@@ -288,6 +288,27 @@ output:
     - "manual_verified"
 
 # ---------------------------------------------------------------------------
+# Phase 2 (patch_generator.py) – LLM patch generation (project/language-specific)
+# ---------------------------------------------------------------------------
+# Tomcat is JAVA. `language: java` turns OFF the host-side gcc syntax check (a C
+# tool) — structural brace validation runs instead, and Phase 3's in-container
+# rebuild is the real compile gate. The prompts are the role preamble only; the
+# pipeline appends the fixed SEARCH/REPLACE edit format. No internal_headers
+# (that is a C/gcc concept).
+phase2:
+  language: "java"
+  system_prompt: >-
+    You are an expert Java security engineer specializing in vulnerability
+    patching for Apache Tomcat. Your task is to fix a security vulnerability by
+    making the SMALLEST POSSIBLE EDIT to the vulnerable method — never by
+    rewriting it.
+  feedback_system_prompt: >-
+    You are an expert Java security engineer specializing in vulnerability
+    patching for Apache Tomcat. Your previous patch attempt FAILED validation.
+    Analyze the failure and produce an improved fix as MINIMAL edits — never
+    rewrite the whole method.
+
+# ---------------------------------------------------------------------------
 # Phase 3 (patch_validator.py) – SAST (static analysis) tooling
 # ---------------------------------------------------------------------------
 # JAVA project — so it uses Java analysers, NOT the C tools (cppcheck/flawfinder).

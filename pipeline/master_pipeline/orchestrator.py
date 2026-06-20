@@ -1314,13 +1314,16 @@ RECOMMENDED ACTIONS:
         if 0 in phases and not shutil.which("gcc"):
             optional.append("[phase 0] gcc not found — SyntaxValidator cannot "
                             "syntax-check C PoCs (apt install gcc)")
-        if 3 in phases:
-            # Configured SAST tools are REQUIRED: the project YAML explicitly
-            # asked for them, so a missing tool aborts rather than silently
-            # running Phase 3 with reduced static-analysis coverage.
+        if 1 in phases or 3 in phases:
+            # Configured SAST tools are REQUIRED whenever SAST runs: Phase 1
+            # captures the baseline (unpatched file) and Phase 3 classifies the
+            # patched file against it — both need the same tools. A missing tool
+            # aborts rather than silently running with reduced coverage.
+            _sast_phases = "phases 1,3" if (1 in phases and 3 in phases) else \
+                           ("phase 1" if 1 in phases else "phase 3")
             for name, present, hint in self._sast_tool_status():
                 if not present:
-                    required.append(f"[phase 3] SAST tool '{name}' not installed — "
+                    required.append(f"[{_sast_phases}] SAST tool '{name}' not installed — "
                                     f"{hint} (declared in the project YAML 'sast:' section)")
         if 4 in phases:
             if not _module("matplotlib"):

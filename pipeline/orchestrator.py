@@ -27,6 +27,8 @@ from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
 from poc_analyzer import PoCAnalyzer
+from master_pipeline.sast_config import load_sast_config
+from master_pipeline import sast_runner  # shared Phase 1/3 SAST run + classify
 
 # Try to import docker, provide helpful error if not installed
 try:
@@ -204,6 +206,28 @@ def _resolve_phase1_settings(cfg: dict, base_dir: Path) -> dict:
         "source_dir_name": p1.get("source_dir_name", _DEFAULT_SOURCE_DIR_NAME),
         "build_dir_name": p1.get("build_dir_name", _DEFAULT_BUILD_DIR_NAME),
         "install_prefix": p1.get("install_prefix", _DEFAULT_INSTALL_PREFIX),
+        # Project-supplied build recipe for the STANDARD (ExploitDB-PoC) path —
+        # the ONLY place build-system/compiler commands live. Run as build.sh in
+        # the CVE image with the generic env contract (SOURCE_DIR / BUILD_DIR /
+        # INSTALL_PREFIX / COMMIT_HASH / BUILD_ARCH); it must write the
+        # /build/build_status markers PROJECT_BUILD_EXIT_CODE /
+        # PROJECT_INSTALL_EXIT_CODE / PROJECT_BUILD_INSTALLED that Phase 1/3 read.
+        # Absent → the build fails loudly (no project-specific defaults in code).
+        "build_script": p1.get("build_script") or None,
+        # Project-supplied PoC prepare recipe for COMPILED-language (C) PoCs — the
+        # ONLY place compiler/link commands live. Run as poc_prepare.sh in the CVE
+        # image with the env contract (INSTALL_PREFIX / BUILD_ARCH / POC_ALTS /
+        # POC_COMPANIONS); it compiles /poc/exploit and writes the honesty marker
+        # /poc/.ssd_poc_uses_build. Absent → compiled PoCs fail loudly; interpreted
+        # PoCs (python/ruby/…) don't use it. No project defaults in code.
+        "poc_prepare_script": p1.get("poc_prepare_script") or None,
+        # Project-supplied LAUNCH setup for compiled PoCs — how to execute the PoC
+        # so it exercises the project build (glibc: run through the project's own
+        # ld.so --library-path). A shell snippet baked into the run wrapper; given
+        # /poc/exploit + $RUN_LIB it sets $SSD_EXEC_PREFIX (launch prefix; empty =
+        # direct) and may override $SSD_LD_LIBRARY_PATH. Absent → run the binary
+        # directly with LD_LIBRARY_PATH=$RUN_LIB (generic default, no project knowledge).
+        "poc_launch_script": p1.get("poc_launch_script") or None,
         "commit_era_map": p1.get("commit_era_map", _DEFAULT_COMMIT_ERA_MAP) or {},
         "docker_platform": p1.get("docker_platform", _DEFAULT_DOCKER_PLATFORM) or None,
         # Generic, project-configured environment exported when running a PoC
@@ -1243,10 +1267,22 @@ class CVEImageBuilder:
     #      read-only /proc/sys leaked "Read-only file system" to stderr and the
     #      negative filter misread it as exploit failure — regressed CVE-2009-5029).
     # v14: capture make/make-install REAL exit codes (was masked by `| tail`,
-    #      always 0 under dash) and record a definitive PROJECT_LIBC_INSTALLED
+    #      always 0 under dash) and record a definitive PROJECT_BUILD_INSTALLED
     #      marker. Header build steps aren't hashed into the signature, so this
     #      bump is what forces cached CVE images to rebuild with the new recipe.
-    WRAPPER_CONTRACT_VERSION = "phase1-wrapper-v14"
+    # v15: standard project build moved out of this Dockerfile header into the
+    #      project-supplied build.sh (phase1.build_script), run with the generic
+    #      SOURCE_DIR/BUILD_DIR/INSTALL_PREFIX/COMMIT_HASH/BUILD_ARCH env contract.
+    #      build_script is now hashed into the poc_signature, so a recipe change
+    #      also invalidates cached images.
+    # v16: C PoC compile/link + honesty marker moved out of CVE_DOCKERFILE_C into
+    #      the project-supplied poc_prepare.sh (phase1.poc_prepare_script), run
+    #      with the INSTALL_PREFIX/BUILD_ARCH/POC_ALTS/POC_COMPANIONS env contract.
+    #      poc_prepare_script is hashed into the signature too.
+    # v17: the compiled-PoC LAUNCH (run through the project loader, LD_LIBRARY_PATH)
+    #      moved out of the run wrapper into the project-supplied poc_launch_script
+    #      (phase1.poc_launch_script), which sets $SSD_EXEC_PREFIX/$SSD_LD_LIBRARY_PATH.
+    WRAPPER_CONTRACT_VERSION = "phase1-wrapper-v17"
     
     # Common Dockerfile header: checkout vulnerable commit, configure and build glibc
     # Uses a multi-strategy approach to handle toolchain version mismatches:
@@ -1271,6 +1307,15 @@ LABEL ai-ssd.poc_language="{poc_language}"
 LABEL ai-ssd.poc_signature="{poc_signature}"
 LABEL ai-ssd.platform="{docker_platform}"
 
+# Generic env contract consumed by the project-supplied build.sh. The build
+# recipe is the ONLY place build-system/compiler/test commands live; this image
+# header carries NO project knowledge (mirrors the in-tree-test path).
+ENV SOURCE_DIR=/build/{source_dir}
+ENV BUILD_DIR=/build/{build_dir}
+ENV INSTALL_PREFIX={install_prefix}
+ENV COMMIT_HASH={commit_hash}
+ENV BUILD_ARCH={build_arch}
+
 # Checkout the vulnerable commit
 # The base image already contains the full .git history copied from the host,
 # so no fetch is needed.  Remove stale lock files that a previous interrupted
@@ -1285,264 +1330,37 @@ RUN rm -f .git/index.lock .git/refs/heads/*.lock 2>/dev/null; \\
         echo "No commit hash provided, using current HEAD"; \\
     fi
 
-# Relax tool-version checks in old glibc configure scripts.
-# Old configure scripts reject newer binutils/make/sed with "too old" because
-# their version-match regexes are too narrow.  Bypass the critic_missing error
-# gate so configure proceeds despite version mismatches.
-RUN sed -i 's/test -n "$critic_missing"/false/g; s/test "x$critic_missing" != x/false/g' \\
-    /build/{source_dir}/configure 2>/dev/null || true
-
-# Generic compat for old trees referencing the linker-script symbol `_begin`:
-# binutils >= 2.21 changed the default linker script so the Makefile sed that
-# injected `_begin = . - SIZEOF_HEADERS;` no longer matches, leaving ld.so
-# with an undefined hidden `_begin` (R_X86_64_PC32 link failure).  `_begin`
-# is just the runtime address of the ELF header, i.e. the load bias —
-# substitute the documented in-source equivalents (era-general, no per-CVE
-# logic; the guard makes this a no-op on trees that no longer use `_begin`).
-RUN if grep -q 'GL(dl_rtld_map).l_map_start = (ElfW(Addr)) _begin;' \\
-        /build/{source_dir}/elf/rtld.c 2>/dev/null; then \\
-      sed -i \\
-        -e 's|GL(dl_rtld_map).l_map_start = (ElfW(Addr)) _begin;|GL(dl_rtld_map).l_map_start = (ElfW(Addr)) GL(dl_rtld_map).l_addr;|' \\
-        -e 's|= (ElfW(Ehdr) \\*) \\&_begin;|= (ElfW(Ehdr) *) bootstrap_map.l_addr;|' \\
-        /build/{source_dir}/elf/rtld.c && \\
-      echo "Applied generic _begin compat fix to elf/rtld.c"; \\
-    fi
-
-# Multi-strategy configure and build
-# Strategy 1: Full configure with warning suppression
-# Strategy 2: Minimal configure with fewer features
-# Strategy 3: Bare-minimum configure (no optional features)
-WORKDIR /build/{build_dir}
-RUN rm -rf /build/{build_dir}/* && \\
-    echo "=== Strategy 1: Full configure ===" && \\
-    (../{source_dir}/configure \\
-        --prefix={install_prefix} \\
-        --disable-werror \\
-        --disable-sanity-checks \\
-        --disable-profile \\
-        --enable-obsolete-rpc \\
-        CC="gcc -fno-stack-protector -fgnu89-inline" \\
-        CFLAGS="-O2 -g -fno-stack-protector -Wno-error -w -U_FORTIFY_SOURCE" \\
-        2>&1 && echo "CONFIGURE_OK") || \\
-    (echo "=== Strategy 2: Minimal configure ===" && \\
-     rm -rf /build/{build_dir}/* && \\
-     ../{source_dir}/configure \\
-        --prefix={install_prefix} \\
-        --disable-werror \\
-        --disable-sanity-checks \\
-        --disable-profile \\
-        --disable-nscd \\
-        --disable-timezone-tools \\
-        --without-selinux \\
-        --without-cvs \\
-        --without-gd \\
-        CC="gcc -fgnu89-inline" \\
-        CFLAGS="-O1 -g -w -U_FORTIFY_SOURCE -fno-stack-protector -Wno-error" \\
-        2>&1 && echo "CONFIGURE_OK") || \\
-    (echo "=== Strategy 3: Bare-minimum configure ===" && \\
-     rm -rf /build/{build_dir}/* && \\
-     ../{source_dir}/configure \\
-        --prefix={install_prefix} \\
-        --disable-werror \\
-        --disable-sanity-checks \\
-        --disable-profile \\
-        --disable-build-nscd \\
-        --disable-nscd \\
-        CC="gcc" \\
-        CFLAGS="-O0 -g -w -U_FORTIFY_SOURCE -fno-stack-protector -Wno-error -std=gnu99 -fgnu89-inline -fno-strict-aliasing" \\
-        2>&1 && echo "CONFIGURE_OK") || \\
-    (echo "=== All configure strategies failed ===" && \\
-     echo "--- configure error (last 20 lines) ---" && \\
-     grep -i "error\\|fail\\|cannot\\|not found\\|unsupported" config.log 2>/dev/null | tail -20 && \\
-     echo "--- config.log tail ---" && tail -50 config.log 2>/dev/null && \\
-     exit 1)
-
-# Capture make's REAL exit code. The output is redirected to a log file (not
-# piped to tail) because the container shell is /bin/sh (dash), where `$?`
-# after `make ... | tail` is tail's exit code (always 0) and `set -o pipefail`
-# is unavailable — that masked failed glibc builds as success. We grab `$?`
-# straight after make, then tail the log for the build trace.
-RUN make -j$(nproc) -k > /build/make.log 2>&1; \\
-    echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; \\
-    tail -20 /build/make.log; \\
-    echo "Build completed (errors may be non-fatal)"
-
-RUN make install -k > /build/make_install.log 2>&1; \\
-    echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status; \\
-    tail -20 /build/make_install.log; \\
-    echo "Install completed"
-
-# Best-effort: generate common locales into the project glibc's OWN locale
-# store using the build's OWN localedef + the in-tree locale/charmap sources.
-# The project glibc (configured --prefix={install_prefix}) reads
-# {install_prefix}/lib/locale, which ships only C/POSIX — so locale-dependent
-# PoCs (setlocale/strcoll/strxfrm) abort with "setlocale failed" before reaching
-# the bug. Using the build's own localedef avoids any cross-version archive
-# incompatibility. General: a fixed common locale set, no per-CVE knowledge.
-RUN if [ -x {install_prefix}/bin/localedef ]; then \\
-        mkdir -p {install_prefix}/lib/locale; \\
-        I18N=/build/{source_dir}/localedata; \\
-        for loc in en_US en_GB de_DE fr_FR es_ES it_IT ja_JP zh_CN ru_RU C; do \\
-            I18NPATH=$I18N {install_prefix}/bin/localedef -i $loc -f UTF-8 $loc.UTF-8 2>/dev/null || true; \\
-        done; \\
-        for loc in en_US en_GB de_DE fr_FR; do \\
-            I18NPATH=$I18N {install_prefix}/bin/localedef -i $loc -f ISO-8859-1 $loc.ISO-8859-1 2>/dev/null || true; \\
-        done; \\
-        echo "Project locales now available:"; \\
-        {install_prefix}/bin/locale -a 2>/dev/null | head -25 || true; \\
-    else \\
-        echo "No project localedef found — skipping locale generation"; \\
-    fi; true
-
-# Verify build produced usable output and record a DEFINITIVE marker of whether
-# the project libc was actually installed into the prefix. PROJECT_BUILD/INSTALL
-# exit codes can be 0 even when -k skipped a fatal target, so the presence of
-# {install_prefix}/lib/libc.so.6 is the ground-truth signal that the source tree
-# is patch-validatable (the honesty gate then confirms the PoC links it).
-RUN ls -la {install_prefix}/lib/ 2>/dev/null || echo "WARNING: lib/ not found"; \\
-    echo "=== Build artifacts ===" && find {install_prefix} -name "*.so*" 2>/dev/null | head -20; \\
-    if ls {install_prefix}/lib/libc.so.6 >/dev/null 2>&1 || ls {install_prefix}/lib*/libc.so.6 >/dev/null 2>&1; then \\
-        echo "PROJECT_LIBC_INSTALLED=yes" >> /build/build_status; \\
-        echo "Project libc installed: OK"; \\
-    else \\
-        echo "PROJECT_LIBC_INSTALLED=no" >> /build/build_status; \\
-        echo "WARNING: project libc.so.6 NOT found in {install_prefix} — build did not produce a usable libc"; \\
-    fi
+# Project-supplied build recipe (phase1.build_script). It configures + builds +
+# installs the project at the vulnerable commit and MUST write the
+# /build/build_status markers PROJECT_BUILD_EXIT_CODE / PROJECT_INSTALL_EXIT_CODE
+# / PROJECT_BUILD_INSTALLED that Phase 1/3 read. The recipe reads $BUILD_ARCH for
+# any 32-bit (i386) handling — no arch logic lives in this code. There are NO
+# build-system/compiler commands here; a project with no build_script gets a
+# stub that fails loudly.
+COPY build.sh /build.sh
+RUN bash /build.sh
 '''
 
     # Language-specific Dockerfile sections
+    # C PoCs: the compile/link against the project build + the honesty marker are
+    # PROJECT-SPECIFIC (glibc links the PoC against {install_prefix}/lib through
+    # the project loader), so they live in the project-supplied poc_prepare.sh
+    # (phase1.poc_prepare_script) — NOT in this code. The pipeline only stages the
+    # PoC + any alternatives/companions into /poc, exports the env contract, and
+    # runs the recipe; the recipe produces /poc/exploit and writes
+    # /poc/.ssd_poc_uses_build. {alt_copies}/{companion_copies} are COPY lines the
+    # generator fills in; {poc_alts}/{poc_companions} are the space-separated
+    # filenames passed to the recipe.
     CVE_DOCKERFILE_C = '''
-# Copy PoC source (C)
+# Copy primary PoC source (C) + any alternatives/companions into /poc.
 COPY {poc_filename} /poc/exploit_raw.c
+{alt_copies}{companion_copies}WORKDIR /poc
 
-# Validate and prepare PoC source file
-# Some auto-extracted PoCs may be code fragments rather than complete programs.
-# Use a broad regex to detect any form of main() declaration, including:
-#   int main(void), main (void), main(const int ...), void main(), etc.
-WORKDIR /poc
-RUN if grep -qE '^[[:space:]]*(int|void)?[[:space:]]*main[[:space:]]*\\(' /poc/exploit_raw.c; then \\
-        echo "PoC has main() - using as-is"; \\
-        cp /poc/exploit_raw.c /poc/exploit.c; \\
-    else \\
-        echo "WARNING: PoC missing main() - wrapping in test harness"; \\
-        echo '/* Auto-generated wrapper for PoC code fragment */' > /poc/exploit.c; \\
-        echo '#include <stdio.h>' >> /poc/exploit.c; \\
-        echo '#include <stdlib.h>' >> /poc/exploit.c; \\
-        echo '#include <string.h>' >> /poc/exploit.c; \\
-        echo '#include <unistd.h>' >> /poc/exploit.c; \\
-        echo '' >> /poc/exploit.c; \\
-        cat /poc/exploit_raw.c >> /poc/exploit.c; \\
-        echo '' >> /poc/exploit.c; \\
-        echo 'int main(int argc, char *argv[]) {{' >> /poc/exploit.c; \\
-        echo '    puts("PoC code fragment loaded - vulnerability path exists in binary");' >> /poc/exploit.c; \\
-        echo '    return 0;' >> /poc/exploit.c; \\
-        echo '}}' >> /poc/exploit.c; \\
-    fi
-
-# Compile PoC against vulnerable glibc with multi-strategy fallback chain
-# First, detect if the PoC uses i386 inline assembly and install 32-bit libs
-RUN if grep -qE 'int \\$0x80|%eax|%ebx|%ecx|%edx|%esi|%edi|%esp|%ebp' /poc/exploit.c 2>/dev/null; then \\
-        echo "Detected i386 inline assembly — installing 32-bit development libraries" && \\
-        dpkg --add-architecture i386 && \\
-        apt-get update -qq && \\
-        apt-get install -y gcc-multilib libc6-dev-i386 2>/dev/null || true; \\
-    fi
-# Use file-based success tracking (not shell variables) so that subshell
-# gcc compilations can reliably signal success to later strategy guards.
-RUN DYNAMIC_LINKER=$(find {install_prefix}/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
-    rm -f /poc/exploit && \\
-    echo "=== Compilation Strategy 1: Link against vulnerable glibc (all libs) ===" && \\
-    if [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include \\
-            -ldl -lpthread -lm -lrt 2>&1 || \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include \\
-            -ldl -lpthread 2>&1 || \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include \\
-            -ldl 2>&1 || \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include 2>&1 || \\
-        echo "Vulnerable glibc linking failed, trying relaxed flags..."; \\
-    fi && \\
-    if [ ! -f /poc/exploit ] && [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then \\
-        echo "=== Compilation Strategy 2: Relaxed flags (-w -fpermissive) ===" && \\
-        gcc -o exploit exploit.c -w -fpermissive \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include \\
-            -D_GNU_SOURCE \\
-            -ldl -lpthread -lm 2>&1 || \\
-        echo "Relaxed compilation also failed"; \\
-    fi && \\
-    if [ ! -f /poc/exploit ]; then \\
-        echo "=== Compilation Strategy 3: System glibc ===" && \\
-        (gcc -o exploit exploit.c -ldl -lpthread -lm -lrt 2>&1 || \\
-         gcc -o exploit exploit.c -ldl -lpthread 2>&1 || \\
-         gcc -o exploit exploit.c -ldl -lm 2>&1 || \\
-         gcc -o exploit exploit.c -ldl 2>&1 || \\
-         gcc -o exploit exploit.c -lm 2>&1 || \\
-         gcc -o exploit exploit.c 2>&1 || \\
-         gcc -o exploit exploit.c -w -fpermissive -D_GNU_SOURCE 2>&1) || \\
-        echo "System glibc compilation also failed"; \\
-    fi && \\
-    if [ ! -f /poc/exploit ]; then \\
-        echo "=== Compilation Strategy 4: C99/GNU99 mode ===" && \\
-        (gcc -std=gnu99 -o exploit exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 || \\
-         gcc -std=gnu99 -o exploit exploit.c -w -D_GNU_SOURCE 2>&1) || \\
-        echo "All C99/GNU99 strategies exhausted"; \\
-    fi && \\
-    if [ ! -f /poc/exploit ] && {{ which gcc-multilib >/dev/null 2>&1 || dpkg -l gcc-multilib 2>/dev/null | grep -q ^ii; }}; then \\
-        echo "=== Compilation Strategy 5: 32-bit (-m32) for i386 PoCs ===" && \\
-        (gcc -m32 -o exploit exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 || \\
-         gcc -m32 -o exploit exploit.c -w -D_GNU_SOURCE -ldl -lpthread 2>&1 || \\
-         gcc -m32 -o exploit exploit.c -w -D_GNU_SOURCE -ldl 2>&1 || \\
-         gcc -m32 -o exploit exploit.c -w -D_GNU_SOURCE 2>&1 || \\
-         gcc -m32 -std=gnu99 -o exploit exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1) || \\
-        echo "32-bit compilation also failed"; \\
-    fi && \\
-    if [ -f /poc/exploit ]; then \\
-        echo "SUCCESS: Exploit binary created" && file /poc/exploit; \\
-    else \\
-        echo "ERROR: Failed to compile exploit!" && \\
-        echo "=== Source file head ===" && head -30 /poc/exploit.c && \\
-        echo "=== Verbose compilation attempt ===" && \\
-        gcc -v -o exploit exploit.c -w 2>&1 || true && \\
-        exit 1; \\
-    fi
-
-# Record whether the PoC actually exercises the project build at RUNTIME.
-# The run wrapper launches the PoC through the project's OWN dynamic loader
-# (ld.so --library-path {install_prefix}/lib), so the honest question is not
-# "what did the binary link at compile time" but "does running it under that
-# loader map the project libc". We check exactly that (with an LD_LIBRARY_PATH
-# ldd fallback). When neither resolves the project build, no source patch can
-# change the PoC's behavior, so the orchestrator routes the CVE to manual
-# revision. NOTE: keep this logic in sync with read_poc_uses_build() and the
-# Phase 3 marker in patch_validator.py.
-RUN LOADER=$(find {install_prefix}/lib -maxdepth 1 -name 'ld-*.so*' 2>/dev/null | head -1); \\
-    USES=no; \\
-    if [ -n "$LOADER" ] && "$LOADER" --library-path {install_prefix}/lib --list /poc/exploit 2>/dev/null | grep -q "{install_prefix}"; then \\
-        USES=yes; \\
-    elif LD_LIBRARY_PATH={install_prefix}/lib ldd /poc/exploit 2>/dev/null | grep -q "{install_prefix}"; then \\
-        USES=yes; \\
-    fi; \\
-    echo "$USES" > /poc/.ssd_poc_uses_build; \\
-    echo "poc_uses_project_build: $USES"
+# Project-supplied PoC compile/link + honesty marker (phase1.poc_prepare_script).
+# Env: INSTALL_PREFIX + BUILD_ARCH (inherited from the image header), POC_ALTS,
+# POC_COMPANIONS. It must produce /poc/exploit and write /poc/.ssd_poc_uses_build.
+COPY poc_prepare.sh /poc_prepare.sh
+RUN POC_ALTS="{poc_alts}" POC_COMPANIONS="{poc_companions}" bash /poc_prepare.sh
 
 ENV LD_LIBRARY_PATH={install_prefix}/lib
 CMD ["/poc/exploit"]
@@ -1667,7 +1485,10 @@ CMD ["php", "/poc/exploit.php"]
                  build_dir_name: str = _DEFAULT_BUILD_DIR_NAME,
                  install_prefix: str = _DEFAULT_INSTALL_PREFIX,
                  docker_platform: str = None,
-                 poc_run_env: Optional[Dict[str, Any]] = None):
+                 poc_run_env: Optional[Dict[str, Any]] = None,
+                 build_script: str = None,
+                 poc_prepare_script: str = None,
+                 poc_launch_script: str = None):
         self.client = docker_client
         self.logger = logger
         self.build_timeout = build_timeout
@@ -1675,6 +1496,16 @@ CMD ["php", "/poc/exploit.php"]
         self.build_dir_name = build_dir_name
         self.install_prefix = install_prefix
         self.docker_platform = docker_platform
+        # Project-supplied standard build recipe (Phase 0 YAML phase1.build_script),
+        # run as build.sh in every CVE image. The ONLY place build-system/compiler
+        # commands live; empty → a loud-failure stub (no project defaults in code).
+        self.build_script: str = build_script or ""
+        # Project-supplied PoC compile/link recipe (compiled-language PoCs). The
+        # ONLY place compiler commands live; empty → loud-failure stub.
+        self.poc_prepare_script: str = poc_prepare_script or ""
+        # Project-supplied launch setup for compiled PoCs (loader-prefix model);
+        # empty → run the binary directly with LD_LIBRARY_PATH=$RUN_LIB.
+        self.poc_launch_script: str = poc_launch_script or ""
         # Project-configured environment for PoC execution (Phase 0 YAML
         # phase1.poc_run_env). Generic: the pipeline bakes these exports into the
         # run wrapper without any built-in project knowledge. Lets a project
@@ -1712,6 +1543,14 @@ CMD ["php", "/poc/exploit.php"]
         hasher.update(json.dumps(
             self.poc_run_env or {}, sort_keys=True, separators=(",", ":"), default=str
         ).encode("utf-8"))
+        # The project build recipe is baked into the image (build.sh), so a change
+        # to it MUST invalidate the cached image — otherwise a stale image built
+        # with the old recipe would be silently reused.
+        hasher.update((self.build_script or "").encode("utf-8"))
+        # Likewise the PoC prepare/compile recipe (poc_prepare.sh) is baked in.
+        hasher.update((self.poc_prepare_script or "").encode("utf-8"))
+        # The compiled-PoC launch snippet is baked into the run wrapper.
+        hasher.update((self.poc_launch_script or "").encode("utf-8"))
         return hasher.hexdigest()
 
     def _generate_dockerfile(self, vuln: VulnerabilityInfo, base_image_tag: str,
@@ -1756,65 +1595,33 @@ CMD ["php", "/poc/exploit.php"]
             build_dir=self.build_dir_name,
             install_prefix=self.install_prefix,
             docker_platform=self.docker_platform or '',
+            build_arch=build_arch or "amd64",
         )
 
-        # 32-bit (i386) arch fallback: build the project glibc and compile the
-        # PoC as 32-bit for bugs that only manifest on 32-bit (integer-overflow
-        # width, i686 multiarch asm). Applied as targeted transforms so the
-        # amd64 path — the common case — is byte-for-byte unchanged. Requires a
-        # multilib base image (gcc-multilib + libc6-dev-i386, installed in v3).
-        if (build_arch or "amd64") == "i386":
-            # Configure the project build 32-bit: force the i686 host triplet and
-            # -m32 into every configure strategy's CC/CFLAGS.
-            header = header.replace('CC="gcc', 'CC="gcc -m32')
-            header = header.replace('CFLAGS="', 'CFLAGS="-m32 ')
-            header = header.replace(
-                f'--prefix={self.install_prefix} ',
-                f'--prefix={self.install_prefix} --host=i686-linux-gnu --build=i686-linux-gnu ',
-            )
+        # For compiled (C) PoCs, stage the primary PoC plus any alternatives and
+        # companion/helper files into /poc and hand their names to the project's
+        # poc_prepare.sh via the POC_ALTS / POC_COMPANIONS env. The recipe owns the
+        # compile/link, the alt fallback, the companion build, the i386 (-m32)
+        # handling (via $BUILD_ARCH) and the honesty marker — none of which live in
+        # this code anymore. Interpreted-language templates ignore these (they have
+        # no such placeholders; str.format drops the extra kwargs).
+        alt_copies = companion_copies = poc_alts = poc_companions = ""
+        if lang == 'c':
+            if alt_poc_filenames:
+                alt_copies = "".join(f"COPY {a} /poc/{a}\n" for a in alt_poc_filenames)
+                poc_alts = " ".join(alt_poc_filenames)
+            if companion_filenames:
+                companion_copies = "".join(f"COPY {c} /poc/{c}\n" for c in companion_filenames)
+                poc_companions = " ".join(companion_filenames)
 
         body = template.format(
             poc_filename=poc_filename,
             install_prefix=self.install_prefix,
+            alt_copies=alt_copies,
+            companion_copies=companion_copies,
+            poc_alts=poc_alts,
+            poc_companions=poc_companions,
         )
-
-        # Append COPY + fallback compilation for alternative PoC files
-        if alt_poc_filenames and lang == 'c':
-            alt_section = self._generate_alt_poc_section(alt_poc_filenames)
-            # When alternatives exist, the primary compilation step must NOT
-            # 'exit 1' on failure — otherwise the build stops before the alt
-            # fallback step runs.  Replace the exit-1 block with a soft warning.
-            body = body.replace(
-                'echo "ERROR: Failed to compile exploit!" && \\\n'
-                '        echo "=== Source file head ===" && head -30 /poc/exploit.c && \\\n'
-                '        echo "=== Verbose compilation attempt ===" && \\\n'
-                '        gcc -v -o exploit exploit.c -w 2>&1 || true && \\\n'
-                '        exit 1; \\',
-                'echo "WARNING: Primary PoC failed to compile — trying alternatives..."; \\'
-            )
-            # Insert alt section BEFORE the final ENV/CMD lines
-            env_marker = '\nENV LD_LIBRARY_PATH='
-            idx = body.rfind(env_marker)
-            if idx != -1:
-                body = body[:idx] + '\n' + alt_section + body[idx:]
-
-        # 32-bit arch fallback: compile the PoC -m32 so it links the 32-bit
-        # project glibc. Done before the companion section is inserted so only
-        # the main-PoC compile commands are rewritten (companions keep their own
-        # arch handling). C PoCs only.
-        if (build_arch or "amd64") == "i386" and lang == 'c':
-            body = body.replace('gcc -o exploit', 'gcc -m32 -o exploit')
-            body = body.replace('gcc -std=gnu99 -o exploit', 'gcc -m32 -std=gnu99 -o exploit')
-
-        # Append COPY + compilation for companion/helper files (multi-file PoCs).
-        if companion_filenames:
-            companion_section = self._generate_companion_section(companion_filenames)
-            env_marker = '\nENV LD_LIBRARY_PATH='
-            idx = body.rfind(env_marker)
-            if idx != -1:
-                body = body[:idx] + '\n' + companion_section + body[idx:]
-            else:
-                body = body + '\n' + companion_section
 
         self.logger.info(f"Generated {lang} Dockerfile for {vuln.cve}"
                          + (f" [arch={build_arch}]" if build_arch != 'amd64' else ''))
@@ -1927,40 +1734,34 @@ CMD ["php", "/poc/exploit.php"]
         ]
 
         if is_c_poc:
-            # Replace every ./exploit invocation with the loader-prefixed form.
-            # $LOADER_PREFIX is empty when the binary already embeds the project
-            # loader (see PT_INTERP check below), so this collapses to a direct
-            # ./exploit run in that case.
-            exec_loader = exec_wrap.replace("./exploit", "$LOADER_PREFIX ./exploit")
+            # Replace every ./exploit invocation with the launch-prefixed form.
+            # $SSD_EXEC_PREFIX is empty for a direct run (the project launch
+            # snippet decides), so this collapses to a plain ./exploit when so.
+            exec_loader = exec_wrap.replace("./exploit", "$SSD_EXEC_PREFIX ./exploit")
+            # Project-supplied launch setup (phase1.poc_launch_script). Given the
+            # built /poc/exploit and $RUN_LIB it sets $SSD_EXEC_PREFIX (launch
+            # prefix; empty = direct) and may override $SSD_LD_LIBRARY_PATH. The
+            # glibc recipe runs the PoC through the project's own ld.so so the
+            # freshly-built loader+libc are exercised regardless of how the binary
+            # linked. No recipe → run directly with LD_LIBRARY_PATH=$RUN_LIB. The
+            # "how to reach the project build" decision carries NO project
+            # knowledge in this code anymore.
+            launch_lines = (self.poc_launch_script.splitlines()
+                            if self.poc_launch_script.strip() else
+                            ["# (no project launch recipe — run the binary directly)"])
             exec_lines = [
-                "# 2. Execution — run the C PoC against the project glibc, unprivileged.",
+                "# 2. Execution — run the compiled PoC against the project build, unprivileged.",
                 "echo '--- Running exploit ---'",
                 f"RUN_LIB='{lib_path}'",
-                "LOADER=$(find \"$RUN_LIB\" -maxdepth 1 -name 'ld-*.so*' 2>/dev/null | head -1)",
-                "# Decide HOW to reach the project glibc. If the binary's ELF",
-                "# interpreter (PT_INTERP) already points into the project build",
-                "# (compile baked -Wl,--dynamic-linker + rpath), run it DIRECTLY so",
-                "# argv[0] and any self-re-exec (/proc/self/exe) stay correct — LPE",
-                "# PoCs that re-invoke themselves break under an explicit 'ld.so",
-                "# ./exploit'. Otherwise (system/empty interpreter, e.g. a compile",
-                "# fallback or a runtime-built driver) force the project loader so",
-                "# the project libc is still exercised. General, no per-CVE logic.",
-                "INTERP=$(readelf -l /poc/exploit 2>/dev/null | "
-                "sed -n 's/.*program interpreter: \\(.*\\)]/\\1/p' | head -1)",
-                "case \"$INTERP\" in",
-                "    \"$RUN_LIB\"/*) LOADER_PREFIX=; "
-                "echo \"  PoC uses project interpreter ($INTERP) — running directly\" ;;",
-                "    *) if [ -n \"$LOADER\" ] && [ -x \"$LOADER\" ]; then "
-                "LOADER_PREFIX=\"$LOADER --library-path $RUN_LIB\"; "
-                "echo \"  Forcing project loader (binary interpreter: ${INTERP:-none})\"; "
-                "else LOADER_PREFIX=; fi ;;",
-                "esac",
+                "SSD_EXEC_PREFIX=",
+                'SSD_LD_LIBRARY_PATH="$RUN_LIB"',
+                *launch_lines,
                 f"POC_USER='{_POC_RUN_USER}'",
                 "# Materialize the exploit invocation into a script so dropping",
                 "# privileges (su) does not mangle quoting / redirection / pipes.",
                 "cat > /poc/.ssd_run.sh <<EOF",
                 "cd /poc",
-                "export LD_LIBRARY_PATH=$RUN_LIB",
+                "export LD_LIBRARY_PATH=$SSD_LD_LIBRARY_PATH",
                 *env_exports,
                 exec_loader,
                 "EOF",
@@ -2028,85 +1829,6 @@ CMD ["php", "/poc/exploit.php"]
             'CMD ["/bin/bash", "/poc/wrapper.sh"]\n'
         )
 
-    def _generate_alt_poc_section(self, alt_poc_filenames: List[str]) -> str:
-        """Generate Dockerfile snippet that tries alternative PoC files if the
-        primary one failed to compile."""
-        lines = [
-            '',
-            '# === Alternative PoC fallback ===',
-            '# If the primary PoC failed to compile, try each alternative in turn.',
-        ]
-        for alt_name in alt_poc_filenames:
-            lines.append(f'COPY {alt_name} /poc/{alt_name}')
-        # Build a single RUN that tries each alternative with the full strategy chain
-        lines.append('RUN if [ ! -f /poc/exploit ]; then \\')
-        for i, alt_name in enumerate(alt_poc_filenames):
-            lines.append(f'    echo "=== Trying alternative PoC: {alt_name} ===" && \\')
-            lines.append(f'    cp /poc/{alt_name} /poc/exploit.c && \\')
-            lines.append( '    (gcc -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 || \\')
-            lines.append( '     gcc -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl -lpthread 2>&1 || \\')
-            lines.append( '     gcc -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl 2>&1 || \\')
-            lines.append( '     gcc -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE 2>&1 || \\')
-            lines.append( '     gcc -m32 -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 || \\')
-            lines.append( '     gcc -std=gnu99 -o /poc/exploit /poc/exploit.c -w -D_GNU_SOURCE -ldl -lpthread -lm 2>&1 || \\')
-            lines.append( '     true) && \\')
-            if i < len(alt_poc_filenames) - 1:
-                lines.append( '    if [ -f /poc/exploit ]; then echo "SUCCESS: Compiled alternative PoC"; fi && \\')
-                lines.append( '    if [ ! -f /poc/exploit ]; then \\')
-        # Final check
-        lines.append( '    if [ -f /poc/exploit ]; then \\')
-        lines.append( '        echo "SUCCESS: Compiled alternative PoC" && file /poc/exploit; \\')
-        lines.append( '    else \\')
-        lines.append( '        echo "ERROR: All alternative PoCs also failed to compile" && exit 1; \\')
-        lines.append( '    fi; \\')
-        # Close nested if blocks
-        for i in range(len(alt_poc_filenames) - 1):
-            lines.append( '    fi; \\')
-        lines.append( 'fi')
-        lines.append('')
-        return '\n'.join(lines) + '\n'
-    
-    def _generate_companion_section(self, companion_filenames: List[str]) -> str:
-        """Dockerfile snippet that stages + builds companion helper files.
-
-        Some real-world PoCs are multi-file: the main exploit invokes a helper it
-        expects to find next to itself (e.g. CVE-2014-5119's `popen("./pty")`).
-        The pipeline stages such helpers from a per-CVE directory
-        ``exploits/<CVE>.d/`` (general convention, no per-CVE code): every file is
-        copied into /poc/, each C/C++ source is compiled to a binary of the same
-        stem (so ``./pty`` resolves to a built ``pty``), and scripts are made
-        executable. A helper that fails to build is a soft warning — the main PoC
-        still runs and the negative filter reports any missing-helper error.
-        """
-        lines = ['', '# === Companion / helper files (multi-file PoC support) ===']
-        for name in companion_filenames:
-            lines.append(f'COPY {name} /poc/{name}')
-        cmds: List[str] = []
-        for name in companion_filenames:
-            low = name.lower()
-            stem = name.rsplit('.', 1)[0]
-            if low.endswith('.c'):
-                cmds.append(
-                    f'(gcc -O0 -g -w -o /poc/{stem} /poc/{name} -ldl -lpthread -lm 2>&1 || '
-                    f'gcc -O0 -g -w -o /poc/{stem} /poc/{name} 2>&1 || '
-                    f'echo "WARN: companion {name} failed to build")'
-                )
-            elif low.endswith(('.cpp', '.cc', '.cxx', '.c++')):
-                cmds.append(
-                    f'(g++ -O0 -g -w -o /poc/{stem} /poc/{name} 2>&1 || '
-                    f'echo "WARN: companion {name} failed to build")'
-                )
-            elif low.endswith(('.sh', '.py', '.pl', '.rb')):
-                cmds.append(f'chmod +x /poc/{name} 2>/dev/null || true')
-        if cmds:
-            lines.append('RUN cd /poc && \\')
-            for i, c in enumerate(cmds):
-                # NOTE: keep the backslash OUT of the f-string expression — a
-                # backslash inside `{...}` is a SyntaxError on Python < 3.12
-                # (the VM runs 3.10). Build the continuation separately.
-                cont = " && \\" if i < len(cmds) - 1 else ""
-                lines.append(f'    {c}{cont}')
-        return '\n'.join(lines) + '\n'
 
     # =========================================================================
     # Option A — in-tree regression-test image (poc_language == "intree-test")
@@ -2371,7 +2093,41 @@ CMD ["/run_intree_test.sh"]
                 build_arch=vuln.build_arch,
             )
             (build_context / "Dockerfile").write_text(dockerfile_content)
-            
+
+            # Project-supplied build recipe (phase1.build_script). The Dockerfile
+            # header COPYs build.sh and runs it under the generic env contract.
+            # No recipe configured → a stub that fails the build loudly, instead
+            # of silently producing a project with no installed libs (which would
+            # mislead the honesty gate). No project-specific defaults in code.
+            if self.build_script.strip():
+                build_sh = self.build_script
+            else:
+                self.logger.error(
+                    "phase1.build_script is not configured for this project — "
+                    "the CVE image cannot build the project at the vulnerable commit"
+                )
+                build_sh = (
+                    "#!/bin/bash\n"
+                    "echo 'ERROR: no phase1.build_script configured for this project' >&2\n"
+                    "exit 1\n"
+                )
+            (build_context / "build.sh").write_text(build_sh)
+
+            # Project-supplied PoC compile/link recipe (phase1.poc_prepare_script),
+            # COPY'd + run by the C template. Always staged (harmless for
+            # interpreted templates, which don't COPY it); a missing recipe yields
+            # a loud-failure stub so a compiled PoC can't silently skip its build.
+            if self.poc_prepare_script.strip():
+                poc_prepare_sh = self.poc_prepare_script
+            else:
+                poc_prepare_sh = (
+                    "#!/bin/bash\n"
+                    "echo 'ERROR: no phase1.poc_prepare_script configured for this project' >&2\n"
+                    "echo no > /poc/.ssd_poc_uses_build\n"
+                    "exit 1\n"
+                )
+            (build_context / "poc_prepare.sh").write_text(poc_prepare_sh)
+
             # Build
             image, build_logs = _docker_build(
                 self.client, str(build_context), tag,
@@ -2443,7 +2199,8 @@ class ImageManifest:
                       baseline_exit_code: Optional[int] = None,
                       needs_manual_revision: bool = False,
                       poc_uses_project_build: Optional[str] = None,
-                      baseline_cache_key: Optional[str] = None):
+                      baseline_cache_key: Optional[str] = None,
+                      sast_baseline: Optional[List[Dict[str, Any]]] = None):
         """Record a CVE image entry.
 
         ``baseline_exit_code`` is the PoC exit code captured on the
@@ -2476,6 +2233,11 @@ class ImageManifest:
             # the flag lets Phase 3 log/branch on it).
             "needs_privileged": getattr(vuln, "needs_privileged", False),
             "build_arch": getattr(vuln, "build_arch", "amd64"),
+            # SAST findings on the UNPATCHED vulnerable file (the Phase 3
+            # baseline). Phase 3 classifies its patched-file findings against
+            # this so only patch-introduced ("new") issues fail validation;
+            # pre-existing debt is documented, not penalised.
+            "sast_baseline": sast_baseline or [],
             "created_at": datetime.now().isoformat(),
         }
         for i, existing in enumerate(self.data["cve_images"]):
@@ -3516,6 +3278,11 @@ class PipelineOrchestrator:
         raw_cfg = _load_phase0_config(phase0_config_path)
         self._p1 = _resolve_phase1_settings(raw_cfg, self.base_dir)
         self._arch_fallback_enabled = bool(self._p1.get("enable_arch_fallback", True))
+        # SAST baseline (methodology: Phase 3 scores only the patch's delta).
+        # Phase 1 runs the SAME configured tools on the UNPATCHED vulnerable file
+        # and stores the findings in the manifest as the baseline.
+        self._sast_config = load_sast_config(phase0_config_path=phase0_config_path)
+        self._skip_sast = getattr(args, 'skip_sast', False) or not self._sast_config.enabled
         # Phase 1 determinism guard: run the baseline PoC multiple times and
         # require agreement before trusting the exit code (kills flaky baselines).
         self._baseline_runs, self._baseline_min_agree = _load_baseline_policy()
@@ -3591,6 +3358,9 @@ class PipelineOrchestrator:
             install_prefix=self._p1["install_prefix"],
             docker_platform=self._p1.get("docker_platform"),
             poc_run_env=self._p1.get("poc_run_env", {}),
+            build_script=self._p1.get("build_script"),
+            poc_prepare_script=self._p1.get("poc_prepare_script"),
+            poc_launch_script=self._p1.get("poc_launch_script"),
         )
         self._manifest = ImageManifest(self._p1["image_manifest_path"], self.logger)
         self.poc_analyzer = PoCAnalyzer(self.logger)
@@ -3722,14 +3492,20 @@ class PipelineOrchestrator:
             
             result = self._process_vulnerability_phase0(vuln)
             self.report_gen.add_result(result)
-            
+
             status = "success" if result.vulnerability_reproduced else result.status
+            # SAST baseline: scan the UNPATCHED vulnerable file so Phase 3 can
+            # classify its patched-file findings against it (only reproduced CVEs
+            # reach Phase 3, so don't pay for the others).
+            sast_baseline = (self._capture_sast_baseline(vuln)
+                             if result.vulnerability_reproduced else [])
             self._manifest.add_cve_image(
                 vuln, vuln.cve_image_tag, status,
                 baseline_exit_code=result.baseline_exit_code,
                 needs_manual_revision=result.needs_manual_revision,
                 poc_uses_project_build=result.poc_uses_project_build,
                 baseline_cache_key=result.baseline_cache_key,
+                sast_baseline=sast_baseline,
             )
             
             self.logger.info(f"Completed {vuln.cve}: {result.status} (duration: {result.execution_time_seconds:.1f}s)")
@@ -4102,6 +3878,53 @@ class PipelineOrchestrator:
             result.execution_time_seconds = (datetime.now() - start_time).total_seconds()
         return result
 
+    def _capture_sast_baseline(self, vuln: VulnerabilityInfo) -> List[Dict[str, Any]]:
+        """Run the configured SAST tools on the UNPATCHED vulnerable file and
+        return the findings (the Phase 3 baseline).
+
+        The vulnerable file is read with ``git show <commit>:<path>`` — the
+        checked-out commit IS the vulnerable state (see the CVE Dockerfile), and
+        it's the same file Phase 2 patches. Host-side, project-agnostic; failures
+        degrade to an empty baseline (Phase 3 then treats all findings as new).
+        """
+        if self._skip_sast:
+            return []
+        if not (vuln.file_path and vuln.commit_hash):
+            self.logger.warning(
+                f"SAST baseline skipped for {vuln.cve}: missing file_path/commit_hash")
+            return []
+        repo = self._p1.get("project_repo_path")
+        if not (repo and Path(repo).exists()):
+            self.logger.warning(f"SAST baseline skipped for {vuln.cve}: repo not present")
+            return []
+        try:
+            show = subprocess.run(
+                ["git", "-C", str(repo), "show", f"{vuln.commit_hash}:{vuln.file_path}"],
+                capture_output=True, text=True, timeout=60)
+            if show.returncode != 0 or not show.stdout:
+                self.logger.warning(
+                    f"SAST baseline: cannot read {vuln.file_path}@{vuln.short_commit} "
+                    f"for {vuln.cve} (git show rc={show.returncode})")
+                return []
+            suffix = Path(vuln.file_path).suffix or ".c"
+            tmp = None
+            try:
+                with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False,
+                                                 encoding="utf-8") as tf:
+                    tf.write(show.stdout)
+                    tmp = Path(tf.name)
+                findings = sast_runner.run_sast_file(tmp, self._sast_config, self.logger)["findings"]
+                self.logger.info(
+                    f"SAST baseline for {vuln.cve}: {len(findings)} finding(s) on "
+                    f"unpatched {vuln.file_path}")
+                return findings
+            finally:
+                if tmp:
+                    tmp.unlink(missing_ok=True)
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(f"SAST baseline failed for {vuln.cve}: {e}")
+            return []
+
     def _process_vulnerability_phase0(self, vuln: VulnerabilityInfo) -> ExecutionResult:
         """Process a CVE using Phase 0 optimized path (derived CVE images)."""
         start_time = datetime.now()
@@ -4251,7 +4074,7 @@ class PipelineOrchestrator:
                 return result
 
             build_status = self.docker_mgr.read_build_status(vuln.cve_image_tag)
-            if build_status.get("PROJECT_LIBC_INSTALLED") == "no":
+            if build_status.get("PROJECT_BUILD_INSTALLED") == "no":
                 status_bits = []
                 for key in ("PROJECT_BUILD_EXIT_CODE", "PROJECT_INSTALL_EXIT_CODE"):
                     if build_status.get(key):

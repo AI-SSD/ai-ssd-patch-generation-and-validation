@@ -292,20 +292,32 @@ class IterativeFeedbackLoop:
     
     def _get_patch_content(self, cve_id: str, model_name: str) -> str:
         """Get the content of the initial patch."""
-        model_safe = model_name.replace(":", "_").replace(".", "_")
+        # Use the SAME sanitization patch_generator used to WRITE the dir.
+        # sanitize_model_name replaces ':' and '/', NOT '.', so the dir is e.g.
+        # "gpt-4.1-mini". The old inline ".replace('.', '_')" looked in
+        # "gpt-4_1-mini" (which never exists) and silently returned "" — masking
+        # the previous-patch context (and crashing once the fallback used
+        # iterdir() on the missing dir). Mirrors _generate_patch_with_feedback.
+        model_safe = self.patch_generator.sanitize_model_name(model_name)
         patches_dir = self.config.base_dir / "patches" / cve_id / model_safe
-        
-        # Find the function-only file
-        for f in patches_dir.glob("*_function_only.c"):
+        if not patches_dir.is_dir():
+            return ""
+
+        # Find the function-only file (any language extension, not just .c)
+        for f in sorted(patches_dir.glob("*_function_only.*")):
             with open(f, 'r') as file:
                 return file.read()
-        
-        # Fallback to main patch file
-        for f in patches_dir.glob("*.c"):
-            if "_invalid" not in f.name and "_function_only" not in f.name:
-                with open(f, 'r') as file:
-                    return file.read()
-        
+
+        # Fallback to the main patch file: any source file that isn't an
+        # _invalid/_function_only artifact or a metadata/raw-response sidecar.
+        for f in sorted(patches_dir.iterdir()):
+            if not f.is_file() or f.suffix in (".txt", ".json"):
+                continue
+            if "_invalid" in f.name or "_function_only" in f.name:
+                continue
+            with open(f, 'r') as file:
+                return file.read()
+
         return ""
     
     def _generate_patch_with_feedback(
