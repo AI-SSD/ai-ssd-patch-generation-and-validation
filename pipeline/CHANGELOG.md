@@ -4,6 +4,55 @@ All notable changes to the AI-SSD Patch Generation & Validation Pipeline will be
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project loosely adheres to Semantic Versioning principles.
 
+## [Unreleased] - 2026-06-25
+
+Consolidates all work since 0.3.7: the methodology v2/v3 deterministic-baseline reproduction model, multi-project expansion, configurable SAST, benchmarking/provider infrastructure, dashboard, notifications, and Phase 0 parallelization.
+
+### Added
+
+- **Multi-project support (12 C/C++ projects + Apache Tomcat/Java).** New Phase 0 configs for `expat`, `ffmpeg`, `file`, `gnutls`, `libtasn1`, `libtiff`, `libxml2`, `openssl`, `pcre2`, and `tcpdump`, plus `tomcat` (Apache Tomcat, Java) alongside `glibc` and `kernel` (a generic `aggregator_config.yaml` template is also provided). Targeting a new project needs only a YAML config — no Python changes.
+- **Dual reproduction oracle (`reproduction_strategy`).** Besides ExploitDB PoCs, Phase 0 can harvest the regression test the fixing commit ships and use it as a reproduction artefact; Phases 1 and 3 then validate via a *fail-to-pass* oracle (the test fails on the vulnerable build and must pass on the patched build). Most shipped configs set `reproduction_strategy: [exploitdb, intree]`.
+- **Configurable, per-project SAST.** The Phase 3 tool list is declared in each project's YAML `sast:` section and executed by a tool-/format-agnostic runner (cppcheck-xml / flawfinder / SARIF / regex parsers). C projects use cppcheck + clang-tidy + semgrep + flawfinder; Tomcat (Java) uses semgrep + PMD. SAST also runs in Phase 1 to record an unpatched baseline.
+- **Benchmarking & provider infrastructure.** LLM provider profiles under `profiles/`, batch runners (`run_matrix.sh` / `run_all.sh`), and supporting docs (`documentation/benchmarking.md`).
+- **Results dashboard** (`dashboard.py` / `dashboard_server.py` / `dashboard.sh`):
+  - Per-phase live-progress cards updated in real time via per-phase `.live_progress_p{N}.json` heartbeat files (`cve_aggregator/utils/live_progress.py`); the overlay prefers the heartbeat over stale/absent final artifacts by mtime.
+  - Per-phase manual-review UI (`/manual` route): edit/approve/discard/retry/proceed workflow; the Start form enables or skips manual review independently per phase. Marker-file IPC drives a polling orchestrator gate; live-run-safe defaults (`auto_skip=true`, `phase1_gate=false`) via ENV transport.
+  - Run control: start/stop/pause via PGID signals to `run_all.sh` (`dashboard_control.py`).
+  - Selective data and Docker deletion scoped to project × profile × phase, with a preview→token→apply fail-safe.
+  - nginx basic-auth + CSRF/localhost gate.
+- **Push notifications (`master_pipeline/notify.py`).** ntfy-based two-layer system: `run_all.sh` (run/stage/project/cell) and `master_pipeline/notify.py` (per-phase). Granularity toggles and issue-always-send behavior driven by one `config.yaml notifications:` block.
+- **LLM compatibility layer (`cve_aggregator/utils/llm_compat.py`).** Centralizes provider-specific parameter normalization (e.g., stripping `temperature` for gpt-5/o-series models that reject non-default values). Wired into `poc_repair.py` and `poc_analyzer.py`.
+- **Phase 1 readiness utility (`cve_aggregator/utils/phase1_readiness.py`).** Checks that Phase 0 artifacts are present and well-formed before Phase 1 is launched.
+- **Vulnerable-commit metadata in Phase 0 CSV.** Phase 0 now records `V_COMMIT_TIMESTAMP` and `V_COMMIT_YEAR` so later phases can reuse commit-era information without re-querying git.
+- **In-memory commit message index** (`build_commit_message_index` in `cve_aggregator/utils/git_utils.py`): avoids repeated `git log --grep` subprocesses, dramatically reducing commit-search latency on large repos.
+- **Setup utilities reorganized under `pipeline/setup/`** (`setup.sh`, `verify_setup.sh`, `fix_containerd.sh`); scripts now resolve the pipeline root correctly after the move.
+- **API key fallback loading.** `NVD_API_KEY` / `OPENAI_API_KEY` are loaded from repo-root secret files (`pipeline/API-openai-key`, `pipeline/API-nvd-key`) when environment variables and YAML values are absent.
+
+### Changed
+
+- **Phase 1 reproduction model (methodology v2/v3).** Replaced the two-gate exit-`42`/`43` wrapper with a **deterministic-baseline** model: the wrapper propagates the PoC's own exit code, captured across multiple runs as the baseline signature in `image_manifest.json`, against which Phase 3 compares the patched build. A **build-linkage honesty gate** (with previous-era and 32-bit/i386 recovery rebuilds) and an **LLM negative filter** (regex fallback) guard the baseline. The legacy gate design was archived under `deprecated/` (`orchestrator_phase1_gates.py`, `poc_analyzer.py`).
+- **Era-by-version base-image selection (Gate B).** The Docker base is chosen from the checked-out tree's actual version (`version_era_map`), with the commit-date map as a fallback, so back-ported fixes build on an era-matched toolchain.
+- **SAST gating is baseline-relative.** A patch fails only on findings it *introduces* (new vs. the Phase 1 baseline); pre-existing project debt is documented but never gates.
+- **Phase 2 emits minimal SEARCH/REPLACE edits**, with per-project language and prompts (`phase2.language`, `system_prompt`).
+- **Phase 3 verdict mirrors Phase 1.** Patched-image output now passes through the same negative filter used for Phase 1 baselines; `POC_HANG` exit class is retryable; crash-class/137 exit hardening added for consistency across both phases.
+- **Phase 2 and Phase 3 consume the Phase 0 CSV path from the active configuration** instead of hardcoded `documentation/file-function.csv` paths, including master pipeline and feedback-loop wiring.
+- **`Phase0CSVParser` and `resolve_build_ubuntu_version()`** now use commit-year metadata from Phase 0 when available, improving Ubuntu-era selection; `commit_era_map` extended back to 1995.
+- **Parallelized `CommitDiscovery`**: processes CVEs via a configurable `ThreadPoolExecutor` (`commit_discovery.max_workers`).
+- **Parallelized `PoCRepairLLM`**: runs independent LLM repair calls concurrently with a configurable worker pool (`poc_repair.max_repair_workers`).
+- **Configurable performance knobs**: `commit_discovery.commit_index_timeout`, `poc_repair.local_token_rate`, `poc_repair.openai_token_rate`, and other LLM/timeout parameters; defaults preserved for backward compatibility.
+- **Cleanup coverage** now includes Phase 0 artifacts and project workspaces, with updated Docker image prefixes for the new project layout.
+- **Manual review flow** now offers a continue/skip-all option for remaining pending CVEs.
+- **Documentation cleanup**: removed stale analysis/design documents (`poc_flag_analysis.md`, `documentation/poc-validation-report.md`, `documentation/provider-profiles-design.md`, `documentation/non-c-adaptation-inventory.md`, `docs/MODULARIZATION_PLAN.md`, `docs/STAGE4_TOMCAT_DESIGN.md`).
+
+### Fixed
+
+- **Phase 3 `--phase0-config` not forwarded.** `executor.py` did not pass `--phase0-config` to `patch_validator.py`, so non-glibc Phase 3 runs silently read the glibc manifest path and returned "No Phase 1 Baseline" for every CVE. Fixed in `executor.py` and `patch_validator.py` (manifest path + SAST config resolution).
+- **Phase 2 PoC-source path.** `_find_poc_source` now resolves the exploits directory against the active `--base-dir` (a rebased `EXPLOITS_DIR`) in both the subprocess and the in-process feedback paths, so multi-project runs include the exploit in the generation prompt instead of silently dropping it.
+- **gpt-5/o-series temperature rejection.** Models in the o-series/gpt-5 family reject non-default `temperature` values; now handled centrally in `llm_compat.py` and wired into `poc_repair.py` and `poc_analyzer.py`.
+- **NVD/OpenAI key loading** now works from the relocated root secret files in addition to environment variables and config values.
+- **Master pipeline preflight** no longer requires the legacy CSV path when Phase 0 is part of the current run.
+- **Variable reference bug in failed PoC repair output**: corrected a `NameError` when writing failed PoC repairs to `manual_supervision/` (`original_code` was referenced instead of the undefined `content`), preventing empty manual-review artifacts.
+
 ## [0.3.7] - 2026-04-14
 
 ### Fixed
@@ -214,39 +263,3 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 - **Pipeline Architecture**: Successfully modularized the legacy monolithic `pipeline.py` script into the organized `master_pipeline` Python package, mirroring the modular standard set by the `cve_aggregator`.
 
-## Unreleased - 2026-05-11
-
-### Added
-
-- Phase 0 now records vulnerable commit metadata and exports `V_COMMIT_TIMESTAMP` and `V_COMMIT_YEAR` in the generated CSV so later phases can reuse commit-era information without re-querying git.
-- Setup utilities were reorganized under `pipeline/setup/` (`setup.sh`, `verify_setup.sh`, and `fix_containerd.sh`), and the scripts now resolve the pipeline root correctly after the move.
-- API key loading now falls back to repo-root secret files (`pipeline/API-openai-key` and `pipeline/API-nvd-key`) when environment variables or YAML config values are not set.
-- In-memory commit message index: added `build_commit_message_index` to `cve_aggregator/utils/git_utils.py` to avoid repeated `git log --grep` subprocesses and dramatically reduce commit-search latency on large repos.
-
-### Changed
-
-- Phase 2 and Phase 3 now consume the Phase 0 CSV path resolved from the active configuration instead of hardcoded `documentation/file-function.csv` paths, including the master pipeline and feedback-loop wiring.
-- `Phase0CSVParser` and `resolve_build_ubuntu_version()` now use commit-year metadata from Phase 0 when available, improving Ubuntu-era selection; `commit_era_map` was extended back to 1995.
-- Cleanup coverage now includes Phase 0 artifacts and project workspaces, with updated Docker image prefixes for the new project layout.
-- Manual review flow in the master pipeline now offers a continue/skip-all option for remaining pending CVEs.
-- Parallelized `CommitDiscovery`: processes CVEs using a configurable `ThreadPoolExecutor` (`commit_discovery.max_workers`) to utilize available CPU and I/O concurrency and shorten Phase 0 wall-clock time.
-- Parallelized `PoCRepairLLM`: runs independent LLM repair calls concurrently with a configurable worker pool (`poc_repair.max_repair_workers`) to avoid serial LLM call delays.
-- Made previously hardcoded values configurable: `commit_discovery.commit_index_timeout`, `poc_repair.local_token_rate`, `poc_repair.openai_token_rate`, and other LLM/timeout knobs; defaults preserved for backward compatibility.
-
-### Fixed
-
-- NVD/OpenAI key loading now works from the relocated root secret files in addition to environment variables and config values.
-- Master pipeline preflight checks no longer require the legacy CSV path when Phase 0 is part of the current run.
-- Documentation was refreshed to match the relocated setup scripts and project-agnostic pipeline layout.
-- Bugfix: corrected a variable reference when writing failed PoC repairs to `manual_supervision/` (used `original_code` rather than undefined `content`), preventing empty manual-review artifacts.
-
-### Security
-
-- `pipeline/API-openai-key` and `pipeline/API-nvd-key` are now ignored in version control and loaded from the pipeline root when present, keeping sensitive credentials out of tracked source.
-
-### Notes
-
-- All performance and concurrency parameters are configurable in `cve_aggregator/*_config.yaml` (or the global `config.yaml`) and have safe defaults so behavior is non-breaking by default.
-- These changes are modular and do not modify Phase I/O contracts; they aim to reduce Phase 0 runtime without reducing result quality.
-
-Files changed: `cve_aggregator/utils/git_utils.py`, `cve_aggregator/modules/commit_discovery.py`, `cve_aggregator/modules/poc_repair.py`
