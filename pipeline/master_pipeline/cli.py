@@ -215,7 +215,7 @@ def main():
     
     # Build configuration with feedback loop settings
     config = PipelineConfig(
-        base_dir=Path(args.base_dir),
+        base_dir=Path(args.base_dir).resolve(),
         cves=args.cves,
         models=args.models,
         phases=sorted(args.phases),

@@ -1,7 +1,10 @@
 import os
+import signal
 import subprocess
 import sys
 import logging
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -11,6 +14,34 @@ from .utils import format_duration
 from . import notify
 
 logger = logging.getLogger('pipeline')
+
+# Fallback per-phase INACTIVITY (idle) timeouts in seconds, used when config.yaml
+# has no `phase_idle_timeouts` entry for a phase. The idle watchdog kills a phase
+# only after this long with NO progress signal (neither a live_progress heartbeat
+# nor any child stdout/stderr) — unlike the hard wall-clock cap in phase_timeouts,
+# it scales to any CVE/model count because each processed item resets the clock.
+# A value must exceed the worst-case SINGLE-item silent stretch: for Phase 1/3
+# that is a cold build (~15-20 min) plus a hang-PoC baseline (3×300s) with no
+# heartbeat in between. 0 disables idle detection (hard cap only).
+_DEFAULT_IDLE_TIMEOUTS = {0: 1800, 1: 2400, 2: 1800, 3: 2400, 4: 600}
+
+# How often the watchdog re-checks liveness while a phase runs.
+_WATCHDOG_POLL_SECONDS = 10
+
+
+class _WatchdogResult:
+    """Mimics the subset of subprocess.CompletedProcess the executor reads, plus
+    the watchdog's verdict. ``kill_reason`` is None for a natural exit, "stalled"
+    when the idle watchdog fired, or "timeout" when the hard wall-clock cap fired."""
+
+    __slots__ = ("returncode", "stdout", "stderr", "kill_reason", "idle_seconds")
+
+    def __init__(self, returncode, stdout, stderr, kill_reason=None, idle_seconds=0.0):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.kill_reason = kill_reason
+        self.idle_seconds = idle_seconds
 
 class PhaseExecutor:
     """Executes individual pipeline phases."""
@@ -91,23 +122,46 @@ class PhaseExecutor:
             # not the CWD. cve_aggregator.modules.base.resolve_input_path reads this.
             env["SSD_PIPELINE_ROOT"] = root_str
 
-            process = subprocess.run(
-                cmd,
-                cwd=str(self.config.base_dir),
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=self._get_timeout(phase)
-            )
-            
+            # Run under the idle watchdog: a hard wall-clock cap (phase_timeouts)
+            # AND an inactivity cap (phase_idle_timeouts). A healthy-but-slow phase
+            # that keeps emitting progress is never killed; only a genuine stall or
+            # the hard backstop terminates it. See _run_with_watchdog.
+            process = self._run_with_watchdog(cmd, str(self.config.base_dir), env, phase)
+
             end_time = datetime.now()
             result.end_time = end_time.isoformat()
             result.duration_seconds = (end_time - start_time).total_seconds()
             result.exit_code = process.returncode
             result.stdout = process.stdout
             result.stderr = process.stderr
-            
-            if process.returncode == 0:
+
+            if process.kill_reason == "stalled":
+                idle_to = self._get_idle_timeout(phase)
+                result.status = PhaseStatus.FAILED
+                result.error_message = (
+                    f"Stalled: no progress for {process.idle_seconds:.0f}s "
+                    f"(idle timeout {idle_to}s)"
+                )
+                result.exit_code = -1
+                logger.error(
+                    f"Phase {phase} stalled — no heartbeat/output for "
+                    f"{process.idle_seconds:.0f}s (idle timeout {idle_to}s); killed"
+                )
+                notify.send("phase_failed",
+                            f"⏱ {cell} — Phase {phase} ({notify.phase_label(phase)}) "
+                            f"STALLED (no progress for {process.idle_seconds:.0f}s)",
+                            title=ntitle, base_dir=self.config.base_dir)
+            elif process.kill_reason == "timeout":
+                hard_cap = self._get_timeout(phase)
+                result.status = PhaseStatus.FAILED
+                result.error_message = f"Timeout after {hard_cap}s (hard cap)"
+                result.exit_code = -1
+                logger.error(f"Phase {phase} hit the hard wall-clock cap ({hard_cap}s); killed")
+                notify.send("phase_failed",
+                            f"⏱ {cell} — Phase {phase} ({notify.phase_label(phase)}) "
+                            f"TIMED OUT after {hard_cap}s (hard cap)",
+                            title=ntitle, base_dir=self.config.base_dir)
+            elif process.returncode == 0:
                 result.status = PhaseStatus.SUCCESS
                 result.output_files = self._detect_output_files(phase)
                 logger.info(f"Phase {phase} completed successfully in {format_duration(result.duration_seconds)}")
@@ -146,19 +200,6 @@ class PhaseExecutor:
                             f"FAILED (exit {process.returncode}) after "
                             f"{format_duration(result.duration_seconds)}",
                             title=ntitle, base_dir=self.config.base_dir)
-
-        except subprocess.TimeoutExpired:
-            end_time = datetime.now()
-            result.end_time = end_time.isoformat()
-            result.duration_seconds = (end_time - start_time).total_seconds()
-            result.status = PhaseStatus.FAILED
-            result.error_message = f"Timeout after {self._get_timeout(phase)}s"
-            result.exit_code = -1
-            logger.error(f"Phase {phase} timed out")
-            notify.send("phase_failed",
-                        f"⏱ {cell} — Phase {phase} ({notify.phase_label(phase)}) "
-                        f"TIMED OUT after {self._get_timeout(phase)}s",
-                        title=ntitle, base_dir=self.config.base_dir)
 
         except Exception as e:
             end_time = datetime.now()
@@ -270,6 +311,137 @@ class PhaseExecutor:
         
         return cmd
     
+    def _run_with_watchdog(self, cmd: List[str], cwd: str, env: dict, phase: int) -> "_WatchdogResult":
+        """Run a phase as a subprocess under a dual watchdog.
+
+        Two independent caps terminate the phase:
+          * hard cap (``phase_timeouts``)      — wall-clock backstop against a
+            busy-but-never-terminating loop.
+          * idle cap (``phase_idle_timeouts``) — fires only after this long with
+            NO progress signal. Progress = either a fresh ``live_progress``
+            heartbeat (``results/.live_progress_p{phase}.json`` mtime, the primary
+            per-item signal, rewritten atomically by every phase) OR any child
+            stdout/stderr line (secondary signal). Because each processed item
+            resets the clock, a healthy run of any length survives; only a true
+            stall is killed.
+
+        The child runs in its own session/process group so the whole tree (incl.
+        spawned ``docker`` clients) is terminated on a kill, not just the direct
+        child. Output is drained in threads to avoid a full-pipe deadlock.
+        """
+        hard_cap = self._get_timeout(phase)
+        idle_timeout = self._get_idle_timeout(phase)
+        hb_path = self.config.base_dir / "results" / f".live_progress_p{phase}.json"
+
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+            start_new_session=True,  # own process group → clean tree-kill
+        )
+
+        out_chunks: List[str] = []
+        err_chunks: List[str] = []
+        activity = {"ts": time.monotonic()}  # last child-output time (monotonic)
+        lock = threading.Lock()
+
+        def _drain(stream, sink):
+            try:
+                for line in iter(stream.readline, ''):
+                    sink.append(line)
+                    with lock:
+                        activity["ts"] = time.monotonic()
+            except Exception:
+                pass
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        t_out = threading.Thread(target=_drain, args=(proc.stdout, out_chunks), daemon=True)
+        t_err = threading.Thread(target=_drain, args=(proc.stderr, err_chunks), daemon=True)
+        t_out.start()
+        t_err.start()
+
+        start = time.monotonic()
+        kill_reason = None
+        idle_at_kill = 0.0
+
+        while True:
+            try:
+                proc.wait(timeout=_WATCHDOG_POLL_SECONDS)
+                break  # exited on its own
+            except subprocess.TimeoutExpired:
+                pass
+
+            now = time.monotonic()
+            with lock:
+                stdout_idle = now - activity["ts"]
+            # Heartbeat idle is a wall-clock delta; stdout idle is a monotonic
+            # delta — both are "seconds since that signal last advanced", so they
+            # are directly comparable. The most recent signal (min idle) governs.
+            try:
+                hb_idle = time.time() - hb_path.stat().st_mtime
+                idle = min(stdout_idle, hb_idle)
+            except OSError:
+                idle = stdout_idle  # no heartbeat file yet → rely on stdout
+
+            if idle_timeout and idle > idle_timeout:
+                kill_reason, idle_at_kill = "stalled", idle
+                self._kill_tree(proc)
+                break
+            if hard_cap and (now - start) > hard_cap:
+                kill_reason, idle_at_kill = "timeout", now - start
+                self._kill_tree(proc)
+                break
+
+        t_out.join(timeout=5)
+        t_err.join(timeout=5)
+        return _WatchdogResult(
+            returncode=proc.returncode if proc.returncode is not None else -1,
+            stdout="".join(out_chunks),
+            stderr="".join(err_chunks),
+            kill_reason=kill_reason,
+            idle_seconds=idle_at_kill,
+        )
+
+    @staticmethod
+    def _kill_tree(proc: subprocess.Popen) -> None:
+        """SIGTERM the child's process group, escalating to SIGKILL after a grace
+        period. Falls back to single-process signals if the group is gone."""
+        def _signal_group(sig):
+            try:
+                os.killpg(os.getpgid(proc.pid), sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    proc.send_signal(sig)
+                except Exception:
+                    pass
+
+        _signal_group(signal.SIGTERM)
+        try:
+            proc.wait(timeout=15)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        _signal_group(signal.SIGKILL)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def _get_idle_timeout(self, phase: int) -> int:
+        """Per-phase inactivity timeout (seconds) from config.yaml
+        phase_idle_timeouts, falling back to _DEFAULT_IDLE_TIMEOUTS. 0 disables
+        idle detection (the phase then relies solely on the hard wall-clock cap)."""
+        idle_cfg = cfg_section("phase_idle_timeouts", self.config.base_dir)
+        if idle_cfg and phase in idle_cfg:
+            return int(idle_cfg[phase])
+        if idle_cfg and str(phase) in idle_cfg:
+            return int(idle_cfg[str(phase)])
+        return _DEFAULT_IDLE_TIMEOUTS.get(phase, 0)
+
     def _get_timeout(self, phase: int) -> int:
         """Get timeout for a specific phase from config.yaml phase_timeouts."""
         phase_timeouts = cfg_section("phase_timeouts", self.config.base_dir)

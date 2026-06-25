@@ -43,8 +43,30 @@ phase_timeouts:
                 # build; 1h only got ~halfway. This is a safety cap, not a target;
                 # cached images make re-runs much faster.
   2: 10800      # Phase 2: Patch generation (LLM API calls)
-  3: 7200       # Phase 3: Patch validation (Docker builds + PoC + SAST)
+  3: 28800      # Phase 3: Patch validation (Docker builds + PoC + SAST). 8h —
+                # glibc in-tree validation needs ~5 min/CVE for the incremental
+                # rebuild; 23 validated patches × 350s ≈ 2.2h, well within 8h.
   4: 600        # Phase 4: Reporting
+
+# Per-phase INACTIVITY (idle) timeouts (seconds) — used by the executor's idle
+# watchdog ALONGSIDE phase_timeouts above. A phase is killed early only if it
+# makes NO progress for this long: neither a live_progress heartbeat (the
+# per-item .live_progress_p{N}.json file, rewritten after each CVE) nor any child
+# stdout/stderr. Unlike phase_timeouts (a fixed wall-clock cap that must be
+# hand-sized to the whole workload), the idle cap SCALES automatically — every
+# processed item resets the clock, so a healthy-but-slow run of any length
+# survives and only a genuine stall (wedged Docker build, hung LLM/API call) is
+# terminated. phase_timeouts remains as a hard backstop against a busy loop that
+# never finishes. Each value MUST exceed the worst-case SINGLE-item silent
+# stretch: for Phase 1/3 that is a cold glibc build (~15-20 min) plus a hang-PoC
+# baseline (3×300s) with no heartbeat in between. Set 0 to disable idle detection
+# for a phase (hard cap only).
+phase_idle_timeouts:
+  0: 1800       # Phase 0: per-CVE NVD API + git ops; 30-min silence = stuck
+  1: 2400       # Phase 1: cold build + 3×300s hang baseline between heartbeats
+  2: 1800       # Phase 2: per-CVE LLM call (request timeout 600s × retries)
+  3: 2400       # Phase 3: cold incremental rebuild + PoC run between heartbeats
+  4: 600        # Phase 4: reporting is fast and steadily writes to stdout
 
 # Docker-level timeouts (seconds) – used inside individual phases
 build_timeout: 3600     # Docker image build timeout
