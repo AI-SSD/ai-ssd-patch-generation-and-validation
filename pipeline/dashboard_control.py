@@ -498,6 +498,88 @@ def _read_live(results_dir: str, phase: int) -> Tuple[Optional[Dict[str, Any]], 
         return None, 0.0
 
 
+# get_progress() runs on every page load and poll, across every project cell.
+# Some run artifacts are huge — the Phase-0 CSVs embed PoC source (tens of MB
+# each) and a runaway PoC (e.g. an infinite-loop test whose container_logs are
+# captured) can bloat a Phase-1 results.json to several GB. Re-reading those on
+# every request froze the dashboard. We therefore (a) parse each artifact at
+# most once per (mtime, size) and serve a cached summary otherwise, and (b) read
+# only the small `metadata` header of results.json instead of its multi-GB body.
+_ARTIFACT_CACHE: Dict[str, Tuple[Tuple[float, int], Any]] = {}
+# Hard ceiling for any whole-file JSON/CSV parse fallback (bytes). Above this we
+# refuse to load the full file into memory (it would freeze the dashboard / OOM).
+_MAX_FULL_PARSE_BYTES = 64 * 1024 * 1024
+
+
+def _cached_artifact(path: str, loader):
+    """Return ``loader(path)``, memoised by the file's (mtime, size) so an
+    unchanged artifact is parsed at most once."""
+    try:
+        st = os.stat(path)
+        key = (st.st_mtime, st.st_size)
+    except OSError:
+        return loader(path)
+    hit = _ARTIFACT_CACHE.get(path)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    val = loader(path)
+    _ARTIFACT_CACHE[path] = (key, val)
+    return val
+
+
+def _load_phase0_summary(path: str) -> Dict[str, int]:
+    with open(path, newline="", encoding="utf-8") as f:
+        return summarize_phase0_readiness(_csv.DictReader(f))
+
+
+def _read_results_metadata(path: str, max_bytes: int = 65536) -> Optional[dict]:
+    """Decode just the leading ``"metadata"`` object of a Phase-1 results.json
+    without reading the (potentially multi-GB) rest of the file."""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        head = f.read(max_bytes)
+    i = head.find('"metadata"')
+    if i == -1:
+        return None
+    j = head.find("{", i)
+    if j == -1:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(head[j:])
+        return obj
+    except ValueError:
+        return None
+
+
+def _load_phase1_counts(path: str) -> Dict[str, int]:
+    """Phase-1 reproduction counts. Prefers the authoritative ``metadata``
+    header (cheap, bounded read); falls back to counting the per-CVE records
+    only for small legacy files that lack it."""
+    md = _read_results_metadata(path)
+    if md and "total_vulnerabilities" in md:
+        total = int(md.get("total_vulnerabilities") or 0)
+        reproduced = int(md.get("successful_reproductions") or 0)
+        manual = int(md.get("needs_manual_revision") or 0)
+        return {"total": total, "reproduced": reproduced,
+                "manual_revision": manual,
+                "failed": max(0, total - reproduced - manual)}
+    counts = {"total": 0, "reproduced": 0, "manual_revision": 0, "failed": 0}
+    try:
+        if os.path.getsize(path) > _MAX_FULL_PARSE_BYTES:
+            return counts  # too large to parse safely and no metadata header
+    except OSError:
+        return counts
+    data = json.loads(open(path).read())
+    for r in data.get("results", []):
+        counts["total"] += 1
+        if r.get("vulnerability_reproduced"):
+            counts["reproduced"] += 1
+        elif r.get("needs_manual_revision"):
+            counts["manual_revision"] += 1
+        else:
+            counts["failed"] += 1
+    return counts
+
+
 def get_progress() -> Dict[str, Any]:
     """Aggregate per-phase metrics across all project cell directories.
 
@@ -550,8 +632,8 @@ def get_progress() -> Dict[str, Any]:
                 # skipped_cves is the orchestrator's in-memory manual-timeout
                 # exclusion set — not persisted to the CSV, so we can't see it
                 # here; the manual_review_required column covers the rest.
-                with open(csv_files[0], newline="", encoding="utf-8") as f:
-                    summary = summarize_phase0_readiness(_csv.DictReader(f))
+                # Cached by (mtime, size): these CSVs are tens of MB each.
+                summary = _cached_artifact(csv_files[0], _load_phase0_summary)
                 for k in ("total_cves", "with_poc", "ready",
                           "manual_pending", "manual_done", "not_ready"):
                     cs[k] = summary[k]
@@ -574,15 +656,12 @@ def get_progress() -> Dict[str, Any]:
                                     "manual_revision": 0, "failed": 0,
                                     "done": 0, "running": False}
             try:
-                data = json.loads(open(r1_path).read())
-                for r in data.get("results", []):
-                    cs1["total"] += 1
-                    if r.get("vulnerability_reproduced"):
-                        cs1["reproduced"] += 1
-                    elif r.get("needs_manual_revision"):
-                        cs1["manual_revision"] += 1
-                    else:
-                        cs1["failed"] += 1
+                # Read only the metadata header (cached by mtime,size). A
+                # runaway PoC can bloat results.json to multiple GB; never load
+                # the whole body just to count reproductions.
+                stats = _cached_artifact(r1_path, _load_phase1_counts)
+                for k in ("total", "reproduced", "manual_revision", "failed"):
+                    cs1[k] = stats[k]
             except Exception:
                 pass
             for k in ("total", "reproduced", "manual_revision", "failed"):
@@ -663,13 +742,29 @@ def get_progress() -> Dict[str, Any]:
             stats["done"] = int(live.get("done") or 0)
             stats["total"] = int(live.get("total") or 0)
             stats["running"] = bool(live.get("running"))
+            # The heartbeat only carries done/total/running (+ optional counts),
+            # but each phase card reads phase-specific keys unconditionally.
+            # Backfill them so a mid-run cell renders its live progress instead
+            # of raising KeyError in the renderer.
             if phase == 0:
                 # Phase 0's card keys differ from the discovery heartbeat; keep
                 # the planned CVE total so the card renders a sane denominator.
                 stats.setdefault("total_cves", stats["total"])
-                stats.setdefault("with_poc", 0)
-                stats.setdefault("manual_pending", 0)
-                stats.setdefault("manual_done", 0)
+                for k in ("with_poc", "ready", "manual_pending",
+                          "manual_done", "not_ready"):
+                    stats.setdefault(k, 0)
+            elif phase == 1:
+                for k in ("reproduced", "manual_revision", "failed"):
+                    stats.setdefault(k, 0)
+            elif phase == 2:
+                stats.setdefault("total_tasks", stats["total"])
+                for k in ("syntax_valid", "syntax_invalid"):
+                    stats.setdefault(k, 0)
+            elif phase == 3:
+                for k in ("success", "poc_blocked", "sast_passed",
+                          "poc_still_works", "sast_failures", "build_failures",
+                          "execution_errors", "no_baseline"):
+                    stats.setdefault(k, 0)
             bucket["by_cell"][cell] = stats
 
     return {"phase0": p0, "phase1": p1, "phase2": p2, "phase3": p3}
