@@ -37,6 +37,10 @@ BASE_DIR = Path(__file__).parent.resolve()
 
 sys.path.insert(0, str(BASE_DIR))
 from master_pipeline.config import load_pipeline_config  # noqa: E402
+try:  # best-effort live-progress heartbeat for the dashboard (never fatal)
+    from cve_aggregator.utils import live_progress  # noqa: E402
+except Exception:  # pragma: no cover
+    live_progress = None
 
 _cfg = load_pipeline_config(BASE_DIR)
 _paths = _cfg.get("paths", {}) if isinstance(_cfg.get("paths"), dict) else {}
@@ -1437,7 +1441,20 @@ class PipelineReporter:
     def generate_report(self) -> Path:
         """Generate complete report with visualizations."""
         logger.info("Starting report generation...")
-        
+
+        # Live-progress heartbeat so the dashboard's Phase 4 card updates in real
+        # time (mirrors Phases 1-3). Best-effort; never fatal. 7 milestones:
+        # loads+stats, 5 charts, markdown.
+        _live_dir = self.base_dir / "results"
+        _P4_TOTAL = 7
+
+        def _emit_p4(done, charts=0, report=0, running=True):
+            if live_progress:
+                live_progress.emit(_live_dir, 4, _P4_TOTAL, done,
+                                   {"charts": charts, "report": report}, running=running)
+
+        _emit_p4(0)
+
         # Load data from all phases
         logger.info("Loading Phase 1 results...")
         phase1_results = self.loader.load_phase1_results()
@@ -1462,6 +1479,7 @@ class PipelineReporter:
         model_stats = calc.get_model_stats()
         cve_stats = calc.get_cve_stats()
         sast_summary = calc.get_sast_summary()
+        _emit_p4(1)  # loads + stats done
 
         # A legitimately EMPTY run (nothing reproduced in Phase 1, so nothing to
         # patch/validate — e.g. a project whose CVEs have no usable ExploitDB PoC,
@@ -1487,6 +1505,7 @@ class PipelineReporter:
                 feedback_entries=None,
                 feedback_stats=None,
             )
+            _emit_p4(_P4_TOTAL, charts=0, report=1, running=False)
             logger.info(f"Report generation complete (empty run): {report_path}")
             return report_path
 
@@ -1522,7 +1541,9 @@ class PipelineReporter:
             )
         except Exception as e:
             logger.warning(f"Failed to generate pipeline overview chart: {e}")
-        
+
+        _emit_p4(6, charts=len(chart_paths))  # all charts attempted
+
         # Generate report
         logger.info("Generating Markdown report...")
         report_path = self.report_gen.generate_full_report(
@@ -1539,9 +1560,10 @@ class PipelineReporter:
             feedback_stats=feedback_stats
         )
         
+        _emit_p4(_P4_TOTAL, charts=len(chart_paths), report=1, running=False)
         logger.info(f"Report generation complete: {report_path}")
         logger.info(f"Charts saved to: {self.output_dir}")
-        
+
         return report_path
 
 # =============================================================================

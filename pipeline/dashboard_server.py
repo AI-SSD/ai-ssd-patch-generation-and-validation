@@ -153,19 +153,38 @@ def grid_content(run_dir):
         return "<p style='color:#aaa'>No active run directory — start a run via <a href='/control'>Run Control</a>.</p>"
     cells = load_cells(run_dir); now = int(time.time())
     complete = os.path.exists(os.path.join(run_dir, "COMPLETE"))
+    try:
+        prog = ctl.get_progress() if ctl else {}
+    except Exception:
+        prog = {}
+    running_phase = prog.get("running_phase", {})
+    psum = prog.get("pipeline_success", {})
     counts, rows = {}, ""
     for c in cells:
         ds = disp_state(c, complete); counts[ds] = counts.get(ds, 0) + 1
         link = "/cell/" + quote(c["name"])
+        # The pipeline phase running right now (incl. the feedback loop as its
+        # own phase), distinct from the run_all.sh sweep "stage" column.
+        ph = running_phase.get(c["name"], "") if ds == "RUNNING" else ""
+        ph_cell = (f"<span style='color:#f9a825;font-weight:700'>{html.escape(ph)}</span>"
+                   if ph else "<span style='color:#555'>—</span>")
         rows += (f"<tr><td>{c['proj']}</td><td><a href='{link}'>{c['prof']}</a></td>"
                  f"<td>{c['stage']}</td>"
+                 f"<td>{ph_cell}</td>"
                  f"<td><span class=b style='background:{HCOL.get(ds, '#333')}'>{ds}</span></td>"
                  f"<td>{elapsed_of(c, now)}</td><td><a href='{link}'>logs &rsaquo;</a></td></tr>")
     summ = " &nbsp; ".join(f"{k}: <b>{v}</b>" for k, v in sorted(counts.items()))
-    head = (f"<p>{time.strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; {summ}"
+    # Run-wide sum-up: unique CVEs fixed end-to-end across every cell that has
+    # produced validation results (PoC blocked + SAST passed).
+    fixed_total = psum.get("fixed", 0)
+    sumup = ""
+    if psum.get("cells"):
+        sumup = (f" &nbsp;|&nbsp; <span style='color:#6c6;font-weight:700'>&#10003; "
+                 f"end-to-end fixed: {fixed_total}/{psum.get('validated', 0)} CVEs</span>")
+    head = (f"<p>{time.strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; {summ}{sumup}"
             + ("  <b style=color:#6c6>COMPLETE</b>" if complete else "") + "</p>")
-    return (head + "<table><tr><th>project</th><th>profile</th><th>stage</th><th>state</th>"
-            "<th>elapsed</th><th></th></tr>" + rows + "</table>")
+    return (head + "<table><tr><th>project</th><th>profile</th><th>stage</th><th>phase</th>"
+            "<th>state</th><th>elapsed</th><th></th></tr>" + rows + "</table>")
 
 
 def cell_progress_html(cell: str) -> str:
@@ -178,10 +197,14 @@ def cell_progress_html(cell: str) -> str:
         return ""
 
     p0 = d["phase0"]; p1 = d["phase1"]; p2 = d["phase2"]; p3 = d["phase3"]
+    pfb = d.get("feedback", {}); p4 = d.get("phase4", {})
     s0 = p0["by_cell"].get(cell); s1 = p1["by_cell"].get(cell)
     s2 = p2["by_cell"].get(cell); s3 = p3["by_cell"].get(cell)
+    sfb = pfb.get("by_cell", {}).get(cell); s4 = p4.get("by_cell", {}).get(cell)
+    ssucc = d.get("pipeline_success", {}).get("by_cell", {}).get(cell)
+    running_phase = d.get("running_phase", {}).get(cell, "")
 
-    if not any([s0, s1, s2, s3]):
+    if not any([s0, s1, s2, s3, sfb, s4]):
         return "<p style='color:#666;font-size:13px'>No progress data yet for this cell.</p>"
 
     def pct(num, den):
@@ -272,9 +295,47 @@ def cell_progress_html(cell: str) -> str:
     else:
         card3 = card("Phase 3 — Validation", "#555", "<tr><td style='color:#555'>not started</td></tr>", active=False)
 
+    # Feedback Loop (self-healing) — runs between Phases 2 and 3 on failures
+    if sfb:
+        cfb = (prog(sfb, "patches")
+               + row("Patches", f"{sfb.get('done', sfb['total'])}/{sfb['total']}" if sfb.get("running") else sfb["total"])
+               + row("Fixed by retry ✓", f"{sfb['after_retry']}", "#6c6")
+               + row("Succeeded", f"{sfb['successful']}/{sfb['total']}{pct(sfb['successful'], sfb['total'])}", "#6c6")
+               + (row("Unpatchable ✗", sfb["unpatchable"], "#f88") if sfb["unpatchable"] else "")
+               + row("Retry attempts", sfb["retries"], "#6cf"))
+        cardfb = card(*title_for("Feedback Loop — Self-Healing", sfb), cfb)
+    else:
+        cardfb = card("Feedback Loop — Self-Healing", "#555", "<tr><td style='color:#555'>not started</td></tr>", active=False)
+
+    # Phase 4 — reporting (live heartbeat while generating; report+charts when done)
+    if s4:
+        c4 = (prog(s4, "steps")
+              + (row("Report ✓", "generated", "#6c6") if s4.get("report") else "")
+              + (row("Generated", s4["generated"], "#6cf") if s4.get("generated") else "")
+              + row("Charts", s4.get("charts", 0), "#6cf"))
+        card4 = card(*title_for("Phase 4 — Reporting", s4), c4)
+    else:
+        card4 = card("Phase 4 — Reporting", "#555", "<tr><td style='color:#555'>not started</td></tr>", active=False)
+
     ts = time.strftime("%H:%M:%S")
-    return (f"<div style='display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:.8rem'>"
-            f"{card0}{card1}{card2}{card3}</div>"
+    banner = ""
+    if running_phase:
+        banner = (f"<div style='margin-bottom:.5rem;font-size:13px'>"
+                  f"<span style='color:#f9a825;font-weight:700'>&#9654; running:</span> "
+                  f"<span style='color:#9cf;font-weight:700'>{html.escape(running_phase)}</span></div>")
+    # Full-pipeline sum-up: unique CVEs that made it end-to-end (PoC blocked + SAST passed)
+    sumup = ""
+    if ssucc and ssucc.get("validated"):
+        fx, vd = ssucc["fixed"], ssucc["validated"]
+        sumup = (f"<div style='margin-bottom:.6rem;padding:.4rem .7rem;background:#13261a;"
+                 f"border:1px solid #2e5b3e;border-radius:6px;font-size:13px'>"
+                 f"<span style='color:#6c6;font-weight:700'>&#10003; Full pipeline:</span> "
+                 f"<span style='color:#eee;font-weight:700'>{fx}/{vd}</span> "
+                 f"<span style='color:#9c9'>CVEs fixed end-to-end{pct(fx, vd)}</span> "
+                 f"<small style='color:#777'>&mdash; PoC blocked + SAST passed</small></div>")
+    return (banner + sumup
+            + f"<div style='display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:.8rem'>"
+            f"{card0}{card1}{card2}{card3}{cardfb}{card4}</div>"
             f"<small style='color:#555'>live stats · updated {ts}</small>")
 
 

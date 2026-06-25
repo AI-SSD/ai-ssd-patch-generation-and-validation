@@ -16,6 +16,10 @@ from .utils import (print_banner, print_phase_header, print_summary_table,
                      wait_for_gpu)
 from .executor import PhaseExecutor
 from .feedback import IterativeFeedbackLoop
+try:  # best-effort live-progress heartbeat for the dashboard (never fatal)
+    from cve_aggregator.utils import live_progress
+except Exception:  # pragma: no cover
+    live_progress = None
 
 logger = logging.getLogger('pipeline')
 
@@ -1098,7 +1102,28 @@ RECOMMENDED ACTIONS:
         if skipped_statuses:
             logger.info(f"Not retrying (non-retryable statuses): {skipped_statuses}")
         logger.info(f"Found {len(failed_patches)} failed patches for retry")
-        
+
+        # Live-progress heartbeat so the dashboard's Feedback Loop card updates in
+        # real time (mirrors how Phases 1-3 emit). Best-effort; never fatal.
+        _fb_live_dir = self.config.base_dir / "results"
+        _fb_total = len(failed_patches)
+
+        def _emit_fb(done, running=True):
+            if not live_progress:
+                return
+            res = self.feedback_results
+            counts = {
+                "successful": sum(1 for r in res if r.final_status == PatchStatus.SUCCESS),
+                "unpatchable": sum(1 for r in res if r.final_status == PatchStatus.UNPATCHABLE),
+                "failed": sum(1 for r in res if r.final_status == PatchStatus.FAILED),
+                "after_retry": sum(1 for r in res if r.final_status == PatchStatus.SUCCESS
+                                   and r.successful_attempt and r.successful_attempt > 1),
+                "retries": sum(max(0, r.total_attempts - 1) for r in res),
+            }
+            live_progress.emit(_fb_live_dir, "fb", _fb_total, done, counts, running=running)
+
+        _emit_fb(0)
+
         for idx, failed in enumerate(failed_patches, 1):
             cve_id = failed.get("cve_id")
             model_name = failed.get("model_name")
@@ -1175,12 +1200,15 @@ RECOMMENDED ACTIONS:
                     end_time=error_time.isoformat(),
                     total_duration_seconds=(error_time - feedback_loop_start).total_seconds()
                 ))
-        
+
+            _emit_fb(idx)  # advance the dashboard Feedback Loop card after each patch
+
         feedback_loop_end = datetime.now()
         feedback_loop_duration = (feedback_loop_end - feedback_loop_start).total_seconds()
-        
+
         logger.info(f"\n[FEEDBACK LOOP] Completed all patches in {feedback_loop_duration:.1f}s")
-        
+
+        _emit_fb(_fb_total, running=False)  # terminal heartbeat (phase ended)
         # Save feedback loop results with phase timing
         self._save_feedback_loop_results(feedback_loop_start, feedback_loop_end)
     

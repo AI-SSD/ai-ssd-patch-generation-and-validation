@@ -513,17 +513,20 @@ _MAX_FULL_PARSE_BYTES = 64 * 1024 * 1024
 
 def _cached_artifact(path: str, loader):
     """Return ``loader(path)``, memoised by the file's (mtime, size) so an
-    unchanged artifact is parsed at most once."""
+    unchanged artifact is parsed at most once. Keyed by (path, loader) because a
+    single file (e.g. feedback_loop_results.json) is read by more than one loader
+    that return different shapes — keying on path alone would cross them."""
+    cache_key = (path, getattr(loader, "__name__", repr(loader)))
     try:
         st = os.stat(path)
         key = (st.st_mtime, st.st_size)
     except OSError:
         return loader(path)
-    hit = _ARTIFACT_CACHE.get(path)
+    hit = _ARTIFACT_CACHE.get(cache_key)
     if hit is not None and hit[0] == key:
         return hit[1]
     val = loader(path)
-    _ARTIFACT_CACHE[path] = (key, val)
+    _ARTIFACT_CACHE[cache_key] = (key, val)
     return val
 
 
@@ -580,6 +583,178 @@ def _load_phase1_counts(path: str) -> Dict[str, int]:
     return counts
 
 
+def _load_feedback_counts(path: str) -> Dict[str, int]:
+    """Counts for the Iterative Feedback Loop card, from the cell's
+    ``results/feedback_loop_results_*.json`` summary."""
+    d = json.loads(open(path).read())
+    s = d.get("summary", {}) or {}
+    ob = d.get("outcome_breakdown", {}) or {}
+    return {
+        "total": int(s.get("total_patches_processed") or 0),
+        "successful": int(s.get("successful") or 0),
+        "unpatchable": int(s.get("unpatchable") or 0),
+        "failed": int(s.get("failed") or 0),
+        "after_retry": int(ob.get("successful_after_retry") or 0),
+        "retries": int(s.get("total_retry_attempts") or 0),
+    }
+
+
+def _success_from_validation(path: str) -> Dict[str, list]:
+    """Phase 3 CVE sets: CVEs with a patch that both blocked the PoC and passed
+    SAST (``fixed``), and all CVEs that reached validation (``all``). Returns
+    lists (cacheable). Matches reporter.py's ``fixed_cves`` definition."""
+    try:
+        if os.path.getsize(path) > _MAX_FULL_PARSE_BYTES:
+            return {"fixed_cves": [], "all_cves": []}
+    except OSError:
+        return {"fixed_cves": [], "all_cves": []}
+    d = json.loads(open(path).read())
+    fixed, allc = set(), set()
+    for r in d.get("all_results", []) or []:
+        cve = (r.get("cve_id") or "").upper()
+        if not cve:
+            continue
+        allc.add(cve)
+        if r.get("poc_blocked") and r.get("sast_passed"):
+            fixed.add(cve)
+    return {"fixed_cves": sorted(fixed), "all_cves": sorted(allc)}
+
+
+def _success_from_feedback(path: str) -> Dict[str, list]:
+    """Feedback-loop CVE sets: CVEs whose final_status == success after retries
+    (``fixed``), and all CVEs the loop processed (``all``). The loop only handles
+    patches that FAILED the initial Phase 3, so this MUST be unioned with the
+    Phase 3 sets — on its own it omits first-try successes."""
+    d = json.loads(open(path).read())
+    fixed, allc = set(), set()
+    for r in d.get("results", []) or []:
+        cve = (r.get("cve_id") or "").upper()
+        if not cve:
+            continue
+        allc.add(cve)
+        if str(r.get("final_status") or "").lower().rsplit(".", 1)[-1] == "success":
+            fixed.add(cve)
+    return {"fixed_cves": sorted(fixed), "all_cves": sorted(allc)}
+
+
+def _load_pipeline_success(cell_dir: str) -> Optional[Dict[str, int]]:
+    """Unique CVEs fixed end-to-end by the full pipeline for one cell, or None if
+    the cell has not produced validation results yet.
+
+    Merges (unions) the Phase 3 validation summary with the feedback-loop final
+    verdict: a CVE is fixed if it passed the initial validation OR was salvaged
+    by a retry. Counting either source alone undercounts (validation misses
+    retry saves; feedback misses first-try successes)."""
+    fixed: set = set()
+    allc: set = set()
+    found = False
+    v3 = sorted(glob.glob(os.path.join(
+        cell_dir, "validation_results", "validation_summary_*.json")))
+    if v3:
+        found = True
+        s = _cached_artifact(v3[-1], _success_from_validation)
+        fixed |= set(s["fixed_cves"]); allc |= set(s["all_cves"])
+    fb = sorted(glob.glob(os.path.join(
+        cell_dir, "results", "feedback_loop_results_*.json")))
+    if fb:
+        found = True
+        s = _cached_artifact(fb[-1], _success_from_feedback)
+        fixed |= set(s["fixed_cves"]); allc |= set(s["all_cves"])
+    if not found:
+        return None
+    return {"fixed": len(fixed), "validated": len(allc)}
+
+
+def _feedback_live_from_log(cell_dir: str) -> Optional[Dict[str, Any]]:
+    """Live Feedback-Loop counts parsed from the cell run log.
+
+    Used only when the loop is running under an orchestrator process that
+    predates the fb heartbeat (so there is no ``.live_progress_pfb.json`` and no
+    final results json yet) — without this the card would read "not started"
+    while the loop is clearly running. Returns a heartbeat-shaped dict or None.
+    """
+    logs = sorted(glob.glob(os.path.join(cell_dir, "logs", "run_*.log")))
+    if not logs:
+        return None
+    try:
+        with open(logs[-1], "rb") as f:
+            f.seek(0, 2)
+            sz = f.tell()
+            f.seek(max(0, sz - 2_000_000))  # tail is plenty; run logs stay small
+            txt = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    m = re.findall(r"Found (\d+) failed patches for retry", txt)
+    if not m:
+        return None  # the loop hasn't announced its work list yet
+    total = int(m[-1])
+    comp = re.findall(r"\[FEEDBACK LOOP\] Completed [^:\n]+: (\w+) \(attempts: (\d+)", txt)
+    succ = sum(1 for s, _ in comp if s == "success")
+    unpatch = sum(1 for s, _ in comp if s == "unpatchable")
+    failed = sum(1 for s, _ in comp if s == "failed")
+    retries = sum(max(0, int(a) - 1) for _, a in comp)
+    proc = re.findall(r"Processing \((\d+)/\d+\)", txt)
+    done = int(proc[-1]) if proc else len(comp)  # current patch index ≈ progress
+    return {"done": min(done, total), "total": total, "successful": succ,
+            "unpatchable": unpatch, "failed": failed, "after_retry": succ,
+            "retries": retries, "running": True}
+
+
+def _detect_running_phase(cell: str, cell_dir: str) -> str:
+    """Best-effort label of the phase a cell is running RIGHT NOW, or "" if the
+    cell is not currently running.
+
+    Phases 0–3 expose a live-progress heartbeat (``running`` flag); the feedback
+    loop and Phase 4 do not, so they are inferred from their own artifacts:
+      * Feedback loop — its log is being written and not yet finalised. It also
+        re-runs generation+validation internally, re-firing the p2/p3
+        heartbeats, so the feedback log (not those heartbeats) is the
+        authoritative signal and wins when it is at least as fresh.
+      * Phase 4 — the reports/ dir is being written but the final report .md
+        does not exist yet.
+    Gated by the cell's RUNNING state so a finished cell shows no running phase.
+    """
+    if not _cell_is_running(cell):
+        return ""
+    res = os.path.join(cell_dir, "results")
+    best_rec, best_label = -1.0, ""
+    # A heartbeat with running==true marks that phase in progress. The feedback
+    # loop ("fb") and Phase 4 now emit heartbeats too; "fb" is checked last so it
+    # wins ties against the p2/p3 heartbeats it re-fires during retries.
+    for n in (0, 1, 2, 3, 4, "fb"):
+        live, mt = _read_live(res, n)
+        if live and live.get("running"):
+            rec = float(live.get("ts") or mt or 0.0)
+            if rec >= best_rec:
+                best_rec = rec
+                best_label = "Feedback loop" if n == "fb" else f"Phase {n}"
+    # Fallback for runs predating the fb/p4 heartbeats:
+    # Feedback loop — fresh log, no final results json newer than it.
+    fb_logs = glob.glob(os.path.join(cell_dir, "logs", "feedback_loop_*.log"))
+    if fb_logs:
+        fb_mt = max((_safe_mtime(p) for p in fb_logs), default=0.0)
+        done_mt = max((_safe_mtime(p) for p in glob.glob(
+            os.path.join(res, "feedback_loop_results_*.json"))), default=0.0)
+        if fb_mt > done_mt and fb_mt >= best_rec - 1.0:
+            best_rec, best_label = fb_mt, "Feedback loop"
+    # Phase 4: reports/ being written, final report not yet produced.
+    rep_dir = os.path.join(cell_dir, "reports")
+    if os.path.isdir(rep_dir):
+        if not glob.glob(os.path.join(rep_dir, "pipeline_report_*.md")):
+            rep_mt = max((_safe_mtime(p) for p in glob.glob(
+                os.path.join(rep_dir, "*"))), default=0.0)
+            if rep_mt >= best_rec:
+                best_rec, best_label = rep_mt, "Phase 4"
+    return best_label or "…"
+
+
+def _safe_mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
 def get_progress() -> Dict[str, Any]:
     """Aggregate per-phase metrics across all project cell directories.
 
@@ -604,13 +779,20 @@ def get_progress() -> Dict[str, Any]:
                            "sast_passed": 0, "poc_still_works": 0, "sast_failures": 0,
                            "build_failures": 0, "execution_errors": 0, "no_baseline": 0,
                            "by_cell": {}}
+    pfb: Dict[str, Any] = {"cells": 0, "total": 0, "successful": 0, "unpatchable": 0,
+                            "failed": 0, "after_retry": 0, "retries": 0, "by_cell": {}}
+    p4: Dict[str, Any] = {"cells": 0, "reports": 0, "charts": 0, "by_cell": {}}
+    # Full-pipeline outcome: unique CVEs fixed end-to-end (PoC blocked + SAST passed).
+    psum: Dict[str, Any] = {"cells": 0, "fixed": 0, "validated": 0, "by_cell": {}}
+    running_phase: Dict[str, str] = {}  # cell -> "Phase N" / "Feedback loop" / "Phase 4"
 
     for cell_dir in sorted(glob.glob(os.path.join(PROJECTS_DIR, "*"))):
         if not os.path.isdir(cell_dir):
             continue
         cell = os.path.basename(cell_dir)
         live_dir = os.path.join(cell_dir, "results")
-        art_mt = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0}  # final-artifact mtimes
+        # final-artifact mtimes; "fb" = feedback loop, 4 = reporting
+        art_mt = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0, "fb": 0.0, 4: 0.0}
 
         # ---- Phase 0: *_cve_poc_complete.csv ----------------------------------
         csv_files = glob.glob(os.path.join(cell_dir, "results", "*_cve_poc_complete.csv"))
@@ -732,8 +914,59 @@ def get_progress() -> Dict[str, Any]:
             cs3["done"] = cs3["total"]
             p3["by_cell"][cell] = cs3
 
+        # ---- Feedback loop: results/feedback_loop_results_*.json --------------
+        fb_files = sorted(glob.glob(os.path.join(
+            cell_dir, "results", "feedback_loop_results_*.json")))
+        if fb_files:
+            art_mt["fb"] = _safe_mtime(fb_files[-1])
+            pfb["cells"] += 1
+            csfb: Dict[str, Any] = {"total": 0, "successful": 0, "unpatchable": 0,
+                                     "failed": 0, "after_retry": 0, "retries": 0,
+                                     "done": 0, "running": False}
+            try:
+                csfb.update(_cached_artifact(fb_files[-1], _load_feedback_counts))
+            except Exception:
+                pass
+            for k in ("total", "successful", "unpatchable", "failed",
+                      "after_retry", "retries"):
+                pfb[k] += csfb[k]
+            csfb["done"] = csfb["total"]
+            pfb["by_cell"][cell] = csfb
+
+        # ---- Phase 4: reports/pipeline_report_*.md ----------------------------
+        rep_dir = os.path.join(cell_dir, "reports")
+        rep_md = sorted(glob.glob(os.path.join(rep_dir, "pipeline_report_*.md")))
+        if rep_md:
+            art_mt[4] = _safe_mtime(rep_md[-1])
+            p4["cells"] += 1
+            charts = len(glob.glob(os.path.join(rep_dir, "*.png")))
+            cs4: Dict[str, Any] = {"report": 1, "charts": charts,
+                                    "generated": "", "running": False}
+            try:
+                cs4["generated"] = time.strftime(
+                    "%H:%M:%S", time.localtime(os.path.getmtime(rep_md[-1])))
+            except OSError:
+                pass
+            p4["reports"] += 1
+            p4["charts"] += charts
+            p4["by_cell"][cell] = cs4
+
+        # ---- Full-pipeline outcome: unique CVEs fixed end-to-end --------------
+        succ = _load_pipeline_success(cell_dir)
+        if succ is not None:
+            psum["cells"] += 1
+            psum["fixed"] += succ["fixed"]
+            psum["validated"] += succ["validated"]
+            psum["by_cell"][cell] = succ
+
+        # ---- Current running phase (for the grid column + cell banner) --------
+        rp = _detect_running_phase(cell, cell_dir)
+        if rp:
+            running_phase[cell] = rp
+
         # ---- Live overlay: a fresh heartbeat supersedes a stale/absent artifact
-        for phase, bucket in ((0, p0), (1, p1), (2, p2), (3, p3)):
+        for phase, bucket in ((0, p0), (1, p1), (2, p2), (3, p3),
+                              ("fb", pfb), (4, p4)):
             live, mt = _read_live(live_dir, phase)
             if not live or mt < art_mt[phase]:
                 continue  # phase finished (artifact is newer) or no heartbeat
@@ -765,9 +998,33 @@ def get_progress() -> Dict[str, Any]:
                           "poc_still_works", "sast_failures", "build_failures",
                           "execution_errors", "no_baseline"):
                     stats.setdefault(k, 0)
+            elif phase == "fb":
+                for k in ("successful", "unpatchable", "failed",
+                          "after_retry", "retries"):
+                    stats.setdefault(k, 0)
+            elif phase == 4:
+                stats.setdefault("charts", 0)
+                stats.setdefault("report", 0)
+                stats.setdefault("generated", "")
             bucket["by_cell"][cell] = stats
 
-    return {"phase0": p0, "phase1": p1, "phase2": p2, "phase3": p3}
+        # ---- Fallback for a feedback loop / Phase 4 running under an OLD
+        # orchestrator process (no heartbeat, no final artifact yet): derive a
+        # live card so it shows progress instead of a misleading "not started".
+        if running_phase.get(cell) == "Feedback loop" and cell not in pfb["by_cell"]:
+            lf = _feedback_live_from_log(cell_dir)
+            if lf:
+                pfb["by_cell"][cell] = lf
+        elif running_phase.get(cell) == "Phase 4" and cell not in p4["by_cell"]:
+            p4["by_cell"][cell] = {
+                "report": 0, "running": True, "done": 0, "total": 7,
+                "charts": len(glob.glob(os.path.join(cell_dir, "reports", "*.png"))),
+                "generated": "",
+            }
+
+    return {"phase0": p0, "phase1": p1, "phase2": p2, "phase3": p3,
+            "feedback": pfb, "phase4": p4, "pipeline_success": psum,
+            "running_phase": running_phase}
 
 
 def plan_deletion(sel: Dict[str, Any]) -> Dict[str, Any]:

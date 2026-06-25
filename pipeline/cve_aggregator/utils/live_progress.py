@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional
 FILENAME = ".live_progress_p{phase}.json"
 
 
-def emit(results_dir, phase: int, total: int, done: int,
+def emit(results_dir, phase, total: int, done: int,
          counts: Optional[Dict[str, Any]] = None, running: bool = True) -> None:
     """Atomically write the live-progress heartbeat for ``phase``.
 
@@ -39,8 +39,12 @@ def emit(results_dir, phase: int, total: int, done: int,
     try:
         rd = str(results_dir)
         os.makedirs(rd, exist_ok=True)
+        try:
+            phase_val: Any = int(phase)
+        except (TypeError, ValueError):
+            phase_val = phase  # non-numeric phase id (e.g. "fb" for the feedback loop)
         payload = {
-            "phase": int(phase),
+            "phase": phase_val,
             "total": int(total or 0),
             "done": int(done or 0),
             "running": bool(running),
