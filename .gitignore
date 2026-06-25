@@ -58,7 +58,9 @@ ExploitForge_anon
 
 pipeline/API-openai-key
 pipeline/API-nvd-key
+pipeline/API-ollama-proxy
 pipeline/documentation/server.md
 pipeline/*projects/
 pipeline/project-runs/
+pipeline/runs/
 pipeline/CLAUDE.md

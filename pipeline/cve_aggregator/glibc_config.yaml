@@ -23,6 +23,23 @@ pipeline:
   skip_modules: []
 
 # ---------------------------------------------------------------------------
+# Reproduction strategy — which CVE reproducer(s) to use, in PRIORITY order.
+# One knob, all four modes (the first entry is the primary reproducer Phase 1
+# uses; a later entry is the fallback for CVEs the first can't cover):
+#   [exploitdb]            ExploitDB PoC only            (default — current glibc)
+#   [intree]               fix-commit regression test only (Option A only)
+#   [exploitdb, intree]    both, ExploitDB preferred     (PoC, else the test)
+#   [intree, exploitdb]    both, Option A preferred      (test, else the PoC)
+# "intree" needs this project's phase1.intree_test.{build_script,run_script}
+# recipe (glibc has one). Supersedes commit_discovery.harvest_regression_tests.
+# Flip to [exploitdb, intree] to add fix-commit-test coverage for the many CVEs
+# with no public PoC.
+# ---------------------------------------------------------------------------
+reproduction_strategy:
+  - exploitdb
+  - intree
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 logging:
@@ -1013,6 +1030,19 @@ phase1:
   # Install prefix inside the container for the compiled project artefacts.
   # Phase 1 links PoCs against libraries found here.
   install_prefix: "/opt/project-build"
+
+  # Project framing for the LLM PoC-analysis prompts (poc_analyzer.py: driver
+  # synthesis + execution strategy, used for payload-generator/"OTHER" PoCs).
+  # The code carries a GENERIC default; this sharpens it for glibc. Omit the
+  # block entirely for other projects to get the generic phrasing.
+  #   project_name : human name used in the prompt
+  #   reach_hint   : how to feed a crafted payload to the vulnerable function
+  poc_analysis:
+    project_name: "the GNU C Library (glibc)"
+    reach_hint: >-
+      for a tzfile payload: write it to a file, point TZ at that file with a
+      leading ':' or install it under a TZ name, then call tzset()/localtime();
+      for a locale payload: install it and call setlocale()/newlocale(); etc.
 
   # Environment variables exported right before a PoC runs against the project
   # build (Phase 1 baseline AND the inherited Phase 3 validation). This is a

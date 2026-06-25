@@ -7,6 +7,7 @@ CLI arguments override the YAML values when provided.
 
 import csv
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -40,10 +41,87 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
         return {}
 
 
+# ---------------------------------------------------------------------------
+# Provider-profile env overlay
+# ---------------------------------------------------------------------------
+# A "profile" (profiles/<name>.env, sourced by run_project.sh) switches the LLM
+# backend for a whole run via environment variables, WITHOUT editing any YAML.
+# These overlay config.yaml's ``llm`` section (and the feedback-loop model
+# schedule) so the same projects can be benchmarked across AI families by
+# changing one flag. Precedence everywhere: env var > config.yaml > default.
+# No LLM_* vars set ⇒ this is a no-op and the YAML behaves exactly as before.
+# ---------------------------------------------------------------------------
+
+def _env(name: str) -> Optional[str]:
+    """Return a non-empty environment variable, or None."""
+    val = os.environ.get(name)
+    return val if val not in (None, "") else None
+
+
+def parse_models_by_attempt(raw: Optional[str]) -> Dict[int, str]:
+    """Parse ``"m1,m2,m3,m4"`` into ``{1: m1, 2: m2, ...}`` (1-indexed attempts)."""
+    if not raw:
+        return {}
+    return {i + 1: m.strip() for i, m in enumerate(raw.split(",")) if m.strip()}
+
+
+def _apply_llm_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Overlay profile-driven LLM settings from the environment onto *cfg*."""
+    if not isinstance(cfg, dict):
+        return cfg
+    llm = cfg.get("llm")
+    if not isinstance(llm, dict):
+        llm = {}
+        cfg["llm"] = llm
+
+    if _env("LLM_PROVIDER"):
+        llm["provider"] = _env("LLM_PROVIDER").lower()
+    if _env("LLM_ENDPOINT"):
+        llm["endpoint"] = _env("LLM_ENDPOINT")
+    if _env("LLM_OPENAI_MODEL"):
+        llm["openai_model"] = _env("LLM_OPENAI_MODEL")
+    if _env("LLM_OPENAI_BASE_URL"):
+        llm["openai_base_url"] = _env("LLM_OPENAI_BASE_URL")
+    if _env("OLLAMA_USERNAME"):
+        llm["ollama_username"] = _env("OLLAMA_USERNAME")
+    if _env("OLLAMA_PASSWORD"):
+        llm["ollama_password"] = _env("OLLAMA_PASSWORD")
+    for env_name, key, caster in (
+        ("LLM_NUM_CTX", "num_ctx", int),
+        ("LLM_TEMPERATURE", "temperature", float),
+        ("LLM_MAX_TOKENS", "max_tokens", int),
+        ("LLM_TIMEOUT", "timeout", int),
+    ):
+        raw = _env(env_name)
+        if raw is not None:
+            try:
+                llm[key] = caster(raw)
+            except (TypeError, ValueError):
+                logger.warning("Ignoring invalid %s=%r", env_name, raw)
+
+    # Per-attempt model schedule (the 4-model ramp). When provided it drives the
+    # feedback loop for BOTH providers, and its attempt-1 model becomes the
+    # initial Phase 2 generation model (OpenAI: openai_model; Ollama: the single
+    # entry of llm.models, so the per-CVE loop runs once then retries escalate).
+    schedule = parse_models_by_attempt(_env("LLM_MODELS_BY_ATTEMPT"))
+    if schedule:
+        fb = cfg.get("feedback_loop")
+        if not isinstance(fb, dict):
+            fb = {}
+            cfg["feedback_loop"] = fb
+        fb["models_by_attempt"] = dict(schedule)
+        m1 = schedule[1]
+        llm["openai_model"] = m1
+        llm["models"] = [m1]
+    elif _env("LLM_MODELS"):
+        llm["models"] = [m.strip() for m in _env("LLM_MODELS").split(",") if m.strip()]
+    return cfg
+
+
 def load_pipeline_config(base_dir: Optional[Path] = None) -> Dict[str, Any]:
-    """Load ``config.yaml`` from the pipeline root and return the raw dict."""
+    """Load ``config.yaml`` from the pipeline root, with profile env overrides."""
     base = base_dir or BASE_DIR
-    return _load_yaml(base / "config.yaml")
+    return _apply_llm_env_overrides(_load_yaml(base / "config.yaml"))
 
 
 # ---------------------------------------------------------------------------
@@ -125,14 +203,38 @@ _fb = _cfg.get("feedback_loop", {}) if isinstance(_cfg.get("feedback_loop"), dic
 MAX_RETRIES: int = int(_fb.get("max_retries", 3))
 FEEDBACK_LOOP_ENABLED: bool = bool(_fb.get("enabled", True))
 
-# Manual verification
+# Manual verification.  Env vars override config.yaml so the dashboard /
+# run_all.sh can set per-run, per-phase manual-review behavior WITHOUT editing
+# config.yaml (the same env-transport pattern the LLM profiles use). Precedence:
+# env var > config.yaml > default. Defaults preserve the historical behavior
+# (Phase 0 auto-skip honors config; Phase 1 hold gate OFF).
+def _env_bool(name: str, default: bool) -> bool:
+    v = _env(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    v = _env(name)
+    try:
+        return int(v) if v is not None else int(default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 _mv = _cfg.get("manual_verification", {}) if isinstance(_cfg.get("manual_verification"), dict) else {}
-MANUAL_VERIFY_TIMEOUT: int = int(_mv.get("timeout", 1800))
-MANUAL_VERIFY_POLL_INTERVAL: int = int(_mv.get("poll_interval", 30))
-# When True, the Phase 0 manual-verification step never prompts: every CVE still
-# pending manual review is automatically skipped (excluded from Phase 1+), the
-# same as choosing [S] in the interactive menu. Lets the pipeline run unattended.
-MANUAL_VERIFY_AUTO_SKIP: bool = bool(_mv.get("auto_skip", False))
+MANUAL_VERIFY_TIMEOUT: int = _env_int("MANUAL_VERIFY_TIMEOUT", int(_mv.get("timeout", 1800)))
+MANUAL_VERIFY_POLL_INTERVAL: int = _env_int("MANUAL_VERIFY_POLL", int(_mv.get("poll_interval", 30)))
+# Phase 0: when True the manual-verification gate never holds — every CVE still
+# pending manual review is auto-excluded from Phase 1+ (the [S] outcome). When
+# False AND non-interactive (dashboard run), the gate HOLDS and polls
+# manual_supervision/ for dashboard approve/retry/discard/proceed decisions.
+MANUAL_VERIFY_AUTO_SKIP: bool = _env_bool("MANUAL_VERIFY_AUTO_SKIP", bool(_mv.get("auto_skip", False)))
+# Phase 1 manual-revision HOLD gate. Default OFF = historical behavior (flagged
+# items silently dropped from Phase 2). When ON, after Phase 1 the run holds and
+# polls manual_supervision/ for dashboard retry/discard/proceed decisions.
+MANUAL_VERIFY_PHASE1_GATE: bool = _env_bool("PHASE1_MANUAL_GATE", bool(_mv.get("phase1_gate", False)))
 
 # Phase scripts – structural, not user-facing config
 PHASE_SCRIPTS = {
@@ -178,6 +280,7 @@ class PipelineConfig:
     manual_verify_timeout: int = MANUAL_VERIFY_TIMEOUT
     manual_verify_poll_interval: int = MANUAL_VERIFY_POLL_INTERVAL
     manual_verify_auto_skip: bool = MANUAL_VERIFY_AUTO_SKIP
+    manual_verify_phase1_gate: bool = MANUAL_VERIFY_PHASE1_GATE
 
     def resolve_phase0_outputs(self) -> Dict[str, Path]:
         """Read Phase 0 config YAML and return its output file paths resolved to base_dir."""

@@ -54,6 +54,10 @@ from master_pipeline.sast_config import (  # noqa: E402
 )
 from master_pipeline import sast_runner  # noqa: E402  (shared Phase 1/3 SAST run + classify)
 from poc_analyzer import PoCAnalyzer  # noqa: E402  (same negative filter Phase 1 uses)
+try:  # best-effort live-progress heartbeat for the dashboard (never fatal)
+    from cve_aggregator.utils import live_progress  # noqa: E402
+except Exception:  # pragma: no cover
+    live_progress = None
 
 _cfg = load_pipeline_config(_BASE_DIR)
 _paths = _cfg.get("paths", {}) if isinstance(_cfg.get("paths"), dict) else {}
@@ -87,13 +91,25 @@ _DEFAULT_IMAGE_MANIFEST_PATH = "results/image_manifest.json"
 _CONTAINER_SECURITY_OPT = ["seccomp=unconfined", "apparmor=unconfined"]
 
 
-def _resolve_phase1_layout(base_dir: Path) -> Dict[str, Any]:
-    """Resolve the Phase 1 image layout from the Phase 0 config referenced by
-    config.yaml (``phase0_config`` key). Mirrors orchestrator.py defaults."""
+def _resolve_phase1_layout(base_dir: Path,
+                           phase0_config: Optional[Path] = None) -> Dict[str, Any]:
+    """Resolve the Phase 1 image layout from the ACTIVE project's Phase 0 config.
+
+    The project YAML is taken from ``phase0_config`` when supplied (the active
+    project in a multi-project run, passed by the orchestrator via
+    ``--phase0-config``); otherwise it falls back to the ``phase0_config``
+    pointer in config.yaml. This matters: reading the wrong project's YAML
+    resolves the wrong ``image_manifest_path`` (e.g. glibc's
+    ``results/image_manifest.json`` instead of ``results/openssl_image_manifest.json``),
+    so every CVE lookup misses and the whole run reports "No Phase 1 Baseline".
+    Mirrors orchestrator.py defaults."""
     p1 = {}
-    phase0_rel = _cfg.get("phase0_config", "")
-    if phase0_rel:
-        phase0_path = Path(phase0_rel)
+    if phase0_config is not None:
+        phase0_path: Optional[Path] = Path(phase0_config)
+    else:
+        phase0_rel = _cfg.get("phase0_config", "")
+        phase0_path = Path(phase0_rel) if phase0_rel else None
+    if phase0_path is not None:
         if not phase0_path.is_absolute():
             phase0_path = _BASE_DIR / phase0_path
         if phase0_path.exists():
@@ -327,13 +343,20 @@ class ValidationResult:
 # Logging Configuration
 # =============================================================================
 
-def setup_logging(log_dir: Path, verbose: bool = False) -> logging.Logger:
-    """Configure logging for the validator"""
+def setup_logging(log_dir: Path, verbose: bool = False,
+                  log_file: Optional[Path] = None) -> logging.Logger:
+    """Configure logging for the validator.
+
+    ``log_file`` overrides the default ``validator_<ts>.log`` name. The feedback
+    loop passes its own ``feedback_loop_<ts>.log`` so its many per-retry
+    re-validations append to ONE dedicated feedback log instead of spawning a
+    fresh validator_*.log (the Phase-3 formfactor) for every attempt."""
     log_dir.mkdir(parents=True, exist_ok=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"validator_{timestamp}.log"
-    
+
+    if log_file is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = log_dir / f"validator_{timestamp}.log"
+
     log_level = logging.DEBUG if verbose else logging.INFO
     
     # Create formatters
@@ -477,16 +500,35 @@ class PatchDiscovery:
         patched_file = None
         function_only_file = None
         response_json = None
-        
+        invalid_file = None
+
         for file in model_dir.iterdir():
             if file.name == "response.json":
                 response_json = file
             elif file.name.endswith("_function_only.c"):
                 function_only_file = file
-            elif file.name.endswith(".c") and not file.name.endswith("_invalid.c"):
+            elif file.name.endswith("_invalid.c"):
+                # Host-side `gcc -fsyntax-only` flagged this patch. That gate
+                # FALSE-NEGATIVES on project-internal code (missing internal
+                # headers/types it can't see standalone), so the patch may be
+                # perfectly good. Keep it as a fallback and let the REAL
+                # in-container rebuild be the arbiter (a true compile failure
+                # then feeds the feedback loop) instead of hard-dropping it.
+                invalid_file = file
+            elif file.name.endswith(".c"):
                 # This is the full patched file (e.g., strtod_l.c)
                 if "_function_only" not in file.name:
                     patched_file = file
+
+        # B1: defer the syntax verdict to the in-container build. When no clean
+        # patched file exists, fall back to the host-syntax-flagged one (if it
+        # carries real content) rather than dropping the CVE before Phase 3.
+        if not patched_file and invalid_file and invalid_file.exists() and invalid_file.stat().st_size > 0:
+            patched_file = invalid_file
+            self.logger.info(
+                f"{cve_id}/{model_name}: host gcc flagged {invalid_file.name}; "
+                f"validating anyway — the in-container rebuild is the real arbiter"
+            )
         
         # Load metadata from response.json if available
         original_filepath = ""
@@ -501,6 +543,25 @@ class PatchDiscovery:
             except Exception as e:
                 self.logger.warning(f"Failed to parse {response_json}: {e}")
         
+        # A patch whose TARGET is a regression TEST (not the vulnerable source)
+        # can only "pass" validation by altering/deleting the test itself — a
+        # false positive (cf. openssl CVE-2016-7055 editing test/bntest.c and
+        # dropping the discriminating assertion). Reject it here so it can never
+        # become a spurious Success. Project-agnostic: keys off the same test-path
+        # conventions Phase 0 uses (tst-/test-/bug- basename or a test directory).
+        if original_filepath:
+            _p = original_filepath.replace("\\", "/").lower()
+            _base = _p.rsplit("/", 1)[-1]
+            _dirs = _p.split("/")[:-1]
+            if _base.startswith(("tst-", "test-", "test_", "bug-")) or any(
+                d in ("test", "tests", "testsuite", "regress", "regression") for d in _dirs
+            ):
+                self.logger.warning(
+                    f"{cve_id}/{model_name}: patch target {original_filepath!r} is a TEST file, "
+                    f"not vulnerable source — skipping (a test-file patch cannot be a real fix)"
+                )
+                return None
+
         # Only return if we have a valid patched file
         if patched_file and patched_file.exists():
             patch_info = PatchInfo(
@@ -1197,9 +1258,22 @@ class ValidationReportGenerator:
     def add_result(self, result: ValidationResult):
         """Add a validation result"""
         self.results.append(result)
-        
+
         # Also save individual result immediately (for crash recovery)
         self._save_individual_result(result)
+
+    def live_counts(self) -> dict:
+        """Live Phase-3 breakdown for the dashboard (mirrors get_progress)."""
+        def n(status):
+            return sum(1 for r in self.results if r.status == status.value)
+        return {
+            "success": n(ValidationStatus.SUCCESS),
+            "poc_still_works": n(ValidationStatus.POC_STILL_WORKS),
+            "sast_failures": n(ValidationStatus.SAST_FAILED),
+            "build_failures": sum(1 for r in self.results if not r.build_success),
+            "execution_errors": n(ValidationStatus.EXECUTION_ERROR),
+            "no_baseline": n(ValidationStatus.NO_BASELINE),
+        }
     
     def _save_individual_result(self, result: ValidationResult):
         """Save individual result to file"""
@@ -1360,10 +1434,23 @@ class ValidationPipeline:
         self.cleanup = args.cleanup
         self.specific_cve = args.cve
 
+        # Active project's Phase 0 YAML, passed by the orchestrator via
+        # --phase0-config. Drives BOTH the Phase 1 manifest path AND the SAST
+        # tooling, so a multi-project run validates against the right project
+        # instead of silently falling back to the config.yaml (glibc) default.
+        self.phase0_config_path = (
+            Path(args.phase0_config).resolve()
+            if getattr(args, "phase0_config", None)
+            else None
+        )
+
         # Project-/language-specific SAST policy (tools, fail_on, timeout) from
         # the active project's Phase 0 YAML. SAST is skipped if the CLI requests
         # it OR the project disables it (sast.enabled: false).
-        self.sast_config = load_sast_config(pipeline_config_path=_BASE_DIR / "config.yaml")
+        self.sast_config = load_sast_config(
+            pipeline_config_path=_BASE_DIR / "config.yaml",
+            phase0_config_path=self.phase0_config_path,
+        )
         self.skip_sast = bool(args.skip_sast) or not self.sast_config.enabled
 
         # Setup directories
@@ -1371,11 +1458,17 @@ class ValidationPipeline:
         self.results_dir = self.base_dir / "validation_results"
         self.logs_dir = self.base_dir / "logs"
         
-        # Setup logging
-        self.logger = setup_logging(self.logs_dir, args.verbose)
+        # Setup logging. The feedback loop passes args.log_file so its per-retry
+        # re-validations append to its dedicated feedback_loop_<ts>.log instead of
+        # creating a new validator_<ts>.log for each attempt.
+        _explicit_log = getattr(args, "log_file", None)
+        self.logger = setup_logging(
+            self.logs_dir, args.verbose,
+            Path(_explicit_log) if _explicit_log else None,
+        )
         
         # Phase 1 image layout + manifest (methodology v2)
-        self.phase1_layout = _resolve_phase1_layout(self.base_dir)
+        self.phase1_layout = _resolve_phase1_layout(self.base_dir, self.phase0_config_path)
 
         # Initialize components
         self.csv_parser = CSVParser(self.csv_path, self.logger)
@@ -1415,7 +1508,13 @@ class ValidationPipeline:
             sys.exit(1)
         
         self.logger.info(f"Found {len(patches)} patches to validate")
-        
+
+        _live_dir = self.base_dir / "results"
+        total_patches = len(patches)
+        if live_progress:
+            live_progress.emit(_live_dir, 3, total_patches, 0,
+                               self.report_gen.live_counts())
+
         # Process each patch
         for idx, patch_info in enumerate(patches, 1):
             self.logger.info(f"\n{'='*60}")
@@ -1426,13 +1525,23 @@ class ValidationPipeline:
             vuln_info = vuln_info_map.get(patch_info.cve_id)
             if not vuln_info:
                 self.logger.warning(f"No vulnerability info found for {patch_info.cve_id}")
+                if live_progress:
+                    live_progress.emit(_live_dir, 3, total_patches, idx,
+                                       self.report_gen.live_counts())
                 continue
-            
+
             result = self._validate_patch(patch_info, vuln_info)
             self.report_gen.add_result(result)
             self.logger.info(f"Validation completed for {patch_info.cve_id}/{patch_info.model_name}: "
                            f"{result.status} (duration: {result.execution_time_seconds:.1f}s)")
-        
+            if live_progress:
+                live_progress.emit(_live_dir, 3, total_patches, idx,
+                                   self.report_gen.live_counts())
+
+        if live_progress:
+            live_progress.emit(_live_dir, 3, total_patches, total_patches,
+                               self.report_gen.live_counts(), running=False)
+
         phase_end_time = datetime.now()
         phase_duration = (phase_end_time - phase_start_time).total_seconds()
         
@@ -1551,12 +1660,19 @@ class ValidationPipeline:
                 result.error_message = "Patch file not found"
                 return result
             
-            # Check if patch is marked as invalid (syntax errors)
+            # The Phase 2 host-side `gcc -fsyntax-only` flag (patch_info.is_valid
+            # = False) is ADVISORY only — it false-negatives on project-internal
+            # code it cannot see standalone (missing internal headers/types), which
+            # silently dropped ~7 good glibc patches before they were ever built.
+            # The authoritative arbiter is the in-container rebuild below: a real
+            # compile failure surfaces as BUILD_ERROR and feeds the feedback loop.
+            # So no longer hard-reject here; just note it and proceed to the build.
             if not patch_info.is_valid:
-                result.status = ValidationStatus.INVALID_PATCH.value
-                result.error_message = "Patch has syntax errors (marked invalid in Phase 2)"
-                return result
-            
+                self.logger.info(
+                    f"{patch_info.log_label}: host syntax check flagged this patch; "
+                    f"deferring the verdict to the in-container rebuild (real arbiter)"
+                )
+
             # Step 2: Look up the Phase 1 baseline for this CVE (methodology
             # v2): the built CVE image tag + the deterministic baseline exit
             # code. Without them there is nothing to derive from or compare
@@ -1921,7 +2037,16 @@ Examples:
         action='store_true',
         help='Enable verbose output'
     )
-    
+
+    parser.add_argument(
+        '--phase0-config',
+        default=None,
+        help="Active project's Phase 0 YAML (e.g. cve_aggregator/openssl_config.yaml). "
+             "Resolves the Phase 1 image_manifest_path and the project's SAST tooling. "
+             "Without it, Phase 3 falls back to config.yaml's phase0_config (glibc) and "
+             "looks for the wrong manifest, reporting every CVE as 'No Phase 1 Baseline'."
+    )
+
     args = parser.parse_args()
     
     # Set default paths from config.yaml, relative to base directory

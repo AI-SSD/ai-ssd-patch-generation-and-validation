@@ -8,6 +8,7 @@ from typing import List
 from .config import BASE_DIR, PipelineConfig, PHASE_SCRIPTS, cfg_section
 from .models import PhaseResult, PhaseStatus
 from .utils import format_duration
+from . import notify
 
 logger = logging.getLogger('pipeline')
 
@@ -54,9 +55,17 @@ class PhaseExecutor:
         
         # Build command based on phase
         cmd = self._build_command(phase, script_path)
-        
+
         logger.info(f"Executing: {' '.join(cmd)}")
-        
+
+        # Notify: phase starting (gated by notify_phase; low priority so it
+        # delivers silently). The cell = the project__profile working-dir name.
+        cell = self.config.base_dir.name
+        ntitle = f"AI-SSD {cell}"
+        notify.send("phase_start",
+                    f"{cell} — Phase {phase} ({notify.phase_label(phase)}) started",
+                    title=ntitle, base_dir=self.config.base_dir)
+
         # Execute phase
         start_time = datetime.now()
         result = PhaseResult(
@@ -75,6 +84,12 @@ class PhaseExecutor:
             root_str = str(self._pipeline_root)
             if root_str not in pp.split(os.pathsep):
                 env["PYTHONPATH"] = root_str + (os.pathsep + pp if pp else "")
+            # Phase 0 runs with cwd=base_dir (a per-project workdir), so shared
+            # INPUT clones referenced by relative paths in the Phase 0 YAML
+            # (poc_mapper.exploitdb_path, commit_discovery.repo_local_path — kept
+            # beside the pipeline dir) must be resolved against the pipeline root,
+            # not the CWD. cve_aggregator.modules.base.resolve_input_path reads this.
+            env["SSD_PIPELINE_ROOT"] = root_str
 
             process = subprocess.run(
                 cmd,
@@ -96,7 +111,20 @@ class PhaseExecutor:
                 result.status = PhaseStatus.SUCCESS
                 result.output_files = self._detect_output_files(phase)
                 logger.info(f"Phase {phase} completed successfully in {format_duration(result.duration_seconds)}")
-                
+                # Notify: phase done, with a best-effort headline metric.
+                _hl = notify.phase_headline(phase, self.config.base_dir)
+                _dur = format_duration(result.duration_seconds)
+                notify.send("phase_done",
+                            f"{cell} — Phase {phase} ({notify.phase_label(phase)}) done in {_dur}"
+                            + (f" · {_hl}" if _hl else ""),
+                            title=ntitle, base_dir=self.config.base_dir)
+                # The phase runs as a subprocess with captured output, so the
+                # banner above it in this (tee'd) log would otherwise be blank.
+                # Each phase ALSO writes its own detailed log under base_dir/logs;
+                # point there so the run is never an empty banner. Use --verbose to
+                # inline the full child stdout/stderr here instead.
+                logger.info(f"Phase {phase} detailed output → {self.config.base_dir / 'logs'}/  (use --verbose to inline)")
+
                 # Check if output files are missing even on success
                 if not result.output_files and phase in [0, 2]:  # Phase 0 and 2 are critical for files
                     logger.warning(f"Phase {phase} completed but no output files were detected!")
@@ -113,7 +141,12 @@ class PhaseExecutor:
                 logger.error(f"Phase {phase} failed with exit code {process.returncode}")
                 if process.stderr:
                     logger.error(f"STDERR: {process.stderr[:500]}")
-        
+                notify.send("phase_failed",
+                            f"❌ {cell} — Phase {phase} ({notify.phase_label(phase)}) "
+                            f"FAILED (exit {process.returncode}) after "
+                            f"{format_duration(result.duration_seconds)}",
+                            title=ntitle, base_dir=self.config.base_dir)
+
         except subprocess.TimeoutExpired:
             end_time = datetime.now()
             result.end_time = end_time.isoformat()
@@ -122,7 +155,11 @@ class PhaseExecutor:
             result.error_message = f"Timeout after {self._get_timeout(phase)}s"
             result.exit_code = -1
             logger.error(f"Phase {phase} timed out")
-        
+            notify.send("phase_failed",
+                        f"⏱ {cell} — Phase {phase} ({notify.phase_label(phase)}) "
+                        f"TIMED OUT after {self._get_timeout(phase)}s",
+                        title=ntitle, base_dir=self.config.base_dir)
+
         except Exception as e:
             end_time = datetime.now()
             result.end_time = end_time.isoformat()
@@ -131,7 +168,11 @@ class PhaseExecutor:
             result.error_message = str(e)
             result.exit_code = -1
             logger.error(f"Phase {phase} failed with exception: {e}")
-        
+            notify.send("phase_failed",
+                        f"❌ {cell} — Phase {phase} ({notify.phase_label(phase)}) "
+                        f"crashed: {str(e)[:160]}",
+                        title=ntitle, base_dir=self.config.base_dir)
+
         return result
     
     def _build_command(self, phase: int, script_path: Path) -> List[str]:
@@ -198,6 +239,16 @@ class PhaseExecutor:
         
         elif phase == 3:  # Patch Validator
             cmd.extend(['--base-dir', str(self.config.base_dir)])
+            # Pass the active project Phase 0 YAML so Phase 3 resolves the right
+            # image_manifest_path and SAST tooling (mirrors Phase 1/2). Without
+            # it the validator falls back to config.yaml's glibc default manifest,
+            # finds nothing, and reports every CVE as "No Phase 1 Baseline".
+            phase0_config_path = (
+                Path(self.config.phase0_config)
+                if Path(self.config.phase0_config).is_absolute()
+                else self._pipeline_root / self.config.phase0_config
+            )
+            cmd.extend(['--phase0-config', str(phase0_config_path)])
             phase0_csv = self.config.resolve_phase0_outputs().get("csv_path")
             if phase0_csv:
                 cmd.extend(['--csv-file', str(phase0_csv)])

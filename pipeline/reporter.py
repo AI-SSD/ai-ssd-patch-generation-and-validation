@@ -1069,7 +1069,7 @@ class ReportGenerator:
         lines.append("| Metric | Value |")
         lines.append("|--------|-------|")
         lines.append(f"| CVEs Analyzed | {total_cves} |")
-        lines.append(f"| Vulnerabilities Reproduced | {reproduced}/{total_cves} ({reproduced/total_cves*100:.1f}%) |")
+        lines.append(f"| Vulnerabilities Reproduced | {reproduced}/{total_cves} ({reproduced/total_cves*100 if total_cves else 0:.1f}%) |")
         lines.append(f"| Total Patches Generated | {total_patches} |")
         lines.append(f"| Syntax Valid Patches | {syntax_valid}/{total_patches} ({syntax_valid/total_patches*100 if total_patches else 0:.1f}%) |")
         lines.append(f"| Successful Vulnerability Fixes | {vulnerabilities_fixed} |")
@@ -1462,7 +1462,34 @@ class PipelineReporter:
         model_stats = calc.get_model_stats()
         cve_stats = calc.get_cve_stats()
         sast_summary = calc.get_sast_summary()
-        
+
+        # A legitimately EMPTY run (nothing reproduced in Phase 1, so nothing to
+        # patch/validate — e.g. a project whose CVEs have no usable ExploitDB PoC,
+        # like FFmpeg) is NOT a Phase-4 failure. The chart generators assume
+        # non-empty data and can fail hard on a server backend, so skip them and
+        # emit a minimal "nothing reproduced" report; the pipeline then ends
+        # cleanly (exit 0) instead of reporting a spurious Phase-4 crash.
+        if not phase1_results and not phase2_results and not phase3_results:
+            logger.warning(
+                "No Phase 1/2/3 results — emitting a minimal report and skipping "
+                "charts (a run with nothing reproduced is not a Phase-4 failure)."
+            )
+            report_path = self.report_gen.generate_full_report(
+                phase1_results=phase1_results,
+                phase2_metadata=phase2_metadata,
+                phase2_results=phase2_results,
+                phase3_metadata=phase3_metadata,
+                phase3_results=phase3_results,
+                model_stats=model_stats,
+                cve_stats=cve_stats,
+                sast_summary=sast_summary,
+                chart_paths={},
+                feedback_entries=None,
+                feedback_stats=None,
+            )
+            logger.info(f"Report generation complete (empty run): {report_path}")
+            return report_path
+
         # Generate visualizations
         logger.info("Generating visualizations...")
         chart_paths = {}

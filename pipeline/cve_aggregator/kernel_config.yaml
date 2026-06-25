@@ -21,6 +21,14 @@ pipeline:
   abort_on_error: false          # Continue even if one module fails
   skip_modules: []
 
+# Reproducer priority (see aggregator_config.yaml for all modes). ExploitDB
+# preferred; fix-commit test (Option A) as fallback. NOTE: the kernel has no
+# phase1.intree_test recipe and kselftests can't run against a built kernel in
+# Docker, so "intree" CVEs route to manual — ExploitDB is the effective source.
+reproduction_strategy:
+  - exploitdb
+  - intree
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -40,6 +48,13 @@ cve_fetcher:
   # These are sent as ``keywordSearch`` to the NVD 2.0 API.
   keywords:
     - "linux kernel"
+
+  # CPE match — sent as virtualMatchString to NVD 2.0; selects CVEs NVD records as
+  # genuinely AFFECTING the product (version-ranged), far more precise/complete
+  # than keyword search. Merged + de-duped with keyword results. Mirrors glibc.
+  # WARNING: the kernel has THOUSANDS of CVEs — expect a very large, slow fetch.
+  cpe_match:
+    - "cpe:2.3:o:linux:linux_kernel"
 
   # Strong keywords that MUST appear in a CVE description for it to be
   # considered relevant.  Used for deduplication filtering.
@@ -114,7 +129,7 @@ commit_discovery:
 
   # Local path to the cloned repository (relative to CWD or absolute).
   # WARNING: a full kernel clone is ~4-5 GB; ensure sufficient disk space.
-  repo_local_path: "./linux"
+  repo_local_path: "../linux"
 
   # Timeout (seconds) for the initial git clone.
   # The Linux kernel repo is ~4-5 GB; the default 1800 s (30 min) may not
@@ -153,7 +168,7 @@ poc_mapper:
   # Local path to the ExploitDB git repository.
   # Points to the shared clone at the pipeline root (two levels up from
   # the per-project working directory projects/<name>/).
-  exploitdb_path: "../../exploit-database"
+  exploitdb_path: "../exploit-database"
 
   # Remote URL (for auto-clone)
   exploitdb_remote_url: "https://gitlab.com/exploit-database/exploitdb.git"
@@ -300,6 +315,9 @@ output:
     - "poc_index"
     - "poc_path"
     - "poc_language"
+    - "FIX_COMMIT"
+    - "TEST_PATH"
+    - "TEST_SUBDIR"
     - "manual_review_required"
     - "manual_verified"
 
@@ -368,7 +386,7 @@ sast:
 # ---------------------------------------------------------------------------
 phase1:
   # Local path to the project source repository (relative to pipeline base_dir)
-  project_repo_local_path: "linux"
+  project_repo_local_path: "../linux"
 
   # Remote URL used to clone the repo when it is absent locally
   project_repo_remote_url: "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
@@ -423,3 +441,48 @@ phase1:
     2024: "24.04"
     2025: "24.04"
     2026: "24.04"
+
+  # ---- Base image packages (kernel build toolchain) ----
+  base_packages:
+    - build-essential
+    - flex
+    - bison
+    - bc
+    - libelf-dev
+    - libssl-dev
+  base_packages_optional:
+    - kmod
+    - cpio
+  base_setup: ""
+
+  # Era from commit date (no single kernel version file read here).
+  version_file: ""
+  version_regex: ''
+  version_era_map: {}
+
+  poc_run_env: {}
+
+  # ---- build_script — STARTING POINT, UNTESTED, BUILD-ONLY ----
+  # `make defconfig && make` builds a kernel image. NOTE: this is SLOW (tens of
+  # minutes) and produces a vmlinux/bzImage, NOT a runnable target — see the
+  # reproduction note below. Writes the /build/build_status markers.
+  build_script: |
+    #!/bin/bash
+    cd "$SOURCE_DIR" || exit 1
+    make O="$BUILD_DIR" defconfig > /build/cfg.log 2>&1 && echo CONFIG_OK || { echo CONFIG_FAIL; tail -20 /build/cfg.log; }
+    make O="$BUILD_DIR" -j"$(nproc)" > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status
+    tail -20 /build/make.log
+    echo "PROJECT_INSTALL_EXIT_CODE=0" >> /build/build_status
+    if ls "$BUILD_DIR"/vmlinux >/dev/null 2>&1 || ls "$BUILD_DIR"/arch/*/boot/bzImage >/dev/null 2>&1; then echo "PROJECT_BUILD_INSTALLED=yes" >> /build/build_status; else echo "PROJECT_BUILD_INSTALLED=no" >> /build/build_status; fi
+    echo "build complete"
+
+  # ---- Reproduction hooks: OUT OF SCOPE for the kernel ----
+  # Reproducing a kernel CVE means BOOTING the custom-built kernel and running an
+  # LPE/syscall PoC against it — which needs a VM (KVM/qemu), not a Docker
+  # container sharing the host kernel. The pipeline cannot do this, so the kernel
+  # is a BUILD-ONLY target: build_script can compile the tree (useful for patch
+  # build-validation), but Phase 1 reproduction will route every CVE to manual.
+  # Left empty deliberately — do NOT fabricate a fake baseline.
+  poc_prepare_script: ""
+  poc_launch_script: ""
+  patch_rebuild_script: ""

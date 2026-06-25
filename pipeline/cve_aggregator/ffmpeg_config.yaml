@@ -1,0 +1,419 @@
+# =============================================================================
+# CVE Aggregator Pipeline – FFmpeg Configuration  (KERNEL-SCALE C, CLI SHAPE)
+# =============================================================================
+# The "large like the kernel, but actually reproducible in Docker" candidate.
+# FFmpeg is a huge C tree with thousands of CVEs, yet — unlike the kernel — it
+# reproduces WITHOUT a VM: most CVEs are crash-on-decode of a crafted media file
+# fed to the built `ffmpeg`/`ffprobe` binary, or a C PoC that links libavcodec/
+# libavformat and calls avformat_open_input() on crafted data.
+#
+# HONEST SCOPE (read before running) — FFmpeg is the CLI SHAPE, only PARTIALLY
+# supported by the current pipeline (see docs/CPP_VERSATILITY_ANALYSIS.md §3):
+#  * C PoCs that LINK the FFmpeg libraries reproduce like glibc/libxml2 — the
+#    poc_prepare_script below links libav* and the honesty marker checks the build.
+#    These work today.
+#  * PoCs that are a crafted INPUT FILE driving the `ffmpeg` BINARY need (a) the
+#    CLI honesty pattern — "the PoC invoked the BUILT binary at $INSTALL_PREFIX/bin"
+#    (§3.3) — and (b) the poc_analyzer prompts lifted off glibc (§3.1). Until that
+#    code lands, such PoCs route to MANUAL. This is the same class of gap that
+#    parks tomcat/kernel, NOT a config error.
+#  * Build is SLOW and the tree is large; keep --disable-doc and expect long first
+#    builds (still minutes, not the kernel's tens-of-minutes-and-no-repro).
+# Build hooks are UNTESTED STARTING POINTS — expect first-run VM iteration.
+# Run: python3 pipeline.py --phase0-config cve_aggregator/ffmpeg_config.yaml
+# =============================================================================
+
+project:
+  name: "ffmpeg"
+  display_name: "FFmpeg"
+  description: "CVE and PoC dataset for FFmpeg"
+
+pipeline:
+  abort_on_error: false
+  skip_modules: []
+
+# Reproducer priority (see aggregator_config.yaml for all modes). ExploitDB PoC
+# preferred; the fix-commit test (Option A) is the fallback for CVEs with no PoC.
+# NOTE: "intree" only RUNS once this project has a phase1.intree_test recipe
+# (FFmpeg has the FATE suite, but it is not wired here) — until then harvested
+# tests route to manual and ExploitDB is the effective source.
+reproduction_strategy:
+  - exploitdb
+  - intree
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  file: "logs/ffmpeg_cve_aggregator.log"
+
+# ---------------------------------------------------------------------------
+# Module 1: CVE Fetching
+# ---------------------------------------------------------------------------
+cve_fetcher:
+  nvd_api_key: "043bad81-616b-445a-8e79-96e87cc96c66"
+  keywords:
+    - "FFmpeg"
+  cpe_match:
+    - "cpe:2.3:a:ffmpeg:ffmpeg"
+  strong_keywords:
+    - "FFmpeg"
+    - "ffmpeg"
+  # Libav is the historical FORK that shares code/filenames and co-appears in
+  # descriptions; the other media stacks merely bundle/co-mention FFmpeg.
+  non_target_indicators:
+    - "Libav"
+    - "libav "
+    - "VLC"
+    - "MPlayer"
+    - "mplayer"
+    - "HandBrake"
+    - "GStreamer"
+    - "Kodi"
+    - "MythTV"
+    - "Bento4"
+  strict_target_matching: true
+  require_project_cpe_match: false
+  project_cpe_aliases:
+    - "ffmpeg"
+    - "ffmpeg:ffmpeg"
+  enrich_with_cve_org: false
+  cve_org_delay: 1.0
+  # FFmpeg's earliest NVD CVEs date to ~2008-2009.
+  min_published_year: 2008
+
+# ---------------------------------------------------------------------------
+# Module 2: Commit Discovery
+# ---------------------------------------------------------------------------
+commit_discovery:
+  repo_url: "https://github.com/FFmpeg/FFmpeg.git"
+  repo_local_path: "../ffmpeg"
+  clone_timeout: 1800
+  harvest_regression_tests: false
+  auto_update: true
+  extra_grep_patterns: []
+  # FFmpeg uses Trac/GitHub, not Bugzilla; commits cite the CVE id directly.
+  enable_bz_fallback: false
+  allow_unscoped_extra_patterns: false
+  bugzilla_hosts: []
+  enable_online_bug_resolution: false
+  source_extensions:
+    - ".c"
+    - ".h"
+
+# ---------------------------------------------------------------------------
+# Module 3: PoC Mapping (ExploitDB)
+# ---------------------------------------------------------------------------
+poc_mapper:
+  exploitdb_path: "../exploit-database"
+  exploitdb_remote_url: "https://gitlab.com/exploit-database/exploitdb.git"
+  auto_update: true
+  deep_search: true                      # FFmpeg PoCs reference CVEs inside source/comments
+  extract_content: true
+  reverse_search: true
+  enable_reverse_content_grep: true
+  # FFmpeg PoCs are mostly community fuzzing repros — don't require verified.
+  require_verified: false
+  prefer_platforms:
+    - "linux"
+  non_target_indicators:
+    - "Libav"
+    - "Windows"
+
+# ---------------------------------------------------------------------------
+# Module 4–7: Aggregator / Validation / Repair / Output
+# ---------------------------------------------------------------------------
+data_aggregator:
+  global_json_path: "results/ffmpeg_cve_poc_map.json"
+  prune_missing_cves: true
+
+syntax_validator:
+  manual_supervision_dir: "manual_supervision"
+  report_path: "results/ffmpeg_syntax_validation_report.json"
+  allow_manual_without_commit: false
+
+poc_repair:
+  provider: "openai"
+  openai_model: "gpt-4.1-mini"
+  openai_api_key: ""
+  api_endpoint: "http://10.3.2.171:80/api/chat"
+  model: "devstral:32k"
+  max_repair_attempts: 3
+  models_by_attempt:
+    1: "gpt-4.1-mini"
+    2: "gpt-5-mini"
+    3: "gpt-4.1"
+  api_timeout: 600
+  model_load_timeout: 300
+  num_ctx: 32768
+  max_poc_chars: 0
+  temperature: 0.4
+  report_path: "results/ffmpeg_poc_repair_report.json"
+  manual_review_queue_path: "results/ffmpeg_manual_review_queue.json"
+  gpu_wait_timeout: 120
+
+output:
+  global_json_path: "results/ffmpeg_cve_poc_map.json"
+  filtered_json_path: "results/ffmpeg_cve_poc_map_filtered.json"
+  csv_path: "results/ffmpeg_cve_poc_complete.csv"
+  poc_dir: "exploits"
+  filtered_require_commit: false
+  filtered_require_poc: true
+  filtered_require_verified_poc: false
+  flag_unvalidated_edb_for_manual_review: true
+  manual_supervision_dir: "manual_supervision"
+  allow_poc_without_commit: false
+  csv_fields:
+    - "CVE"
+    - "V_COMMIT"
+    - "FilePath"
+    - "F_NAME"
+    - "UNIT_TYPE"
+    - "V_FILE"
+    - "V_FUNCTION"
+    - "CVE_Description"
+    - "CWE"
+    - "CWE_Description"
+    - "project_version"
+    - "project_version_normalized"
+    - "ubuntu_version"
+    - "poc_index"
+    - "poc_path"
+    - "poc_language"
+    - "FIX_COMMIT"
+    - "TEST_PATH"
+    - "TEST_SUBDIR"
+    - "manual_review_required"
+    - "manual_verified"
+
+# ---------------------------------------------------------------------------
+# Phase 2: LLM patch generation (C)
+# ---------------------------------------------------------------------------
+phase2:
+  language: "c"
+  system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for FFmpeg (the multimedia decoding/encoding framework — libavcodec,
+    libavformat, libavutil, etc.). Your task is to fix a security vulnerability by
+    making the SMALLEST POSSIBLE EDIT to the vulnerable function — never by
+    rewriting it.
+  feedback_system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for FFmpeg. Your previous patch attempt FAILED validation. Analyze the failure
+    and produce an improved fix as MINIMAL edits — never rewrite the whole function.
+  internal_headers: []
+
+# ---------------------------------------------------------------------------
+# Phase 3: SAST (C stack — same as glibc/libxml2/kernel)
+# ---------------------------------------------------------------------------
+sast:
+  enabled: true
+  fail_on: [critical, high]
+  tool_timeout: 180
+  tools:
+    - name: cppcheck
+      detect: cppcheck
+      cmd: ["cppcheck", "--enable=all", "--xml", "--xml-version=2", "{file}"]
+      parser: cppcheck-xml
+      install: { apt: cppcheck }
+    - name: clang-tidy
+      detect: clang-tidy
+      cmd: ["clang-tidy", "--quiet", "--checks=clang-analyzer-*,bugprone-*,cert-*", "{file}", "--"]
+      parser: regex
+      regex: '^(.+?):(\d+):(\d+):\s+(warning|error):\s+(.+?)\s+\[([^\]]+)\]$'
+      groups: { file: 1, line: 2, column: 3, severity: 4, message: 5, rule: 6 }
+      severity_map: { warning: medium, error: high }
+      install: { apt: clang-tidy }
+    - name: semgrep
+      detect: semgrep
+      cmd: ["semgrep", "scan", "--sarif", "--quiet", "--metrics=off", "--config=p/c", "{file}"]
+      parser: sarif
+      install: { pip: semgrep }
+    - name: flawfinder
+      detect: flawfinder
+      cmd: ["flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      fallback_cmd: ["{python}", "-m", "flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      parser: flawfinder
+      install: { pip: flawfinder }
+
+# ---------------------------------------------------------------------------
+# Phase 1: reproduction (shared with Phase 3)
+# ---------------------------------------------------------------------------
+phase1:
+  project_repo_local_path: "../ffmpeg"
+  project_repo_remote_url: "https://github.com/FFmpeg/FFmpeg.git"
+  docker_base_image_prefix: "ai-ssd/ffmpeg-base"
+  docker_cve_image_prefix: "ai-ssd/ffmpeg-cve"
+  image_manifest_path: "results/ffmpeg_image_manifest.json"
+  source_dir_name: "project-src"
+  build_dir_name: "project-build"
+  install_prefix: "/opt/project-build"
+
+  # FFmpeg's configure is a custom shell script. nasm/yasm assemble the x86 SIMD;
+  # without them the build falls back to --disable-x86asm (slower, still builds).
+  base_packages:
+    - build-essential
+    - pkg-config
+    - nasm
+  base_packages_optional:
+    - yasm
+    - zlib1g-dev
+    - wget
+    - gcc-multilib
+    - g++-multilib
+  base_setup: |
+    dpkg --add-architecture i386 && apt-get update && apt-get install -y libc6-dev-i386 || true
+
+  # FFmpeg builds across eras; old trees want older toolchains. Map by commit date.
+  commit_era_map:
+    2008: "14.04"
+    2010: "14.04"
+    2012: "14.04"
+    2014: "16.04"
+    2015: "16.04"
+    2016: "16.04"
+    2017: "18.04"
+    2018: "18.04"
+    2019: "20.04"
+    2020: "20.04"
+    2021: "22.04"
+    2022: "22.04"
+    2023: "24.04"
+    2024: "24.04"
+    2025: "24.04"
+    2026: "24.04"
+
+  version_file: ""
+  version_regex: ''
+  version_era_map: {}
+  enable_arch_fallback: true
+
+  poc_run_env: {}
+
+  # ---- build_script — STARTING POINT, UNTESTED ----
+  # In-tree build (FFmpeg's configure must run from the source tree). --enable-shared
+  # gives .so libs the C PoC can link; the ffmpeg/ffprobe BINARIES are kept (NOT
+  # --disable-programs) so the CLI-shape PoCs have something to invoke. Docs are
+  # disabled to cut build time. If asm tools are missing, retry with --disable-x86asm.
+  # Writes the /build/build_status markers Phase 1/3 read.
+  build_script: |
+    #!/bin/bash
+    SRC="$SOURCE_DIR"; PFX="$INSTALL_PREFIX"
+    EXTRA=""; ARCHCFG=""
+    if [ "$BUILD_ARCH" = "i386" ]; then
+      ARCHCFG="--arch=x86_32 --extra-cflags=-m32 --extra-ldflags=-m32 --disable-x86asm"
+    fi
+    cd "$SRC" || exit 1
+    CFGFLAGS="--prefix=$PFX --enable-shared --disable-static --disable-doc --disable-htmlpages --disable-manpages --disable-podpages --enable-gpl --disable-stripping $ARCHCFG"
+    ( ./configure $CFGFLAGS 2>&1 && echo CONFIGURE_OK ) > /build/cfg.log 2>&1 \
+      || ( echo "=== retry: --disable-x86asm ==="; ./configure $CFGFLAGS --disable-x86asm --disable-asm 2>&1 && echo CONFIGURE_OK ) > /build/cfg.log 2>&1 \
+      || { echo "CONFIGURE_FAIL"; tail -30 /build/cfg.log; }
+    make -j"$(nproc)" -k > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
+    make install -k > /build/make_install.log 2>&1; echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status
+    if [ -x "$PFX/bin/ffmpeg" ] && ls "$PFX"/lib/libavcodec.so* >/dev/null 2>&1; then echo "PROJECT_BUILD_INSTALLED=yes" >> /build/build_status; else echo "PROJECT_BUILD_INSTALLED=no" >> /build/build_status; fi
+    echo "build complete"
+
+  # ---- poc_prepare_script — compile the C PoC against the project FFmpeg libs ----
+  # Covers the LIBRARY-LINKING PoCs (a C program that calls avformat_open_input()/
+  # avcodec_* on crafted data). Honesty = the PoC resolves the project libav*.
+  # NOTE: PoCs that instead drive the `ffmpeg` BINARY on a crafted file are the CLI
+  # shape — see the header. The `ffmpeg` binary is on $PFX/bin so an interpreted PoC
+  # CAN call it, but the CLI honesty marker (§3.3) isn't implemented yet, so those
+  # currently fall to manual rather than recording a baseline.
+  poc_prepare_script: |
+    #!/bin/bash
+    PFX="$INSTALL_PREFIX"
+    M32=""; [ "$BUILD_ARCH" = "i386" ] && M32="-m32"
+    cd /poc
+    if grep -qE '^[[:space:]]*(int|void)?[[:space:]]*main[[:space:]]*\(' /poc/exploit_raw.c; then
+      cp /poc/exploit_raw.c /poc/exploit.c
+    else
+      echo '#include <stdio.h>' > /poc/exploit.c
+      echo '#include <stdlib.h>' >> /poc/exploit.c
+      echo '#include <string.h>' >> /poc/exploit.c
+      cat /poc/exploit_raw.c >> /poc/exploit.c
+      echo '' >> /poc/exploit.c
+      echo 'int main(int argc, char *argv[]) { puts("fragment loaded"); return 0; }' >> /poc/exploit.c
+    fi
+    INC="-I$PFX/include"
+    AVLIBS="-lavdevice -lavfilter -lavformat -lavcodec -lswscale -lswresample -lavutil"
+    rm -f /poc/exploit
+    gcc $M32 -O0 -g -w -D_GNU_SOURCE -o exploit exploit.c $INC -L"$PFX/lib" -Wl,-rpath,"$PFX/lib" $AVLIBS -lm -lpthread 2>&1 || \
+    gcc $M32 -O0 -g -w -D_GNU_SOURCE -o exploit exploit.c $INC -L"$PFX/lib" -Wl,-rpath,"$PFX/lib" -lavformat -lavcodec -lavutil -lm 2>&1 || \
+    gcc $M32 -O0 -g -w -D_GNU_SOURCE -o exploit exploit.c -lavformat -lavcodec -lavutil 2>&1 || \
+    gcc $M32 -O0 -g -w -o exploit exploit.c 2>&1 || \
+    echo "compile failed"
+    if [ -f /poc/exploit ]; then echo "SUCCESS"; file /poc/exploit; else echo "ERROR: failed to compile"; head -30 /poc/exploit.c; exit 1; fi
+    for c in $POC_COMPANIONS; do
+      stem="${c%.*}"
+      case "$c" in
+        *.c) ( gcc -O0 -g -w -o "/poc/$stem" "/poc/$c" -I"$PFX/include" -L"$PFX/lib" -Wl,-rpath,"$PFX/lib" -lavformat -lavcodec -lavutil 2>&1 || gcc -O0 -g -w -o "/poc/$stem" "/poc/$c" 2>&1 || echo "WARN: companion $c" ) ;;
+        *.sh|*.py|*.pl|*.rb) chmod +x "/poc/$c" 2>/dev/null || true ;;
+      esac
+    done
+    USES=no
+    if LD_LIBRARY_PATH="$PFX/lib" ldd /poc/exploit 2>/dev/null | grep -q "$PFX"; then USES=yes; fi
+    echo "$USES" > /poc/.ssd_poc_uses_build; echo "poc_uses_project_build: $USES"
+
+  # No project loader needed — default launch (direct run, LD_LIBRARY_PATH=$RUN_LIB)
+  # is correct for the linked C PoC.
+  poc_launch_script: ""
+
+  # ---- patch_rebuild_script — incremental in-tree make + markers ----
+  patch_rebuild_script: |
+    #!/bin/bash
+    cd "$SOURCE_DIR" || { echo "no source dir" > /tmp/ssd_rebuild.log; }
+    make -j"$(nproc)" -k > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
+    make install -k > /tmp/ssd_install.log 2>&1; echo "install exit: $?"
+    grep -B2 -A8 "error:" /tmp/ssd_rebuild.log 2>/dev/null | head -100 > /tmp/ssd_build_errors; true
+    case "$VULN_FILE" in
+      *.c) OBJ="$(basename "$VULN_FILE" .c).o"; find "$SOURCE_DIR" -name "$OBJ" -newer "$SOURCE_DIR/$VULN_FILE" -print -quit > /tmp/ssd_obj_rebuilt; echo "obj_rebuilt: $(cat /tmp/ssd_obj_rebuilt)" ;;
+      *) echo skip > /tmp/ssd_obj_rebuilt ;;
+    esac
+    USES=no
+    if LD_LIBRARY_PATH="$INSTALL_PREFIX/lib" ldd /poc/exploit 2>/dev/null | grep -q "$INSTALL_PREFIX"; then USES=yes; fi
+    echo "$USES" > /tmp/ssd_poc_uses_build; echo "poc_uses_build: $USES"
+
+  # ---- Option A: in-tree regression test (poc_language: intree-test) ----
+  # STARTING POINT, UNTESTED — and LOW YIELD by nature. FFmpeg's regression tests
+  # are FATE (tests/fate/*.mak driving the ffmpeg binary on an EXTERNAL multi-GB
+  # sample suite), NOT committed .c files. is_regression_test_path() only harvests a
+  # .c/.cc/.cpp under test/|tests/, which FFmpeg security fixes almost never add — so
+  # this recipe will RARELY fire. It exists to cover the rare self-contained C test
+  # (e.g. tests/api/*.c) a fix occasionally ships. FATE-based reproduction would need
+  # the sample suite + a different harness and is out of scope here.
+  # Env: SOURCE_DIR, BUILD_DIR, INSTALL_PREFIX, TEST_SUBDIR, TEST_NAME, TEST_PATH,
+  # FIX_COMMIT, COMMIT_HASH. Verdict: test FAILS on the vulnerable build = reproduced.
+  # With reproduction_strategy [exploitdb, intree], intree only runs for CVEs with no
+  # PoC; flip to [intree, exploitdb] to prefer tests.
+  intree_test:
+    build_script: |
+      #!/bin/bash
+      cd "$SOURCE_DIR" || exit 1
+      ( ./configure --prefix="$INSTALL_PREFIX" --enable-shared --disable-static --disable-doc --enable-gpl --disable-stripping 2>&1 && echo CONFIGURE_OK ) > /build/cfg.log 2>&1 \
+        || ( ./configure --prefix="$INSTALL_PREFIX" --enable-shared --disable-static --disable-doc --disable-x86asm --disable-asm 2>&1 && echo CONFIGURE_OK ) > /build/cfg.log 2>&1 \
+        || { echo CONFIGURE_FAIL; tail -25 /build/cfg.log; }
+      make -j"$(nproc)" > /build/make.log 2>&1; echo "BUILD_RC=$?" >> /build/build_status
+      tail -15 /build/make.log; echo "build complete"
+    run_script: |
+      #!/bin/bash
+      cd "$SOURCE_DIR" || { echo "SSD_TEST_RESULT=NORESULT (no source dir)"; exit 2; }
+      # Build-honesty gate: need the in-tree shared libs, else NORESULT.
+      if ! ls "$SOURCE_DIR"/libavcodec/libavcodec.so* 2>/dev/null | grep -q .; then
+        echo "SSD_TEST_RESULT=NORESULT (no built libavcodec to test against)"; exit 2
+      fi
+      # In-tree libs live in per-component dirs (libavcodec/, libavformat/, …).
+      LIBP=""; for d in "$SOURCE_DIR"/lib*/; do LIBP="$LIBP:${d%/}"; done
+      export LD_LIBRARY_PATH="${LIBP#:}:$INSTALL_PREFIX/lib"
+      # Compile the harvested self-contained C test against the build libs+headers.
+      INCS="-I$SOURCE_DIR"; LIBS="-L$SOURCE_DIR/libavformat -L$SOURCE_DIR/libavcodec -L$SOURCE_DIR/libavutil -lavformat -lavcodec -lavutil -lm -lpthread"
+      if gcc -O2 -w "$SOURCE_DIR/$TEST_PATH" -o /tmp/itest $INCS $LIBS 2>/tmp/cc.log; then
+        echo "--- running test: $TEST_PATH ---"
+        timeout "${INTREE_TEST_TIMEOUT:-300}" /tmp/itest > /tmp/it.log 2>&1; rc=$?
+        tail -25 /tmp/it.log
+        if [ "$rc" -eq 0 ]; then echo "SSD_TEST_RESULT=PASS"; exit 0; else echo "SSD_TEST_RESULT=FAIL"; exit 1; fi
+      fi
+      echo "test did not compile standalone (likely a FATE/.mak test, not a self-contained C program):"; tail -10 /tmp/cc.log 2>/dev/null
+      echo "SSD_TEST_RESULT=NORESULT"; exit 2
+
+  build_system: "custom"
+  extra_configure_flags: []

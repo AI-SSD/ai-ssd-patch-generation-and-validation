@@ -1,0 +1,483 @@
+# =============================================================================
+# CVE Aggregator Pipeline – tcpdump Configuration  (CLI-ON-CRAFTED-FILE SHAPE)
+# =============================================================================
+# A large-universe C project chosen because it matches the pipeline's proven
+# winning shape WITHOUT the traps that sank expat/pcre2/file/libxml2:
+#
+#   * Reproduction is `tcpdump -r <crafted.pcap>` — a CLI tool fed a crafted
+#     input file, NON-NETWORK at runtime (file mode needs no root, no peer).
+#   * The fixing commit for almost every overread CVE ADDS A DISCRETE TEST PCAP
+#     under tests/ (tests/<name>.pcap + tests/<name>.out + a TESTLIST line).
+#     These are PER-CVE discriminating artifacts — the exact property glibc and
+#     openssl have and the monolithic-driver projects (one pcre2test/runtest
+#     binary) lacked. So the in-tree reproducer (Option A) is the PRIMARY path.
+#
+# THE ONE NON-OBVIOUS REQUIREMENT — read before running:
+#   tcpdump's signature CVEs are BUFFER OVER-READS (CWE-125). Reading a few bytes
+#   past a heap buffer usually does NOT segfault (the page is mapped), so a plain
+#   build of the vulnerable AND patched tcpdump would BOTH exit 0 on the crafted
+#   pcap → no discrimination → nothing reproduces. The fix is to build with
+#   AddressSanitizer: under ASan the vulnerable read ABORTS (non-zero) while the
+#   patched build exits cleanly. Every build hook below bakes in
+#   -fsanitize=address. This is how tcpdump's own CI/fuzzing catches these, and
+#   it is what makes the in-tree verdict (FAIL on vulnerable = reproduced) honest.
+#
+# HONEST SCOPE:
+#   * Printer/parsing CVEs (print-*.c overreads) — the large majority — fit well.
+#   * The handful of live-capture / privilege-drop / BPF CVEs need a capture
+#     interface or root and route to MANUAL (expected, not a config bug).
+#   * ExploitDB is kept as a SECONDARY source: most tcpdump PoCs are crafted
+#     pcaps (data, not compilable C), so the in-tree test is the effective path.
+# Build hooks are STARTING POINTS — expect first-run VM iteration (as glibc/openssl had).
+# Run: python3 pipeline.py --phase0-config cve_aggregator/tcpdump_config.yaml
+# =============================================================================
+
+project:
+  name: "tcpdump"
+  display_name: "tcpdump"
+  description: "CVE and PoC dataset for tcpdump"
+
+pipeline:
+  abort_on_error: false
+  skip_modules: []
+
+# PREFER the fix-commit test pcap (Option A) — it is the natural, discriminating
+# reproducer for tcpdump. ExploitDB is the fallback for CVEs whose fix shipped no
+# test (rare for the overread batch).
+reproduction_strategy:
+  - intree
+  - exploitdb
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  file: "logs/tcpdump_cve_aggregator.log"
+
+# ---------------------------------------------------------------------------
+# Module 1: CVE Fetching
+# ---------------------------------------------------------------------------
+cve_fetcher:
+  nvd_api_key: "043bad81-616b-445a-8e79-96e87cc96c66"
+  keywords:
+    - "tcpdump"
+  cpe_match:
+    - "cpe:2.3:a:tcpdump:tcpdump"
+  strong_keywords:
+    - "tcpdump"
+  # Exclude the libpcap CVEs that co-mention tcpdump (different repo/build) and
+  # unrelated products that reference tcpdump in passing.
+  non_target_indicators:
+    - "libpcap"
+    - "Wireshark"
+    - "WinDump"
+    - "Npcap"
+  strict_target_matching: true
+  require_project_cpe_match: false
+  project_cpe_aliases:
+    - "tcpdump"
+    - "tcpdump:tcpdump"
+  enrich_with_cve_org: false
+  cve_org_delay: 1.0
+  # tcpdump CVEs cluster heavily in the 2017 overread batch but reach back to ~2003.
+  min_published_year: 2000
+
+# ---------------------------------------------------------------------------
+# Module 2: Commit Discovery
+# ---------------------------------------------------------------------------
+commit_discovery:
+  repo_url: "https://github.com/the-tcpdump-group/tcpdump.git"
+  repo_local_path: "../tcpdump"
+  clone_timeout: 1200
+  # REQUIRED for the in-tree reproducer: harvest the test pcap the fix added.
+  harvest_regression_tests: true
+  # tcpdump's discriminating reproducer is a crafted CAPTURE FILE (data), not a
+  # compilable C test — opt the harvester in to these data extensions (scoped to
+  # files under a test/ dir). Empty for source-test projects (glibc/openssl), so
+  # this is a no-op everywhere else.
+  regression_test_data_extensions:
+    - ".pcap"
+    - ".pcapng"
+    - ".cap"
+  auto_update: true
+  extra_grep_patterns: []
+  # tcpdump fix commits reliably cite the CVE id in the message; it uses GitHub
+  # issues, not Bugzilla, so the numeric bug-id fallback stays off.
+  enable_bz_fallback: false
+  allow_unscoped_extra_patterns: false
+  bugzilla_hosts: []
+  enable_online_bug_resolution: false
+  source_extensions:
+    - ".c"
+    - ".h"
+
+# ---------------------------------------------------------------------------
+# Module 3: PoC Mapping (ExploitDB) — secondary source for tcpdump
+# ---------------------------------------------------------------------------
+poc_mapper:
+  exploitdb_path: "../exploit-database"
+  exploitdb_remote_url: "https://gitlab.com/exploit-database/exploitdb.git"
+  auto_update: true
+  deep_search: true
+  extract_content: true
+  reverse_search: true
+  enable_reverse_content_grep: true
+  require_verified: false
+  prefer_platforms:
+    - "linux"
+  non_target_indicators:
+    - "Wireshark"
+    - "Windows"
+    - "WinDump"
+
+# ---------------------------------------------------------------------------
+# Module 4–7: Aggregator / Validation / Repair / Output
+# ---------------------------------------------------------------------------
+data_aggregator:
+  global_json_path: "results/tcpdump_cve_poc_map.json"
+  prune_missing_cves: true
+
+syntax_validator:
+  manual_supervision_dir: "manual_supervision"
+  report_path: "results/tcpdump_syntax_validation_report.json"
+  allow_manual_without_commit: false
+
+poc_repair:
+  provider: "openai"
+  openai_model: "gpt-4.1-mini"
+  openai_api_key: ""
+  api_endpoint: "http://10.3.2.171:80/api/chat"
+  model: "devstral:32k"
+  max_repair_attempts: 3
+  models_by_attempt:
+    1: "gpt-4.1-mini"
+    2: "gpt-5-mini"
+    3: "gpt-4.1"
+  api_timeout: 600
+  model_load_timeout: 300
+  num_ctx: 32768
+  max_poc_chars: 0
+  temperature: 0.4
+  report_path: "results/tcpdump_poc_repair_report.json"
+  manual_review_queue_path: "results/tcpdump_manual_review_queue.json"
+  gpu_wait_timeout: 120
+
+output:
+  global_json_path: "results/tcpdump_cve_poc_map.json"
+  filtered_json_path: "results/tcpdump_cve_poc_map_filtered.json"
+  csv_path: "results/tcpdump_cve_poc_complete.csv"
+  poc_dir: "exploits"
+  filtered_require_commit: false
+  filtered_require_poc: true
+  filtered_require_verified_poc: false
+  flag_unvalidated_edb_for_manual_review: true
+  manual_supervision_dir: "manual_supervision"
+  allow_poc_without_commit: false
+  csv_fields:
+    - "CVE"
+    - "V_COMMIT"
+    - "FilePath"
+    - "F_NAME"
+    - "UNIT_TYPE"
+    - "V_FILE"
+    - "V_FUNCTION"
+    - "CVE_Description"
+    - "CWE"
+    - "CWE_Description"
+    - "project_version"
+    - "project_version_normalized"
+    - "ubuntu_version"
+    - "poc_index"
+    - "poc_path"
+    - "poc_language"
+    - "FIX_COMMIT"
+    - "TEST_PATH"
+    - "TEST_SUBDIR"
+    - "manual_review_required"
+    - "manual_verified"
+
+# ---------------------------------------------------------------------------
+# Phase 2: LLM patch generation (C)
+# ---------------------------------------------------------------------------
+phase2:
+  language: "c"
+  system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for tcpdump (the command-line network packet analyzer). Most tcpdump
+    vulnerabilities are buffer over-reads in the protocol printers (print-*.c):
+    the code reads past the captured packet bounds. Fix the vulnerability by
+    making the SMALLEST POSSIBLE EDIT to the vulnerable function — typically a
+    bounds check (e.g. ND_TCHECK / length validation before dereferencing) —
+    never by rewriting it.
+  feedback_system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for tcpdump. Your previous patch attempt FAILED validation. Analyze the
+    failure and produce an improved fix as MINIMAL edits (usually a missing
+    bounds/length check before a packet-buffer dereference) — never rewrite the
+    whole function.
+  internal_headers: []
+
+# ---------------------------------------------------------------------------
+# Phase 3: SAST (C stack — same as glibc/openssl)
+# ---------------------------------------------------------------------------
+sast:
+  enabled: true
+  fail_on: [critical, high]
+  tool_timeout: 180
+  tools:
+    - name: cppcheck
+      detect: cppcheck
+      cmd: ["cppcheck", "--enable=all", "--xml", "--xml-version=2", "{file}"]
+      parser: cppcheck-xml
+      install: { apt: cppcheck }
+    - name: clang-tidy
+      detect: clang-tidy
+      cmd: ["clang-tidy", "--quiet", "--checks=clang-analyzer-*,bugprone-*,cert-*", "{file}", "--"]
+      parser: regex
+      regex: '^(.+?):(\d+):(\d+):\s+(warning|error):\s+(.+?)\s+\[([^\]]+)\]$'
+      groups: { file: 1, line: 2, column: 3, severity: 4, message: 5, rule: 6 }
+      severity_map: { warning: medium, error: high }
+      install: { apt: clang-tidy }
+    - name: semgrep
+      detect: semgrep
+      cmd: ["semgrep", "scan", "--sarif", "--quiet", "--metrics=off", "--config=p/c", "{file}"]
+      parser: sarif
+      install: { pip: semgrep }
+    - name: flawfinder
+      detect: flawfinder
+      cmd: ["flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      fallback_cmd: ["{python}", "-m", "flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      parser: flawfinder
+      install: { pip: flawfinder }
+
+# ---------------------------------------------------------------------------
+# Phase 1: reproduction (shared with Phase 3)
+# ---------------------------------------------------------------------------
+phase1:
+  project_repo_local_path: "../tcpdump"
+  project_repo_remote_url: "https://github.com/the-tcpdump-group/tcpdump.git"
+  docker_base_image_prefix: "ai-ssd/tcpdump-base"
+  docker_cve_image_prefix: "ai-ssd/tcpdump-cve"
+  image_manifest_path: "results/tcpdump_image_manifest.json"
+  source_dir_name: "project-src"
+  build_dir_name: "project-build"
+  install_prefix: "/opt/project-build"
+
+  # tcpdump builds with autotools and links libpcap. The bug lives in tcpdump's
+  # printers, NOT libpcap, so a system libpcap-dev is fine — the project build is
+  # the tcpdump binary itself. flex/bison are needed by some eras' filter parser.
+  base_packages:
+    - build-essential
+    - libpcap-dev
+    - autoconf
+    - automake
+    - flex
+    - bison
+  base_packages_optional:
+    - wget
+    - pkg-config
+  base_setup: |
+    true
+
+  # Older tcpdump branches build cleanly on older toolchains; map by commit date.
+  commit_era_map:
+    2000: "14.04"
+    2003: "14.04"
+    2008: "14.04"
+    2010: "14.04"
+    2012: "14.04"
+    2014: "16.04"
+    2015: "16.04"
+    2016: "16.04"
+    2017: "18.04"
+    2018: "18.04"
+    2019: "20.04"
+    2020: "20.04"
+    2021: "22.04"
+    2022: "22.04"
+    2023: "24.04"
+    2024: "24.04"
+    2025: "24.04"
+    2026: "24.04"
+
+  version_file: ""
+  version_regex: ''
+  version_era_map: {}
+  enable_arch_fallback: false
+
+  poc_run_env:
+    # Make ASan deterministic and non-interactive: abort on first error with a
+    # non-zero exit so the negative-filter/exit-code logic sees a clean failure.
+    ASAN_OPTIONS: "abort_on_error=1:exitcode=99:detect_leaks=0:halt_on_error=1"
+
+  # ---- build_script — STARTING POINT, UNTESTED ----
+  # Builds the tcpdump CLI with AddressSanitizer (see the header note: required to
+  # turn silent overreads into deterministic aborts). Installs the binary to
+  # $INSTALL_PREFIX/bin. Writes the /build/build_status markers Phase 1/3 read.
+  build_script: |
+    #!/bin/bash
+    SRC="$SOURCE_DIR"; PFX="$INSTALL_PREFIX"
+    cd "$SRC" || exit 1
+    export CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O0 -w"
+    export LDFLAGS="-fsanitize=address"
+    # Generate ./configure from git (autogen.sh runs autoreconf); tarball trees
+    # already ship ./configure so tolerate autogen failure.
+    if [ ! -x ./configure ]; then ./autogen.sh > /build/autogen.log 2>&1 || autoreconf -fi > /build/autogen.log 2>&1 || true; fi
+    ( ./configure --prefix="$PFX" 2>&1 && echo CONFIGURE_OK ) > /build/cfg.log 2>&1 \
+      || { echo "CONFIGURE_FAIL"; tail -30 /build/cfg.log; }
+    ( make -j"$(nproc)" 2>&1 || make -k ) > /build/make.log 2>&1
+    echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
+    ( make install -k ) > /build/make_install.log 2>&1; echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status
+    # Marker = presence of the built tcpdump binary (the real project artifact),
+    # NOT the make exit code. Older trees install to sbin, newer to bin; probe both
+    # plus the in-tree binary left in $SRC.
+    if ls "$PFX"/bin/tcpdump "$PFX"/sbin/tcpdump "$SRC"/tcpdump 2>/dev/null | grep -q .; then echo "PROJECT_BUILD_INSTALLED=yes" >> /build/build_status; else echo "PROJECT_BUILD_INSTALLED=no" >> /build/build_status; fi
+    echo "build complete"
+
+  # ---- poc_prepare_script — best-effort for the ExploitDB (secondary) path ----
+  # Most tcpdump ExploitDB PoCs are crafted pcaps (data), not compilable C. If the
+  # PoC IS a C program with main(), compile it; otherwise leave the data file in
+  # place — the launch script below runs the built tcpdump on it. Honesty marker:
+  # the reproducer runs the PROJECT's tcpdump binary, so set uses_build=yes once
+  # we have confirmed a built binary exists.
+  poc_prepare_script: |
+    #!/bin/bash
+    PFX="$INSTALL_PREFIX"; SRC="$SOURCE_DIR"
+    cd /poc
+    if grep -qE '^[[:space:]]*(int|void)?[[:space:]]*main[[:space:]]*\(' /poc/exploit_raw.c 2>/dev/null; then
+      cp /poc/exploit_raw.c /poc/exploit.c
+      gcc -O0 -g -w -fsanitize=address -o exploit exploit.c 2>&1 || gcc -O0 -g -w -o exploit exploit.c 2>&1 || echo "compile failed (non-C PoC?)"
+    fi
+    # Resolve the built tcpdump binary (project artifact).
+    TBIN=""; for c in "$PFX/bin/tcpdump" "$PFX/sbin/tcpdump" "$SRC/tcpdump"; do [ -x "$c" ] && TBIN="$c" && break; done
+    echo "$TBIN" > /poc/.ssd_tcpdump_bin
+    USES=no; [ -n "$TBIN" ] && USES=yes
+    echo "$USES" > /poc/.ssd_poc_uses_build; echo "poc_uses_project_build: $USES (tcpdump=$TBIN)"
+    for c in $POC_COMPANIONS; do
+      case "$c" in *.sh|*.py|*.pl|*.rb) chmod +x "/poc/$c" 2>/dev/null || true ;; esac
+    done
+
+  # ---- poc_launch_script — run built tcpdump on the crafted pcap ----
+  # ExploitDB (secondary) path: feed the PoC/data file to the project tcpdump in
+  # file-read mode (-r), which needs no root and no network. Exit code is the
+  # PoC's own (ASan abort = non-zero) and becomes the Phase-1 baseline.
+  poc_launch_script: |
+    #!/bin/bash
+    TBIN="$(cat /poc/.ssd_tcpdump_bin 2>/dev/null)"; [ -z "$TBIN" ] && TBIN="$(command -v tcpdump)"
+    # If the PoC compiled to a standalone exploit binary, prefer it.
+    if [ -x /poc/exploit ]; then exec /poc/exploit; fi
+    # Otherwise locate a crafted capture among the PoC artifacts and read it.
+    CAP=""
+    for f in /poc/*.pcap /poc/*.pcapng /poc/*.cap /poc/exploit_raw.* /poc/*.bin /poc/*; do
+      [ -f "$f" ] || continue
+      case "$f" in *.c|*.sh|*.py|*.pl|*.rb|*.md|*.txt|*.ssd_*) continue ;; esac
+      CAP="$f"; break
+    done
+    [ -z "$CAP" ] && { echo "no capture artifact found for tcpdump -r"; exit 2; }
+    echo "--- tcpdump -r $CAP ---"
+    exec "$TBIN" -nn -v -r "$CAP"
+
+  # ---- patch_rebuild_script — incremental ASan rebuild + markers ----
+  # tcpdump builds in-tree; the patched file lands in SOURCE_DIR and we rebuild
+  # there. Keep the SAME ASan flags so the patched baseline is apples-to-apples
+  # with the vulnerable one.
+  patch_rebuild_script: |
+    #!/bin/bash
+    cd "$SOURCE_DIR" || { echo "no source dir" > /tmp/ssd_rebuild.log; }
+    export CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O0 -w"
+    export LDFLAGS="-fsanitize=address"
+    ( make -j"$(nproc)" 2>&1 || make -k ) > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
+    ( make install -k ) > /tmp/ssd_install.log 2>&1; echo "install exit: $?"
+    grep -B2 -A8 "error:" /tmp/ssd_rebuild.log 2>/dev/null | head -100 > /tmp/ssd_build_errors; true
+    case "$VULN_FILE" in
+      *.c) OBJ="$(basename "$VULN_FILE" .c).o"; find "$SOURCE_DIR" -name "$OBJ" -newer "$SOURCE_DIR/$VULN_FILE" -print -quit > /tmp/ssd_obj_rebuilt; echo "obj_rebuilt: $(cat /tmp/ssd_obj_rebuilt)" ;;
+      *) echo skip > /tmp/ssd_obj_rebuilt ;;
+    esac
+    # The reproducer runs the project tcpdump binary; mark uses_build by its presence.
+    USES=no; for c in "$INSTALL_PREFIX/bin/tcpdump" "$INSTALL_PREFIX/sbin/tcpdump" "$SOURCE_DIR/tcpdump"; do [ -x "$c" ] && USES=yes && break; done
+    echo "$USES" > /tmp/ssd_poc_uses_build; echo "poc_uses_build: $USES"
+
+  # ---- Option A: in-tree regression test (poc_language: intree-test) — PRIMARY ----
+  # The natural tcpdump reproducer. The fixing commit ADDS a crafted capture under
+  # tests/ (tests/<name>.pcap, often + tests/<name>.out and a tests/TESTLIST line).
+  # is_regression_test_path() harvests it (TEST_PATH=tests/<name>.pcap,
+  # TEST_SUBDIR=tests, TEST_NAME=<name>, FIX_COMMIT set). The pipeline checks out
+  # the VULNERABLE commit and overlays the file(s) the fix ADDED (the capture),
+  # keeping the source vulnerable; build_script builds tcpdump WITH ASan; run_script
+  # reads the capture with the built tcpdump. Verdict: tcpdump ABORTS/crashes on the
+  # vulnerable build = reproduced (SSD_TEST_RESULT=FAIL); clean exit = fixed (PASS).
+  # Env available: SOURCE_DIR, BUILD_DIR, INSTALL_PREFIX, TEST_SUBDIR, TEST_NAME,
+  # TEST_PATH, FIX_COMMIT, COMMIT_HASH.
+  intree_test:
+    build_script: |
+      #!/bin/bash
+      cd "$SOURCE_DIR" || exit 1
+      export CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O0 -w"
+      export LDFLAGS="-fsanitize=address"
+      # Overlay ONLY the test artifacts the fix added (captures / expected output /
+      # TESTLIST registry) so the crafted pcap is present in the vulnerable tree.
+      # These are DATA, not source — they carry no part of the fix to the printers.
+      for tf in $(git diff-tree --no-commit-id --name-only -r "$FIX_COMMIT" 2>/dev/null | grep -E '(^|/)tests/'); do
+        case "$tf" in
+          */tests/*.c) : ;;  # never overlay a .c from tests/ (could carry source-level changes)
+          *) git checkout "$FIX_COMMIT" -- "$tf" 2>/dev/null && echo "overlaid: $tf" ;;
+        esac
+      done
+      if [ ! -x ./configure ]; then ./autogen.sh > /build/autogen.log 2>&1 || autoreconf -fi > /build/autogen.log 2>&1 || true; fi
+      ( ./configure --prefix="$INSTALL_PREFIX" 2>&1 && echo CONFIGURE_OK ) > /build/cfg.log 2>&1 \
+        || { echo CONFIGURE_FAIL; tail -25 /build/cfg.log; }
+      ( make -j"$(nproc)" 2>&1 || make -k ) > /build/make.log 2>&1
+      echo "BUILD_RC=$?" >> /build/build_status
+      tail -15 /build/make.log; echo "build complete"
+    run_script: |
+      #!/bin/bash
+      cd "$SOURCE_DIR" || { echo "SSD_TEST_RESULT=NORESULT (no source dir)"; exit 2; }
+      # Build-honesty gate: must have a freshly built tcpdump; never fall through to
+      # a system tcpdump (that would give a meaningless verdict).
+      TBIN=""; for c in "$SOURCE_DIR/tcpdump" "$INSTALL_PREFIX/bin/tcpdump" "$INSTALL_PREFIX/sbin/tcpdump"; do [ -x "$c" ] && TBIN="$c" && break; done
+      if [ -z "$TBIN" ]; then echo "SSD_TEST_RESULT=NORESULT (no built tcpdump to test against)"; exit 2; fi
+      export ASAN_OPTIONS="abort_on_error=1:exitcode=99:detect_leaks=0:halt_on_error=1"
+      # Resolve the crafted capture. Prefer the harvested TEST_PATH; if it is not a
+      # capture (e.g. the harvester picked the .out), find a sibling capture with
+      # the same stem, then any capture the fix added under tests/.
+      CAP=""
+      if [ -n "$TEST_PATH" ] && [ -f "$SOURCE_DIR/$TEST_PATH" ]; then
+        case "$TEST_PATH" in *.pcap|*.pcapng|*.cap) CAP="$SOURCE_DIR/$TEST_PATH" ;; esac
+      fi
+      if [ -z "$CAP" ] && [ -n "$TEST_NAME" ]; then
+        for ext in pcap pcapng cap; do [ -f "$SOURCE_DIR/tests/$TEST_NAME.$ext" ] && CAP="$SOURCE_DIR/tests/$TEST_NAME.$ext" && break; done
+      fi
+      if [ -z "$CAP" ]; then
+        CAP="$(git diff-tree --no-commit-id --name-only -r "$FIX_COMMIT" 2>/dev/null | grep -E '(^|/)tests/.*\.(pcap|pcapng|cap)$' | head -1)"
+        [ -n "$CAP" ] && CAP="$SOURCE_DIR/$CAP"
+      fi
+      if [ -z "$CAP" ] || [ ! -f "$CAP" ]; then echo "SSD_TEST_RESULT=NORESULT (no crafted capture found)"; exit 2; fi
+      # Recover the tcpdump flags the fix's TESTLIST line used (printer selection
+      # matters for which code path the capture exercises); default to a verbose
+      # full dissection which exercises the printers. TESTLIST is TAB-delimited
+      # (some lines space-delimited) — drop the first 3 fields (testname, pcap,
+      # out) with awk's default whitespace FS, which splits on BOTH tab and space.
+      # A space-only sed here left the whole line as FLAGS on tab lines, so the
+      # entire "name pcap out flag" got passed to tcpdump as a BPF filter →
+      # "tcpdump: syntax error" → a CLI parse failure miscounted as a reproduction.
+      FLAGS="$(grep -hE "(^|[[:space:]])$TEST_NAME([[:space:]]|\.)" "$SOURCE_DIR/tests/TESTLIST" 2>/dev/null | head -1 | awk '{$1="";$2="";$3="";sub(/^[ \t]+/,"");print}')"
+      [ -z "$FLAGS" ] && FLAGS="-nn -v"
+      echo "--- $TBIN $FLAGS -r $CAP ---"
+      timeout "${INTREE_TEST_TIMEOUT:-120}" "$TBIN" $FLAGS -r "$CAP" > /tmp/it.log 2>&1; rc=$?
+      tail -30 /tmp/it.log
+      # REPRODUCTION SANITY GATE: a tcpdump CLI/BPF arg-parse failure ("syntax
+      # error in filter expression", usage, invalid option) means our FLAGS were
+      # malformed and the dissector was NEVER reached — that is NOT a vulnerability
+      # reproduction, and it aborts identically on vulnerable AND patched builds
+      # (no patch can ever flip it). Require the input to have actually been
+      # consumed (or an ASan/crash signature) before declaring FAIL=reproduced;
+      # otherwise NORESULT so it cannot become a false positive.
+      if grep -qiE "syntax error|^Usage:|usage: tcpdump|invalid option|unrecognized option" /tmp/it.log \
+         && ! grep -qiE "reading from file|AddressSanitizer|ABORTING|runtime error|Segmentation" /tmp/it.log; then
+        echo "SSD_TEST_RESULT=NORESULT (tcpdump rejected its arguments; FLAGS=[$FLAGS] — input never processed, not a reproduction)"; exit 2
+      fi
+      # ASan abort / segfault / any non-zero = the overread fired = VULNERABLE.
+      # Clean exit (0) = the bounds check held = FIXED.
+      if [ "$rc" -eq 0 ]; then echo "SSD_TEST_RESULT=PASS"; exit 0; else echo "SSD_TEST_RESULT=FAIL (rc=$rc)"; exit 1; fi
+
+  build_system: "custom"
+  extra_configure_flags: []

@@ -26,7 +26,7 @@ from ..utils.file_utils import (
     is_text_file,
     is_valid_poc_content,
 )
-from .base import PipelineModule
+from .base import PipelineModule, resolve_input_path
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,9 @@ class PoCMapper(PipelineModule):
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
         cfg = self.config.get("poc_mapper", {})
-        edb_path = Path(cfg["exploitdb_path"])
+        # Shared INPUT clone: resolve against the pipeline root, not the Phase-0
+        # CWD (which is the per-project base_dir under projects/<name>).
+        edb_path = resolve_input_path(cfg["exploitdb_path"])
         edb_remote = cfg.get("exploitdb_remote_url", "https://gitlab.com/exploit-database/exploitdb.git")
         deep_search: bool = cfg.get("deep_search", False)
         extract_content: bool = cfg.get("extract_content", True)

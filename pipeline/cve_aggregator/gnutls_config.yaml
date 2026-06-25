@@ -1,0 +1,413 @@
+# =============================================================================
+# CVE Aggregator Pipeline – GnuTLS Configuration  (LARGE C, GNU/autotools)
+# =============================================================================
+# Large GNU TLS/X.509/crypto library. The "huge + most-probably-reproduces"
+# candidate: same proven profile as glibc(30) / openssl(10) / libtasn1(1) — a
+# GNU/autotools C project that ships PER-CVE discriminating in-tree C regression
+# tests under tests/, registered as PER-TEST automake TESTS (so `make check
+# TESTS=<name>` works — NOT expat's monolithic harness). ~150+ CVEs (X.509/ASN.1
+# parsing, cert verification, crypto), many with self-contained tests (client+
+# server spun up in-process → run in one container, no external peer).
+# reproduction_strategy [exploitdb, intree] mirrors openssl's successful config:
+# ExploitDB is thin for GnuTLS, so the fix-commit test is the effective source.
+# Build hooks are UNTESTED STARTING POINTS — expect first-run VM iteration
+# (heavier deps: nettle/gmp/libtasn1 + gnulib bootstrap). Old-era commits may need
+# toolchain/dep tuning (as openssl's oldest did).
+# Run: python3 pipeline.py --project gnutls --phases 0 1
+# =============================================================================
+
+project:
+  name: "gnutls"
+  display_name: "GnuTLS"
+  description: "CVE and PoC dataset for GnuTLS"
+
+pipeline:
+  abort_on_error: false
+  skip_modules: []
+
+reproduction_strategy:
+  - exploitdb
+  - intree
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  file: "logs/gnutls_cve_aggregator.log"
+
+# ---------------------------------------------------------------------------
+# Module 1: CVE Fetching
+# ---------------------------------------------------------------------------
+cve_fetcher:
+  nvd_api_key: "043bad81-616b-445a-8e79-96e87cc96c66"
+  keywords:
+    - "GnuTLS"
+    - "gnutls"
+  cpe_match:
+    - "cpe:2.3:a:gnu:gnutls"
+  strong_keywords:
+    - "GnuTLS"
+    - "gnutls"
+  # Exclude the sibling/dependency libs + other TLS stacks that co-mention GnuTLS.
+  non_target_indicators:
+    - "OpenSSL"
+    - "NSS"
+    - "wolfSSL"
+    - "mbedTLS"
+    - "libtasn1"
+    - "Nettle"
+    - "p11-kit"
+  strict_target_matching: true
+  require_project_cpe_match: false
+  project_cpe_aliases:
+    - "gnutls"
+    - "gnu:gnutls"
+  enrich_with_cve_org: false
+  cve_org_delay: 1.0
+  min_published_year: 2004
+
+# ---------------------------------------------------------------------------
+# Module 2: Commit Discovery
+# ---------------------------------------------------------------------------
+commit_discovery:
+  repo_url: "https://gitlab.com/gnutls/gnutls.git"
+  repo_local_path: "../gnutls"
+  clone_timeout: 1200
+  harvest_regression_tests: true
+  auto_update: true
+  extra_grep_patterns: []
+  enable_bz_fallback: false
+  allow_unscoped_extra_patterns: false
+  bugzilla_hosts: []
+  enable_online_bug_resolution: false
+  source_extensions:
+    - ".c"
+    - ".h"
+
+# ---------------------------------------------------------------------------
+# Module 3: PoC Mapping (ExploitDB)
+# ---------------------------------------------------------------------------
+poc_mapper:
+  exploitdb_path: "../exploit-database"
+  exploitdb_remote_url: "https://gitlab.com/exploit-database/exploitdb.git"
+  auto_update: true
+  deep_search: true
+  extract_content: true
+  reverse_search: true
+  enable_reverse_content_grep: true
+  require_verified: false
+  prefer_platforms:
+    - "linux"
+  non_target_indicators:
+    - "OpenSSL"
+    - "Windows"
+
+# ---------------------------------------------------------------------------
+# Module 4–7: Aggregator / Validation / Repair / Output
+# ---------------------------------------------------------------------------
+data_aggregator:
+  global_json_path: "results/gnutls_cve_poc_map.json"
+  prune_missing_cves: true
+
+syntax_validator:
+  manual_supervision_dir: "manual_supervision"
+  report_path: "results/gnutls_syntax_validation_report.json"
+  allow_manual_without_commit: false
+
+poc_repair:
+  provider: "openai"
+  openai_model: "gpt-4.1-mini"
+  openai_api_key: ""
+  api_endpoint: "http://10.3.2.171:80/api/chat"
+  model: "devstral:32k"
+  max_repair_attempts: 3
+  models_by_attempt:
+    1: "gpt-4.1-mini"
+    2: "gpt-5-mini"
+    3: "gpt-4.1"
+  api_timeout: 600
+  model_load_timeout: 300
+  num_ctx: 32768
+  max_poc_chars: 0
+  temperature: 0.4
+  report_path: "results/gnutls_poc_repair_report.json"
+  manual_review_queue_path: "results/gnutls_manual_review_queue.json"
+  gpu_wait_timeout: 120
+
+output:
+  global_json_path: "results/gnutls_cve_poc_map.json"
+  filtered_json_path: "results/gnutls_cve_poc_map_filtered.json"
+  csv_path: "results/gnutls_cve_poc_complete.csv"
+  poc_dir: "exploits"
+  filtered_require_commit: false
+  filtered_require_poc: true
+  filtered_require_verified_poc: false
+  flag_unvalidated_edb_for_manual_review: true
+  manual_supervision_dir: "manual_supervision"
+  allow_poc_without_commit: false
+  csv_fields:
+    - "CVE"
+    - "V_COMMIT"
+    - "FilePath"
+    - "F_NAME"
+    - "UNIT_TYPE"
+    - "V_FILE"
+    - "V_FUNCTION"
+    - "CVE_Description"
+    - "CWE"
+    - "CWE_Description"
+    - "project_version"
+    - "project_version_normalized"
+    - "ubuntu_version"
+    - "poc_index"
+    - "poc_path"
+    - "poc_language"
+    - "FIX_COMMIT"
+    - "TEST_PATH"
+    - "TEST_SUBDIR"
+    - "manual_review_required"
+    - "manual_verified"
+
+# ---------------------------------------------------------------------------
+# Phase 2: LLM patch generation (C)
+# ---------------------------------------------------------------------------
+phase2:
+  language: "c"
+  system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for GnuTLS (the GNU TLS/SSL, X.509 and cryptography library). Your task is to
+    fix a security vulnerability by making the SMALLEST POSSIBLE EDIT to the
+    vulnerable function — never by rewriting it.
+  feedback_system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for GnuTLS. Your previous patch attempt FAILED validation. Analyze the failure
+    and produce an improved fix as MINIMAL edits — never rewrite the whole function.
+  internal_headers: []
+
+# ---------------------------------------------------------------------------
+# Phase 3: SAST (C stack)
+# ---------------------------------------------------------------------------
+sast:
+  enabled: true
+  fail_on: [critical, high]
+  tool_timeout: 180
+  tools:
+    - name: cppcheck
+      detect: cppcheck
+      cmd: ["cppcheck", "--enable=all", "--xml", "--xml-version=2", "{file}"]
+      parser: cppcheck-xml
+      install: { apt: cppcheck }
+    - name: clang-tidy
+      detect: clang-tidy
+      cmd: ["clang-tidy", "--quiet", "--checks=clang-analyzer-*,bugprone-*,cert-*", "{file}", "--"]
+      parser: regex
+      regex: '^(.+?):(\d+):(\d+):\s+(warning|error):\s+(.+?)\s+\[([^\]]+)\]$'
+      groups: { file: 1, line: 2, column: 3, severity: 4, message: 5, rule: 6 }
+      severity_map: { warning: medium, error: high }
+      install: { apt: clang-tidy }
+    - name: semgrep
+      detect: semgrep
+      cmd: ["semgrep", "scan", "--sarif", "--quiet", "--metrics=off", "--config=p/c", "{file}"]
+      parser: sarif
+      install: { pip: semgrep }
+    - name: flawfinder
+      detect: flawfinder
+      cmd: ["flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      fallback_cmd: ["{python}", "-m", "flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      parser: flawfinder
+      install: { pip: flawfinder }
+
+# ---------------------------------------------------------------------------
+# Phase 1: reproduction (shared with Phase 3)
+# ---------------------------------------------------------------------------
+phase1:
+  project_repo_local_path: "../gnutls"
+  project_repo_remote_url: "https://gitlab.com/gnutls/gnutls.git"
+  docker_base_image_prefix: "ai-ssd/gnutls-base"
+  docker_cve_image_prefix: "ai-ssd/gnutls-cve"
+  image_manifest_path: "results/gnutls_image_manifest.json"
+  source_dir_name: "project-src"
+  build_dir_name: "project-build"
+  install_prefix: "/opt/project-build"
+
+  # GnuTLS bootstraps from git via gnulib + needs nettle/gmp/libtasn1 (+ optional
+  # p11-kit/idn2/unistring). The optional dev libs come from the era's Ubuntu repos;
+  # configure flags below drop the heaviest optional deps to maximise buildability.
+  base_packages:
+    - build-essential
+    - autoconf
+    - automake
+    - libtool
+    - pkg-config
+    - gettext
+    - autopoint          # gnulib ./bootstrap REQUIRES autopoint (Ubuntu splits it out of gettext)
+    - gtk-doc-tools      # gnulib bootstrap runs gtkdocize
+    - bison
+    - gperf
+  base_packages_optional:
+    - nettle-dev
+    - libgmp-dev
+    - libtasn1-6-dev
+    - libunistring-dev
+    - libidn2-dev
+    - libp11-kit-dev
+    - libunbound-dev
+    - texinfo
+    - git
+    - wget
+    - gcc-multilib
+    - g++-multilib
+  base_setup: |
+    dpkg --add-architecture i386 && apt-get update && apt-get install -y libc6-dev-i386 || true
+
+  # GnuTLS builds across eras; map by commit date (older trees on older Ubuntu).
+  commit_era_map:
+    2004: "14.04"
+    2008: "14.04"
+    2010: "14.04"
+    2012: "14.04"
+    2014: "16.04"
+    2015: "16.04"
+    2016: "16.04"
+    2017: "18.04"
+    2018: "18.04"
+    2019: "20.04"
+    2020: "20.04"
+    2021: "22.04"
+    2022: "22.04"
+    2023: "24.04"
+    2024: "24.04"
+    2025: "24.04"
+    2026: "24.04"
+
+  version_file: ""
+  version_regex: ''
+  version_era_map: {}
+  enable_arch_fallback: true
+
+  poc_run_env:
+    MALLOC_CHECK_: "3"
+    MALLOC_PERTURB_: "42"
+
+  # ---- build_script — STARTING POINT, UNTESTED ----
+  # git checkout has no ./configure: bootstrap (pulls gnulib) then out-of-tree
+  # configure + make + install. ChangeLog/AUTHORS/NEWS/README stubs satisfy GNU
+  # automake strictness (as needed for libtasn1). Drop the heaviest optional deps
+  # (--without-p11-kit, --disable-doc, --disable-guile) to maximise buildability.
+  build_script: |
+    #!/bin/bash
+    SRC="$SOURCE_DIR"; BD="$BUILD_DIR"; PFX="$INSTALL_PREFIX"
+    ARCHFLAGS=""; HOST=""
+    if [ "$BUILD_ARCH" = "i386" ]; then ARCHFLAGS="-m32"; HOST="--host=i686-linux-gnu --build=i686-linux-gnu"; fi
+    cd "$SRC" || exit 1
+    if [ ! -x "$SRC/configure" ]; then
+      git submodule update --init >/build/bootstrap.log 2>&1 || true
+      touch ChangeLog AUTHORS NEWS README 2>/dev/null || true   # GNU automake requires these
+      ( ./bootstrap --skip-po >>/build/bootstrap.log 2>&1 \
+        || autoreconf -fi >>/build/bootstrap.log 2>&1 ) || { echo "BOOTSTRAP_FAIL"; tail -25 /build/bootstrap.log; }
+    fi
+    cd "$BD" || exit 1; rm -rf ./*
+    ( "$SRC"/configure --prefix="$PFX" --disable-doc --without-p11-kit --disable-guile --disable-tools \
+        --with-included-unistring --with-included-libtasn1 $HOST CFLAGS="$ARCHFLAGS -O2 -g -w -U_FORTIFY_SOURCE" 2>&1 && echo CONFIGURE_OK ) \
+      > /build/cfg.log 2>&1 \
+      || ( echo "=== retry: minimal configure ==="; rm -rf ./*; "$SRC"/configure --prefix="$PFX" --disable-doc --without-p11-kit --disable-guile --disable-tools $HOST CFLAGS="$ARCHFLAGS -O2 -g -w -U_FORTIFY_SOURCE" 2>&1 && echo CONFIGURE_OK ) \
+      > /build/cfg.log 2>&1 || { echo "CONFIGURE_FAIL"; tail -30 /build/cfg.log; }
+    make -j"$(nproc)" -k > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
+    make install -k > /build/make_install.log 2>&1; echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status
+    if ls "$PFX"/lib/libgnutls.so* "$PFX"/lib64/libgnutls.so* 2>/dev/null | grep -q .; then echo "PROJECT_BUILD_INSTALLED=yes" >> /build/build_status; else echo "PROJECT_BUILD_INSTALLED=no" >> /build/build_status; fi
+    echo "build complete"
+
+  # ---- poc_prepare_script — compile the C PoC against the project libgnutls ----
+  poc_prepare_script: |
+    #!/bin/bash
+    PFX="$INSTALL_PREFIX"
+    M32=""; [ "$BUILD_ARCH" = "i386" ] && M32="-m32"
+    cd /poc
+    if grep -qE '^[[:space:]]*(int|void)?[[:space:]]*main[[:space:]]*\(' /poc/exploit_raw.c; then
+      cp /poc/exploit_raw.c /poc/exploit.c
+    else
+      printf '#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n' > /poc/exploit.c
+      cat /poc/exploit_raw.c >> /poc/exploit.c
+      printf '\nint main(int argc,char**argv){puts("fragment loaded");return 0;}\n' >> /poc/exploit.c
+    fi
+    INC="-I$PFX/include"
+    rm -f /poc/exploit
+    gcc $M32 -O0 -g -w -D_GNU_SOURCE $INC -o exploit exploit.c -L"$PFX/lib" -Wl,-rpath,"$PFX/lib" -lgnutls 2>&1 || \
+    gcc $M32 -O0 -g -w -D_GNU_SOURCE -o exploit exploit.c -lgnutls 2>&1 || \
+    gcc $M32 -O0 -g -w -o exploit exploit.c 2>&1 || echo "compile failed"
+    if [ -f /poc/exploit ]; then echo "SUCCESS"; file /poc/exploit; else echo "ERROR: failed to compile"; head -30 /poc/exploit.c; exit 1; fi
+    for c in $POC_COMPANIONS; do
+      stem="${c%.*}"
+      case "$c" in
+        *.c) ( gcc -O0 -g -w -o "/poc/$stem" "/poc/$c" -I"$PFX/include" -L"$PFX/lib" -Wl,-rpath,"$PFX/lib" -lgnutls 2>&1 || gcc -O0 -g -w -o "/poc/$stem" "/poc/$c" 2>&1 || echo "WARN: companion $c" ) ;;
+        *.sh|*.py|*.pl|*.rb) chmod +x "/poc/$c" 2>/dev/null || true ;;
+      esac
+    done
+    USES=no
+    if LD_LIBRARY_PATH="$PFX/lib" ldd /poc/exploit 2>/dev/null | grep -q "$PFX"; then USES=yes; fi
+    echo "$USES" > /poc/.ssd_poc_uses_build; echo "poc_uses_project_build: $USES"
+
+  poc_launch_script: ""
+
+  # ---- patch_rebuild_script — incremental make + markers ----
+  patch_rebuild_script: |
+    #!/bin/bash
+    cd "$BUILD_DIR" || { echo "no build dir" > /tmp/ssd_rebuild.log; }
+    make -j"$(nproc)" -k > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
+    make install -k > /tmp/ssd_install.log 2>&1; echo "install exit: $?"
+    grep -B2 -A8 "error:" /tmp/ssd_rebuild.log 2>/dev/null | head -100 > /tmp/ssd_build_errors; true
+    case "$VULN_FILE" in
+      *.c) OBJ="$(basename "$VULN_FILE" .c).o"; find "$BUILD_DIR" -name "$OBJ" -newer "$SOURCE_DIR/$VULN_FILE" -print -quit > /tmp/ssd_obj_rebuilt; echo "obj_rebuilt: $(cat /tmp/ssd_obj_rebuilt)" ;;
+      *) echo skip > /tmp/ssd_obj_rebuilt ;;
+    esac
+    USES=no
+    if LD_LIBRARY_PATH="$INSTALL_PREFIX/lib" ldd /poc/exploit 2>/dev/null | grep -q "$INSTALL_PREFIX"; then USES=yes; fi
+    echo "$USES" > /tmp/ssd_poc_uses_build; echo "poc_uses_build: $USES"
+
+  # ---- Option A: in-tree regression test (poc_language: intree-test) ----
+  # The PROVEN libtasn1/openssl pattern (per-test automake TESTS — GnuTLS registers
+  # each tests/*.c as its own test, so `make check TESTS=<name>` produces a .trs).
+  # Overlay the fix's Makefile.am (register the test), build the lib, run ONLY the
+  # harvested test, trust the automake .trs verdict (FAIL on vulnerable = reproduced).
+  # GnuTLS self-contained tests (in-process client+server, cert/ASN.1 parsing) run
+  # in one container — no external peer. STARTING POINT, UNTESTED.
+  intree_test:
+    build_script: |
+      #!/bin/bash
+      SRC="$SOURCE_DIR"; BD="$BUILD_DIR"; PFX="$INSTALL_PREFIX"
+      cd "$SRC" || exit 1
+      # Register the harvested test: overlay the test-list Makefile.am the fix changed.
+      for mf in $(git diff-tree --no-commit-id --name-only -r "$FIX_COMMIT" 2>/dev/null | grep -E "Makefile\.am$|Makefile\.in$"); do
+        git checkout "$FIX_COMMIT" -- "$mf" 2>/dev/null && echo "overlaid makefile: $mf"
+      done
+      if [ ! -x "$SRC/configure" ]; then
+        git submodule update --init >/build/bootstrap.log 2>&1 || true
+        touch ChangeLog AUTHORS NEWS README 2>/dev/null || true
+        ( ./bootstrap --skip-po >>/build/bootstrap.log 2>&1 || autoreconf -fi >>/build/bootstrap.log 2>&1 ) || true
+      fi
+      cd "$BD" || exit 1; rm -rf ./*
+      "$SRC"/configure --prefix="$PFX" --disable-doc --without-p11-kit --disable-guile --disable-tools \
+        --with-included-unistring --with-included-libtasn1 CFLAGS="-O2 -g -w" > /build/cfg.log 2>&1 && echo CONFIG_OK || { echo CONFIG_FAIL; tail -30 /build/cfg.log; }
+      make -j"$(nproc)" -k > /build/make.log 2>&1; echo "BUILD_RC=$?" >> /build/build_status
+      make install -k >> /build/make.log 2>&1 || true
+      tail -15 /build/make.log; echo "build complete"
+    run_script: |
+      #!/bin/bash
+      PFX="$INSTALL_PREFIX"
+      cd "$BUILD_DIR" || { echo "SSD_TEST_RESULT=NORESULT (no build dir)"; exit 2; }
+      if ! ls "$PFX"/lib/libgnutls.so* "$BUILD_DIR"/lib/.libs/libgnutls.so* 2>/dev/null | grep -q .; then
+        echo "SSD_TEST_RESULT=NORESULT (no built libgnutls to test against)"; exit 2
+      fi
+      export LD_LIBRARY_PATH="$PFX/lib:$BUILD_DIR/lib/.libs"
+      SUB="tests"; [ -n "$TEST_SUBDIR" ] && [ -d "$BUILD_DIR/$TEST_SUBDIR" ] && SUB="$TEST_SUBDIR"
+      echo "--- make -C $SUB check TESTS=$TEST_NAME ---"
+      timeout "${INTREE_TEST_TIMEOUT:-500}" make -C "$SUB" check TESTS="$TEST_NAME" > /tmp/mt.log 2>&1; rc=$?
+      tail -30 /tmp/mt.log
+      TRS="$BUILD_DIR/$SUB/$TEST_NAME.trs"
+      [ -f "$TRS" ] || { echo "no .trs (test not registered/built) — NORESULT"; echo "SSD_TEST_RESULT=NORESULT"; exit 2; }
+      cat "$TRS"
+      grep -qE ":test-result:[[:space:]]*PASS" "$TRS" && { echo "SSD_TEST_RESULT=PASS"; exit 0; }
+      grep -qE ":test-result:[[:space:]]*(FAIL|ERROR|XPASS)" "$TRS" && { echo "SSD_TEST_RESULT=FAIL"; exit 1; }
+      echo "SSD_TEST_RESULT=NORESULT"; exit 2
+
+  build_system: "autotools"
+  extra_configure_flags: []

@@ -4,7 +4,7 @@ All notable changes to the AI-SSD Patch Generation & Validation Pipeline will be
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project loosely adheres to Semantic Versioning principles.
 
-## [Unreleased] - 2026-06-25
+## [0.4.1]- 2026-06-25
 
 Consolidates all work since 0.3.7: the methodology v2/v3 deterministic-baseline reproduction model, multi-project expansion, configurable SAST, benchmarking/provider infrastructure, dashboard, notifications, and Phase 0 parallelization.
 
@@ -262,4 +262,3 @@ Consolidates all work since 0.3.7: the methodology v2/v3 deterministic-baseline 
 ### Changed
 
 - **Pipeline Architecture**: Successfully modularized the legacy monolithic `pipeline.py` script into the organized `master_pipeline` Python package, mirroring the modular standard set by the `cve_aggregator`.
-

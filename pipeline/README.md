@@ -1,22 +1,23 @@
 # AI-SSD Pipeline
 
-Automated vulnerability reproduction pipeline for glibc CVEs. The pipeline is composed of 5 phases that run sequentially with an optional feedback loop.
+Automated vulnerability reproduction, patching, and validation pipeline. It is **project-agnostic** and configuration-driven — targeting a new C/C++ project needs only a YAML config (configs ship for glibc, the Linux kernel, OpenSSL, FFmpeg, libxml2, libtiff, pcre2, expat, gnutls, tcpdump, file, libtasn1, plus a Java config for Apache Tomcat). The pipeline is composed of 5 phases that run sequentially with an optional self-healing feedback loop.
 
 ## Phases
 
 | Phase | Script | Description |
 |-------|--------|-------------|
-| **0 – Data Aggregation** | `cve_aggregator/` | Scrape NVD/CVE.org, cross-reference ExploitDB, extract PoCs, validate syntax, attempt LLM-based repair of invalid PoCs, and export datasets. Produces `glibc_cve_poc_complete.csv` for manual review. |
-| **1 – Docker Env Build** | `orchestrator.py` | Build Docker images per CVE and execute PoC exploits to reproduce vulnerabilities. |
-| **2 – Patch Generation** | `patch_generator.py` | Generate candidate patches using LLM. |
-| **3 – Patch Validation** | `patch_validator.py` | Apply patches inside Docker and validate via test execution. |
+| **0 – Data Aggregation** | `cve_aggregator/` | Scrape NVD/CVE.org, cross-reference ExploitDB, extract PoCs — or, for CVEs without a public PoC, harvest the fixing commit's own regression test — validate syntax, attempt LLM-based repair of invalid PoCs, and export datasets. Produces `<project>_cve_poc_complete.csv`. |
+| **1 – Reproduction** | `orchestrator.py` | Build era-matched Docker images per CVE and reproduce each vulnerability — running its ExploitDB PoC, or its harvested regression test — capturing a **deterministic baseline** in `image_manifest.json`. |
+| **2 – Patch Generation** | `patch_generator.py` | Generate candidate patches with an LLM, as minimal SEARCH/REPLACE edits. |
+| **3 – Patch Validation** | `patch_validator.py` | Rebuild the patched source incrementally from the Phase 1 image, re-run the exploit/test against the baseline, and run host-side SAST (gating only on patch-introduced findings). |
 | **4 – Reporting** | `reporter.py` | Collect results and generate final report. |
 
 ## Host requirements (kernel) — important for old-glibc CVEs
 
-Phase 1 reproduces a CVE by building the project from source and running its
-regression test against that build. For glibc this exposes a **host-kernel
-constraint** that is easy to miss because the pipeline runs in Docker.
+Phase 1 reproduces a CVE by building the project from source and then either
+running its ExploitDB PoC or its in-tree regression test against that build. For
+glibc this exposes a **host-kernel constraint** that is easy to miss because the
+pipeline runs in Docker.
 
 **Docker isolates userspace, not the kernel.** Every container shares the *host's*
 single Linux kernel — there is no kernel inside an image. The pipeline can (and does)
@@ -76,12 +77,10 @@ python3 pipeline.py
 python3 pipeline.py --phases 0
 ```
 
-After Phase 0 completes, the pipeline produces `glibc_cve_poc_complete.csv`. CVEs whose PoC had syntax issues are flagged with `manual_review_required=True`. You have **30 minutes** (configurable) to review them before the pipeline continues:
+After Phase 0 completes, the pipeline produces `<project>_cve_poc_complete.csv`. CVEs whose PoC had syntax issues and could not be auto-repaired are flagged with `manual_review_required=True`. **By default (`manual_verification.auto_skip: true`) these pending CVEs are automatically excluded** so unattended runs never block; they can be reviewed and re-run later. To review them interactively, set `auto_skip: false` (or pass `--auto-skip-manual` off) to get a review menu after Phase 0, then either:
 
-- **Edit the CSV directly**: set `manual_verified` to `done` for reviewed CVEs.
+- **Edit the CSV directly**: set `manual_verified` to `done` for reviewed CVEs, or
 - **Create marker files**: `mkdir -p manual_supervision && touch manual_supervision/CVE-XXXX-YYYY.ok`
-
-CVEs not verified within the timeout are skipped and can be re-run later.
 
 ### Re-run skipped CVEs
 
@@ -95,16 +94,17 @@ python3 pipeline.py --cves CVE-2015-7547,CVE-2014-5119
 python3 pipeline.py --dry-run
 ```
 
-### Adjust manual verification timeout
+### Manual verification mode
+
+By default (`manual_verification.auto_skip: true` in `config.yaml`) the pipeline never blocks — pending CVEs are auto-excluded and can be re-run later. To review them interactively instead, set `manual_verification.auto_skip: false` in `config.yaml`; Phase 0 then presents a review menu. The skipped CVEs can always be re-run on their own:
 
 ```bash
-python3 pipeline.py --manual-verify-timeout 3600   # 60 min
-python3 pipeline.py --manual-verify-poll 60          # poll every 60s
+python3 pipeline.py --cves CVE-2015-7547,CVE-2014-5119
 ```
 
 ## Phase 1: Optimized Image Workflow
 
-When Phase 0's CSV (`glibc_cve_poc_complete.csv`) is detected, Phase 1 uses an optimized workflow:
+When Phase 0's CSV (`<project>_cve_poc_complete.csv`) is detected, Phase 1 uses an optimized workflow:
 
 1. **Pre-update glibc** — `git fetch --all && git pull` once (fail-fast).
 2. **Build base images** — One per `ubuntu_version` (e.g., `ai-ssd/glibc-base:ubuntu-16.04`). Reused across CVEs.
@@ -114,14 +114,12 @@ When Phase 0's CSV (`glibc_cve_poc_complete.csv`) is detected, Phase 1 uses an o
 
 If Phase 0 CSV is not found, Phase 1 falls back to the legacy per-CVE Dockerfile workflow.
 
-Phase 1 only counts a PoC as successful when the generated wrapper gets an explicit proof signal:
+Phase 1 uses a **deterministic-baseline** reproduction model (methodology v2/v3). The container wrapper does not judge success itself — it runs the PoC and exits with the exploit's *own* exit code. On the known-vulnerable build that exit code, validated across multiple runs to filter out non-deterministic crashes, is captured as the vulnerability's **baseline signature** in `image_manifest.json`, and Phase 3 later judges a patch by comparison against it. Two gates guard the baseline's integrity:
 
-1. **Setup** — prepare the target-specific runtime context, inputs, or helper files.
-2. **Execute** — run the PoC inside the container.
-3. **Verify** — match a category-specific success condition such as `uid=0(root)`, a SUID file bit, a crash signal, or a concrete leak pattern.
-4. **Confirm** — the wrapper exits `42` only after verification passes; `43` means the PoC ran but did not prove exploitation.
+1. **Build-linkage (honesty) gate** — a linkage probe confirms the compiled PoC actually exercises the project's *own* build rather than the system libraries; if not, the case is routed to manual revision, after first attempting recovery rebuilds on the previous era's toolchain and then on a 32-bit (i386) toolchain.
+2. **Negative filter** — the PoC's output is scanned (an LLM with a deterministic regex fallback) for explicit evidence the exploit did *not* work; a flagged run is routed to manual revision instead of recording a false baseline.
 
-This means a PoC that merely exits cleanly, prints generic text, or loads a Metasploit module without an actual session/shell proof is not treated as a successful reproduction.
+> The earlier two-gate exit-`42`/`43` wrapper design has been retired and archived under `deprecated/` (`orchestrator_phase1_gates.py`, `poc_analyzer.py`).
 
 ### Run Phase 1 standalone
 
@@ -196,7 +194,7 @@ Key settings in `config.yaml` or CLI args:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `--phases` | `0 1 2 3 4` | Which phases to run |
-| `--manual-verify-timeout` | `1800` (30 min) | Seconds to wait for manual CSV review |
+| `--manual-verify-timeout` | `1800` | Manual-review timeout (auto-skip is the default; see *Manual verification mode*) |
 | `--manual-verify-poll` | `30` | Seconds between marker-file checks |
 | `--build-timeout` | `3600` | Docker build timeout per image |
 | `--run-timeout` | `300` | Container execution timeout |

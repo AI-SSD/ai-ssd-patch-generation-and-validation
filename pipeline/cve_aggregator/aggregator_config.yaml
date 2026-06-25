@@ -1,8 +1,24 @@
 # =============================================================================
-# CVE Aggregator Pipeline – Configuration
+# CVE Aggregator + Patch Pipeline — PROJECT-AGNOSTIC CONFIG TEMPLATE
 # =============================================================================
-# This is a PROJECT-AGNOSTIC configuration template.
-# Customise the values below for your target software project.
+# Copy this file to cve_aggregator/<project>_config.yaml and fill in the
+# project-specific values. `glibc_config.yaml` is the reference, fully-working
+# example (it has a successful end-to-end Phases 0–4 run); keep this template in
+# sync with it.
+#
+# The pipeline code is project-agnostic: ALL project-specific logic lives here.
+# A config is "ready" for a given phase only if that phase's sections are filled:
+#   Phase 0 (CVE aggregation) ......... project, cve_fetcher, commit_discovery,
+#                                       poc_mapper, data_aggregator,
+#                                       syntax_validator, poc_repair, output
+#   Phase 1 (reproduction / baseline) . phase1.*  (base_packages + build_script +
+#                                       poc_prepare_script + poc_launch_script)
+#   Phase 2 (LLM patch generation) .... phase2.*
+#   Phase 3 (patch validation + SAST) . sast.* + phase1.patch_rebuild_script
+#
+# A project may be Phase-0-ready but NOT Phase-1-ready: the build/run hooks are
+# genuinely project-specific (autotools≠ant≠kbuild; shared-lib≠HTTP-server≠kernel)
+# and must be authored per project. Missing hooks fail loudly / route to manual.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -11,17 +27,30 @@
 project:
   name: "my-project"                     # Short slug (no spaces)
   display_name: "My Project"             # Human-readable name
-  description: "CVE dataset for My Project"
+  description: "CVE and PoC dataset for My Project"
 
 # ---------------------------------------------------------------------------
 # Pipeline behaviour
 # ---------------------------------------------------------------------------
 pipeline:
-  abort_on_error: true                   # Stop on first module failure?
-  # Modules to skip entirely (class names):
-  #   CVEFetcher, CommitDiscovery, PoCMapper, DataAggregator,
-  #   SyntaxValidator, OutputGenerator
-  skip_modules: []
+  abort_on_error: false                  # Continue even if one Phase 0 module fails
+  skip_modules: []                       # e.g. [CVEFetcher, CommitDiscovery, PoCMapper,
+                                         #       DataAggregator, SyntaxValidator, OutputGenerator]
+
+# ---------------------------------------------------------------------------
+# Reproduction strategy — which CVE reproducer(s) to use, in PRIORITY order.
+# ONE knob, all four modes (first entry = primary reproducer Phase 1 picks;
+# a later entry covers CVEs the first source can't):
+#   [exploitdb]            ExploitDB PoC only             (default)
+#   [intree]               fix-commit regression test only (Option A only)
+#   [exploitdb, intree]    both, ExploitDB preferred      (PoC, else the test)
+#   [intree, exploitdb]    both, Option A preferred       (test, else the PoC)
+# Using "intree" requires this project's phase1.intree_test.{build_script,
+# run_script} recipe (how to build+run one of its tests). Removes the
+# external-PoC dependency for the many CVEs whose fix ships a test.
+# ---------------------------------------------------------------------------
+reproduction_strategy:
+  - exploitdb
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -29,75 +58,106 @@ pipeline:
 logging:
   level: "INFO"                          # DEBUG | INFO | WARNING | ERROR
   format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-  file: "logs/cve_aggregator.log"        # Set to null to disable file logging
+  file: "logs/my-project_cve_aggregator.log"   # null to disable file logging
+
+# ===========================================================================
+# PHASE 0 — CVE AGGREGATION
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
 # Module 1: CVE Fetching & Enrichment
 # ---------------------------------------------------------------------------
 cve_fetcher:
-  # NVD API key – get one at https://nvd.nist.gov/developers/request-an-api-key
-  nvd_api_key: ""                        # Leave empty for unauthenticated (slow)
+  # NVD API key — https://nvd.nist.gov/developers/request-an-api-key
+  # The NVD_API_KEY env var takes precedence. Empty = unauthenticated (slow).
+  nvd_api_key: ""
 
-  # Keywords used for NVD keyword search.
-  # These are sent as ``keywordSearch`` to the NVD 2.0 API.
+  # NVD keywordSearch terms.
   keywords:
-    - "my-project"                       # <-- Replace with your project keywords
+    - "my-project"
 
-  # Strong keywords that MUST appear in a CVE description for it to be
-  # considered relevant.  Used for deduplication filtering.
+  # CPE match — sent as virtualMatchString to NVD 2.0. Selects CVEs NVD records
+  # as genuinely AFFECTING the product (version-ranged); far more precise and
+  # complete than keyword search. Results are merged + de-duped with keywords.
+  # Find the CPE at https://nvd.nist.gov/products/cpe/search — e.g.
+  #   glibc  -> cpe:2.3:a:gnu:glibc        tomcat -> cpe:2.3:a:apache:tomcat
+  #   kernel -> cpe:2.3:o:linux:linux_kernel
+  cpe_match:
+    - "cpe:2.3:a:vendor:my-project"
+
+  # Strong keywords that MUST appear in a CVE description to be considered
+  # relevant (deduplication / false-positive filtering).
   strong_keywords:
     - "my-project"
 
-  # If the description contains ONLY a weak match (e.g. a generic library
-  # name), the presence of any of these strings causes the entry to be
-  # rejected.  Useful to exclude look-alike projects.
+  # If a description ONLY weakly matches, the presence of any of these rejects
+  # it. Use to exclude look-alike / co-mentioned projects.
   non_target_indicators: []
   #   - "SomeOtherProject"
-  #   - "NotMyLibrary"
 
-  # Optional hardening knobs (recommended for projects with common/generic names):
-  # - strict_target_matching: require at least one strong keyword in CVE description
-  # - require_project_cpe_match: require a project alias to appear in a CVE CPE entry
-  strict_target_matching: false
+  # Hardening knobs (recommended for projects with common/generic names):
+  # - strict_target_matching: require >=1 strong keyword in the description
+  # - require_project_cpe_match: require a project alias in a CPE entry
+  strict_target_matching: true
   require_project_cpe_match: false
-  project_cpe_aliases: []
-  #   - "my-project"
-  #   - "my_project"
+  project_cpe_aliases:
+    - "my-project"
 
   # Optionally enrich each CVE with CVE.org data (slower).
   enrich_with_cve_org: false
   cve_org_delay: 1.0                     # Seconds between CVE.org requests
 
+  # Exclude CVEs published before this year (commits predate git history).
+  # null / remove to include all years.
+  min_published_year: 2000
+
 # ---------------------------------------------------------------------------
 # Module 2: Commit Discovery
 # ---------------------------------------------------------------------------
 commit_discovery:
-  # Remote URL of the source repository (will be cloned if not present)
+  # Remote URL of the source repository (cloned if absent).
   repo_url: "https://github.com/example/my-project.git"
 
-  # Local path to the cloned repository (relative to CWD or absolute)
-  repo_local_path: "./source_repo"
+  # Local path to the clone. Keep it a SIBLING of the pipeline dir ("../<name>")
+  # so the (often large) checkout persists across runs/deploys that reset the
+  # pipeline dir. Paths resolve relative to the pipeline root (the run CWD), NOT
+  # to --base-dir. Must match phase1.project_repo_local_path.
+  repo_local_path: "../my-project"
+
+  # Timeout (seconds) for the initial git clone (raise for large repos).
+  clone_timeout: 1800
+
+  # Option A (DORMANT): harvest the fix commit's regression test as an in-tree
+  # reproducer. Keep false — the supported reproducer source is ExploitDB PoCs.
+  harvest_regression_tests: false
 
   # Pull latest changes before searching?
   auto_update: true
 
-  # Additional git-grep patterns to try when searching for fix commits.
-  # The pipeline always searches for CVE-ID and CVE-ID-without-dashes.
-  # BZ fallback and unscoped extra patterns are configurable below.
+  # Extra git-grep patterns for fix commits (pipeline always tries CVE-ID and
+  # CVE-ID-without-dashes). Use {cve}/{cve_num} to scope a pattern to the CVE.
   extra_grep_patterns: []
-  # Use placeholders to scope a pattern to the current CVE:
-  #   - "Bug: {cve}"
-  #   - "BZ#\s*{cve_num}"
-  #   - "Fixes #"
-  #   - "Bug:"
 
-  # Optional safety knobs for commit matching:
-  # - enable_bz_fallback: tries bug-tracker numeric matching (can create false positives)
-  # - allow_unscoped_extra_patterns: if false, plain patterns without {cve}/{cve_num} are ignored
+  # Commit-matching safety knobs:
+  # - enable_bz_fallback: match commits citing the CVE's REAL bug-tracker id(s)
+  #   (looked up from NVD references), scoped to bugzilla_hosts below.
+  # - allow_unscoped_extra_patterns: if false, patterns without {cve}/{cve_num}
+  #   are ignored (keep false for large repos).
   enable_bz_fallback: true
   allow_unscoped_extra_patterns: false
 
-  # File extensions considered as "source code" for content extraction
+  # Native bug-tracker host(s) for THIS project. Only bug ids from these hosts
+  # match the repo's "[BZ #NNNN]" commits; cross-vendor distro tracker ids live
+  # in a different namespace and are ignored. Empty = built-in foreign denylist.
+  bugzilla_hosts: []
+  #   - "sourceware.org"
+
+  # Opt-in NETWORK step: for CVEs whose only bug ref is a distro tracker (e.g.
+  # Red Hat) and whose fix commit never names the CVE, follow the distro Bugzilla
+  # REST API to the upstream bug id and its fix commit. One network call per CVE.
+  enable_online_bug_resolution: false
+
+  # File extensions treated as "source code" for content extraction.
   source_extensions:
     - ".c"
     - ".h"
@@ -106,145 +166,110 @@ commit_discovery:
 # Module 3: PoC Mapping & Extraction (ExploitDB)
 # ---------------------------------------------------------------------------
 poc_mapper:
-  # Local path to the ExploitDB git repository
-  exploitdb_path: "./exploit-database"
-
-  # Remote URL (for auto-clone)
+  # Local path to the ExploitDB clone — SIBLING of the pipeline dir so it's
+  # shared across all projects (don't re-clone per project).
+  exploitdb_path: "../exploit-database"
   exploitdb_remote_url: "https://gitlab.com/exploit-database/exploitdb.git"
-
-  # Pull latest ExploitDB data before mapping?
   auto_update: true
 
-  # Deep search: grep exploit file *contents* for CVE IDs (slower but thorough)
+  # Deep search: grep exploit file *contents* for CVE IDs (slower, thorough).
   deep_search: false
-
-  # Extract full source code from matched exploit files?
   extract_content: true
 
-  # Reverse search: scan ExploitDB titles/contents for your project's
-  # keywords to discover CVEs not returned by NVD keyword search.
+  # Reverse search: scan ExploitDB titles/contents for the project's keywords to
+  # discover CVEs NVD keyword search missed.
   reverse_search: true
-  enable_reverse_content_grep: true
+  enable_reverse_content_grep: false
 
-  # Keywords for the reverse search (defaults to cve_fetcher.strong_keywords)
-  # strong_keywords: []
-
-  # Only include verified exploits from ExploitDB?
+  # Only include ExploitDB-verified exploits? (true = higher quality, lower recall)
   require_verified: true
 
-  # Indicators that an exploit mentioning your project is actually about
-  # something else (same idea as cve_fetcher.non_target_indicators).
-  non_target_indicators: []
+  # Preferred ExploitDB platform tokens, most-preferred first. The primary PoC
+  # (the one Phase 1 compiles) is chosen from the highest-ranked matching
+  # platform. Case-insensitive substring. Empty = no platform-aware ordering.
+  prefer_platforms:
+    - "linux"
 
-  # Keywords to grep inside exploit file contents
-  # content_search_keywords: []
+  # Indicators that an exploit mentioning the project is actually about something
+  # else (same idea as cve_fetcher.non_target_indicators).
+  non_target_indicators: []
 
 # ---------------------------------------------------------------------------
 # Module 4: Data Aggregator
 # ---------------------------------------------------------------------------
 data_aggregator:
-  # Path to the global (all-CVEs) JSON dataset
-  global_json_path: "cve_poc_map.json"
-
-  # When true, remove CVEs from the persisted dataset that are not present
-  # in the current run's raw_cves set.
-  prune_missing_cves: false
+  global_json_path: "results/my-project_cve_poc_map.json"
+  # Remove CVEs from the persisted dataset that aren't in the current run.
+  prune_missing_cves: true
 
 # ---------------------------------------------------------------------------
 # Module 5: Syntax Validation
 # ---------------------------------------------------------------------------
 syntax_validator:
-  # Directory where invalid PoC files are copied for manual review
   manual_supervision_dir: "manual_supervision"
-
-  # Path for the JSON validation report
-  report_path: "syntax_validation_report.json"
+  report_path: "results/my-project_syntax_validation_report.json"
+  # When false, only PoCs of CVEs that have a fix commit are flagged for review.
+  allow_manual_without_commit: false
 
 # ---------------------------------------------------------------------------
-# Module 6: LLM PoC Repair
+# Module 6: LLM PoC Repair (auto-fix invalid PoCs before manual review)
 # ---------------------------------------------------------------------------
-# Attempts to auto-fix invalid PoCs using an LLM before flagging for manual
-# review.  Supports "ollama" (local GPU server) or "openai" (OpenAI API).
 poc_repair:
-  # Backend provider: "ollama" or "openai"
-  provider: "ollama"
+  provider: "openai"                     # "openai" | "ollama"
 
-  # -- OpenAI settings (used only when provider: "openai") --
+  # -- OpenAI (provider: openai). OPENAI_API_KEY env var takes precedence. --
   openai_model: "gpt-4.1-mini"
-  # API key. The OPENAI_API_KEY environment variable takes precedence.
   openai_api_key: ""
 
-  # -- Ollama settings (used only when provider: "ollama") --
-  # Ollama-compatible chat API endpoint
+  # -- Ollama (provider: ollama) --
   api_endpoint: "http://10.3.2.171:80/api/chat"
+  model: "devstral:32k"
 
-  # LLM model to use for repairs (must be available on the Ollama server)
-  model: "qwen2.5-coder:7b"
-
-  # Maximum number of repair attempts per PoC before flagging for manual review
   max_repair_attempts: 3
 
-  # Per-attempt model escalation (optional) — mirrors Phase 2's
-  # feedback_loop.models_by_attempt. Keys are attempt numbers (1 = first repair,
-  # 2 = first retry, …), values model ids. An attempt not listed falls back to
-  # the base model for the active `provider`. Provider-agnostic: use OpenAI ids
-  # with provider: openai, or Ollama/local tags (any family) with provider:
-  # ollama. Leave empty to use the base model for every attempt.
-  # models_by_attempt:        # provider: openai
-  #   1: "gpt-4.1-mini"
-  #   2: "gpt-5-mini"
-  #   3: "gpt-4.1"
-  # models_by_attempt:        # provider: ollama
-  #   1: "qwen2.5-coder:7b"
-  #   2: "devstral:32k"
-  #   3: "qwen3-coder:30b"
+  # Per-attempt model escalation (keys = attempt no.; 1=first, 2=first retry…).
+  # Ids passed straight to the active provider. Omit to use the base model.
+  models_by_attempt:
+    1: "gpt-4.1-mini"
+    2: "gpt-5-mini"
+    3: "gpt-4.1"
 
-  # Timeout for each LLM API call (seconds)
-  api_timeout: 120
-
-  # Ollama context window override passed as options.num_ctx.
-  # 0 = use the server default.
-  num_ctx: 0
-
-  # Maximum characters of PoC source code included in the prompt.
-  # 0 = no truncation.
-  max_poc_chars: 0
-
-  # Sampling temperature for the LLM
-  temperature: 0.2
-
-  # Output paths
-  report_path: "poc_repair_report.json"
-  manual_review_queue_path: "manual_review_queue.json"
+  api_timeout: 600                       # per-call inference timeout (s)
+  model_load_timeout: 300                # ollama cold-load wait (s)
+  num_ctx: 32768                         # ollama context window (0 = server default)
+  max_poc_chars: 0                       # 0 = no PoC-source truncation
+  temperature: 0.4
+  report_path: "results/my-project_poc_repair_report.json"
+  manual_review_queue_path: "results/my-project_manual_review_queue.json"
+  gpu_wait_timeout: 120                  # ollama: wait for a free GPU (0 = skip)
 
 # ---------------------------------------------------------------------------
 # Module 7: Output Generation
 # ---------------------------------------------------------------------------
 output:
-  # JSON output paths
-  global_json_path: "cve_poc_map.json"
-  filtered_json_path: "cve_poc_map_filtered.json"
-
-  # CSV output
-  csv_path: "cve_poc_complete.csv"
-
-  # Directory for saving individual PoC exploit files
+  global_json_path: "results/my-project_cve_poc_map.json"
+  filtered_json_path: "results/my-project_cve_poc_map_filtered.json"
+  csv_path: "results/my-project_cve_poc_complete.csv"
   poc_dir: "exploits"
 
-  # Filter controls for the "filtered" dataset:
-  # - filtered_require_commit: keep only CVEs with discovered fix commits
-  # - filtered_require_poc: keep only CVEs with at least one mapped PoC
-  # - filtered_require_verified_poc: require at least one PoC flagged as
-  #   verified in ExploitDB (mirrors poc_mapper.require_verified for output)
-  filtered_require_commit: true
+  # Filtered-dataset controls:
+  filtered_require_commit: false
   filtered_require_poc: true
   filtered_require_verified_poc: true
 
-  # Export PoC rows/files even when commit discovery failed.
-  # Useful for PoC inventory workflows; disable for strict patch-pipeline-only mode.
+  # Route a CVE with a fix commit + verified ExploitDB entry that FAILS PoC
+  # runnability validation (e.g. a prose write-up) to Phase 0 manual supervision
+  # instead of discarding it. false = discard-on-no-runnable-PoC.
+  flag_unvalidated_edb_for_manual_review: true
+
+  # Must match syntax_validator.manual_supervision_dir.
+  manual_supervision_dir: "manual_supervision"
+
+  # Export PoC rows/files even when commit discovery failed (inventory mode).
   allow_poc_without_commit: false
 
-  # CSV column names (order matters)
+  # CSV columns (order matters). This list OVERRIDES the code default, so include
+  # ALL columns Phases 1–3 read — notably the Option-A and manual-review fields.
   csv_fields:
     - "CVE"
     - "V_COMMIT"
@@ -262,38 +287,176 @@ output:
     - "poc_index"
     - "poc_path"
     - "poc_language"
+    - "FIX_COMMIT"
+    - "TEST_PATH"
+    - "TEST_SUBDIR"
     - "manual_review_required"
     - "manual_verified"
 
+# ===========================================================================
+# PHASE 2 — LLM PATCH GENERATION (patch_generator.py)
+# ===========================================================================
+# Code carries only GENERIC defaults; the project supplies the language framing.
+# `language` gates host-side validation: c -> gcc syntax check; anything else ->
+# structural brace check only (Phase 3's in-container rebuild is the real gate).
+# system_prompt/feedback_system_prompt are the ROLE PREAMBLE only — the pipeline
+# appends the fixed SEARCH/REPLACE edit format + (feedback) the failure tail.
+phase2:
+  language: "c"                          # c | java | …
+  system_prompt: >-
+    You are an expert security engineer specializing in fixing software
+    vulnerabilities. Your task is to fix a security vulnerability by making the
+    SMALLEST POSSIBLE EDIT to the vulnerable function — never by rewriting it.
+  feedback_system_prompt: >-
+    You are an expert security engineer specializing in fixing software
+    vulnerabilities. Your previous patch attempt FAILED validation. Analyze the
+    failure and produce an improved fix as MINIMAL edits — never rewrite the
+    whole function.
+  # Project-internal headers absent host-side (C/gcc only; the generic
+  # "fatal error: *.h" regex is the primary arbiter, so this is belt-and-braces).
+  internal_headers: []
 
-# =============================================================================
-# EXAMPLE: glibc-specific configuration
-# =============================================================================
-# To use this pipeline for glibc, replace the sections above with:
-#
-# project:
-#   name: "glibc"
-#   display_name: "GNU C Library"
-#
-# cve_fetcher:
-#   nvd_api_key: "YOUR_KEY"
-#   keywords: ["glibc", "GNU C Library", "eglibc"]
-#   strong_keywords: ["glibc", "GNU C Library", "GNU libc", "eglibc"]
-#   non_target_indicators:
-#     - "NetBSD"
-#     - "FreeBSD"
-#     - "musl"
-#     - "dietlibc"
-#     - "uClibc"
-#     - "Bionic"
-#
-# commit_discovery:
-#   repo_url: "https://github.com/bminor/glibc.git"
-#   repo_local_path: "./glibc"
-#   source_extensions: [".c", ".h"]
-#
-# poc_mapper:
-#   exploitdb_path: "./exploit-database"
-#   reverse_search: true
-#   require_verified: true
-# =============================================================================
+# ===========================================================================
+# PHASE 3 — SAST (static analysis) tooling (patch_validator.py)
+# ===========================================================================
+# PROJECT-/LANGUAGE-SPECIFIC. SAST runs HOST-SIDE on a single patched SOURCE file
+# with NO build, so only source-level analysers fit (no CodeQL/Infer/SpotBugs).
+# The code is tool-agnostic: it runs a configured command and parses one of the
+# supported output formats. C projects -> cppcheck/clang-tidy/semgrep/flawfinder;
+# Java -> semgrep + pmd. If this section is omitted the loader falls back to the
+# C-oriented cppcheck + flawfinder defaults, so NON-C projects MUST set it.
+#   parser:  cppcheck-xml | flawfinder | sarif | regex
+#   install: { apt: <pkg> } | { pip: <pkg> } | { script: "<shell>" }
+#   {file} -> patched source file        {python} -> running interpreter
+sast:
+  enabled: true
+  fail_on: [critical, high]              # severity classes that FAIL a patch
+  tool_timeout: 180                      # per-tool subprocess timeout (s)
+  tools:
+    - name: cppcheck
+      detect: cppcheck
+      cmd: ["cppcheck", "--enable=all", "--xml", "--xml-version=2", "{file}"]
+      parser: cppcheck-xml
+      install: { apt: cppcheck }
+    - name: semgrep
+      detect: semgrep
+      cmd: ["semgrep", "scan", "--sarif", "--quiet", "--metrics=off", "--config=p/c", "{file}"]
+      parser: sarif
+      install: { pip: semgrep }
+    - name: flawfinder
+      detect: flawfinder
+      cmd: ["flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      fallback_cmd: ["{python}", "-m", "flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      parser: flawfinder
+      install: { pip: flawfinder }
+
+# ===========================================================================
+# PHASE 1 — REPRODUCTION (orchestrator.py); shared with Phase 3
+# ===========================================================================
+# Everything here is read at startup via --phase0-config. The build/PoC/run hooks
+# are SHELL SCRIPTS the pipeline COPYs into the Docker image and runs under a
+# generic env contract — the ONLY place build-system/compiler/run commands live.
+# Each hook below documents its env inputs + required output markers. Absent hooks
+# fail loudly (build) or route the CVE to manual (reproduction).
+phase1:
+  # --- Source repo (must match commit_discovery) ---
+  project_repo_local_path: "../my-project"
+  project_repo_remote_url: "https://github.com/example/my-project.git"
+
+  # --- Docker image tags + manifest ---
+  docker_base_image_prefix: "ai-ssd/my-project-base"
+  docker_cve_image_prefix: "ai-ssd/my-project-cve"
+  image_manifest_path: "results/my-project_image_manifest.json"
+
+  # --- Image layout (single path components; shared with Phase 3) ---
+  source_dir_name: "project-src"
+  build_dir_name: "project-build"
+  install_prefix: "/opt/project-build"
+
+  # --- Base image packages (pipeline hardcodes only git + ca-certificates) ---
+  # base_packages: REQUIRED — install failure fails the base build.
+  # base_packages_optional: best-effort (a 404 on an EOL mirror is non-fatal).
+  # base_setup: post-install shell hook (extra arch, locale-gen, …), best-effort.
+  base_packages: []                      # e.g. [build-essential, gawk, bison]  (glibc)
+                                         #      [default-jdk, ant]              (tomcat)
+                                         #      [build-essential, flex, bison, libelf-dev, bc]  (kernel)
+  base_packages_optional: []
+  base_setup: ""
+
+  # --- Era selection: commit-year -> Ubuntu base. Missing years clamp to bounds.
+  # {} disables (use CSV ubuntu_version). version_era_map below takes precedence.
+  commit_era_map:
+    2000: "12.04"
+    2010: "14.04"
+    2015: "16.04"
+    2018: "18.04"
+    2020: "20.04"
+    2022: "22.04"
+    2024: "24.04"
+
+  # --- Version-based era (Gate B; takes precedence over commit_era_map). Reads
+  # version_file from the checked-out tree and maps it (closest-older key <= ver)
+  # to the era. Fixes backport commits mis-era'd by commit date. Leave version_file
+  # empty to disable. (glibc: version.h. Many projects have no single version file
+  # — then leave empty and rely on commit_era_map.)
+  version_file: ""
+  version_regex: ''
+  version_era_map: {}
+
+  # --- 32-bit (i386) arch fallback for bugs that only manifest on 32-bit ---
+  enable_arch_fallback: true
+
+  # --- Env exported right before a PoC runs (generic hook; e.g. glibc sets
+  # MALLOC_CHECK_ so silent heap corruption aborts detectably). {} if unneeded. ---
+  poc_run_env: {}
+
+  # =====================================================================
+  # BUILD / REPRODUCE / VALIDATE HOOKS (PROJECT-SPECIFIC SHELL SCRIPTS)
+  # =====================================================================
+  # ---- build_script (REQUIRED for Phase 1) -------------------------------
+  # Build+install the project at the checked-out vulnerable commit. Env:
+  #   SOURCE_DIR BUILD_DIR INSTALL_PREFIX COMMIT_HASH BUILD_ARCH
+  # MUST append to /build/build_status:
+  #   PROJECT_BUILD_EXIT_CODE=<n>  PROJECT_INSTALL_EXIT_CODE=<n>
+  #   PROJECT_BUILD_INSTALLED=yes|no   (ground-truth: the build artefact exists)
+  # i386 handling is the script's job, keyed on $BUILD_ARCH. See glibc_config.yaml
+  # for a full autotools example; tomcat -> ant, kernel -> make defconfig && make.
+  build_script: |
+    #!/bin/bash
+    echo "ERROR: phase1.build_script not configured for this project" >&2
+    echo "PROJECT_BUILD_INSTALLED=no" >> /build/build_status
+    exit 1
+
+  # ---- poc_prepare_script (compiled-language PoCs; e.g. C) ---------------
+  # Compile the PoC so it exercises the project build, and write the honesty
+  # marker. Used ONLY for compiled (C) PoCs — interpreted PoCs (python/ruby/…)
+  # skip it. Env: INSTALL_PREFIX BUILD_ARCH POC_ALTS POC_COMPANIONS. Stages the
+  # primary PoC at /poc/exploit_raw.c (+ alts/companions in /poc). MUST produce
+  # /poc/exploit and write /poc/.ssd_poc_uses_build (yes|no). Omit for projects
+  # whose PoCs are purely interpreted. See glibc_config.yaml for the C example.
+  poc_prepare_script: ""
+
+  # ---- poc_launch_script (compiled-language PoCs) -----------------------
+  # Decide HOW to execute /poc/exploit so it exercises the project build. Env:
+  #   RUN_LIB (= install_prefix/lib). Outputs (consumed by the run wrapper):
+  #   SSD_EXEC_PREFIX (launch prefix; "" = run directly), SSD_LD_LIBRARY_PATH.
+  # Omit -> run the binary directly with LD_LIBRARY_PATH=$RUN_LIB. glibc runs it
+  # through the project's own ld.so --library-path. See glibc_config.yaml.
+  poc_launch_script: ""
+
+  # ---- patch_rebuild_script (REQUIRED for Phase 3) ----------------------
+  # Incrementally rebuild the patched image (derives FROM the Phase 1 CVE image,
+  # so SOURCE_DIR/BUILD_DIR/INSTALL_PREFIX are inherited) + verification markers.
+  # Env adds VULN_FILE (patched file, relative to the source tree). MUST write:
+  #   /tmp/ssd_rebuild.log  /tmp/ssd_build_errors  /tmp/ssd_obj_rebuilt
+  #   /tmp/ssd_poc_uses_build
+  # Tolerant: a non-compiling PATCH must NOT fail the image build (surfaced via
+  # the markers); exit 0. See glibc_config.yaml for the make example.
+  patch_rebuild_script: |
+    #!/bin/bash
+    echo "ERROR: phase1.patch_rebuild_script not configured for this project" >&2
+    echo "" > /tmp/ssd_obj_rebuilt
+    exit 1
+
+  build_system: "custom"                 # informational only
+  extra_configure_flags: []              # appended after strategy flags (autotools)

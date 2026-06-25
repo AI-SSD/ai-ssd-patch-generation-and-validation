@@ -819,6 +819,33 @@ def get_file_content_at_commit(
     return None
 
 
+def get_file_bytes_at_commit(
+    repo_path: Path,
+    file_path: str,
+    commit_hash: str,
+    *,
+    timeout: int = 30,
+) -> Optional[bytes]:
+    """Return the RAW bytes of *file_path* as of *commit_hash*.
+
+    Binary-safe twin of :func:`get_file_content_at_commit`. Required for harvested
+    test reproducers that are DATA, not source (e.g. a crafted ``.pcap``): a
+    UTF-8 decode would lossily corrupt them. Returns ``None`` when the file does
+    not exist at the commit (so callers can use truthiness as an existence test)."""
+    if not commit_hash or not repo_path.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{commit_hash}:{file_path}"],
+            cwd=repo_path, capture_output=True, timeout=timeout,
+        )
+        if result.returncode == 0:
+            return result.stdout
+    except (subprocess.TimeoutExpired, Exception) as exc:
+        logger.warning("file-bytes-at-commit failed for %s@%s: %s", file_path, commit_hash, exc)
+    return None
+
+
 def get_changed_functions_in_commit(
     repo_path: Path,
     commit_hash: str,

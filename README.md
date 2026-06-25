@@ -1,6 +1,6 @@
 # AI-SSD Patch Generation & Validation Pipeline
 
-An automated, end-to-end pipeline designed to reproduce, patch, and validate security vulnerabilities (CVEs) across software projects. While initially developed for `glibc`, the pipeline is **project-agnostic** and supports multiple programming languages and build systems.
+An automated, end-to-end pipeline designed to reproduce, patch, and validate security vulnerabilities (CVEs) across software projects. While initially developed for `glibc`, the pipeline is **project-agnostic** and configuration-driven: targeting a new C/C++ project requires only a YAML config (configs ship for glibc, the Linux kernel, OpenSSL, FFmpeg, libxml2, and others). Its Phase 0 data aggregation additionally handles multiple languages, and a Java configuration (Apache Tomcat) is included.
 
 This repository was created as part of the AI-SSD research project by the [Department of Computer Engineering at the Faculty of Sciences and Technology](https://www.uc.pt/fctuc/dei/), [University of Coimbra](https://www.uc.pt/).
 
@@ -10,10 +10,10 @@ The pipeline operates in five sequential phases, orchestrated by a central modul
 
 | Phase             | Component              | Description                                                                                                                                                                                                                                                            |
 | ----------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Phase 0** | `cve_aggregator/`    | **Data Aggregation**: Scrapes NVD/CVE.org, cross-references ExploitDB, extracts Proofs-of-Concept (PoCs), validates syntax, attempts LLM-based repair of invalid PoCs, and exports normalized datasets (CSV/JSON).                                               |
-| **Phase 1** | `orchestrator.py`    | **Vulnerability Reproduction**: Builds Docker environments tailored to the target project (e.g., matching the appropriate Ubuntu version and compiler era), compiles the vulnerable code, and executes PoC exploits to reproduce the issue.                      |
+| **Phase 0** | `cve_aggregator/`    | **Data Aggregation**: Scrapes NVD/CVE.org, cross-references ExploitDB, extracts Proofs-of-Concept (PoCs) — or, for CVEs with no public PoC, harvests the fixing commit's own regression test — validates syntax, attempts LLM-based repair of invalid PoCs, and exports normalized datasets (CSV/JSON).                                               |
+| **Phase 1** | `orchestrator.py`    | **Vulnerability Reproduction**: Builds Docker environments tailored to the target project (matching the appropriate Ubuntu version and compiler era), compiles the vulnerable code, and reproduces the issue via the PoC exploit or the regression test, capturing a deterministic baseline signature for later comparison.                      |
 | **Phase 2** | `patch_generator.py` | **Patch Generation**: Uses local (Ollama) or external (OpenAI) LLMs to generate candidate patches for the vulnerable functions.                                                                                                                                  |
-| **Phase 3** | `patch_validator.py` | **Patch Validation**: Applies generated patches within isolated Docker containers, executes PoCs to confirm mitigation, and runs Static Application Security Testing (SAST) tools (Cppcheck, Flawfinder, RATS) to ensure no new vulnerabilities were introduced. |
+| **Phase 3** | `patch_validator.py` | **Patch Validation**: Rebuilds the patched source incrementally from the Phase 1 image, re-executes the exploit/test and compares against the Phase 1 baseline to confirm mitigation, and runs host-side Static Application Security Testing (SAST) with a configurable, per-project tool set (for C: Cppcheck, Clang-Tidy, Semgrep, Flawfinder; for Java: Semgrep, PMD), failing a patch only when it introduces *new* findings. |
 | **Phase 4** | `reporter.py`        | **Automated Reporting**: Aggregates all execution results, generates comprehensive Markdown reports, and produces Matplotlib visualizations comparing model performances.                                                                                        |
 
 ## ⚙️ Prerequisites & Setup
@@ -114,7 +114,7 @@ To kill tmux `tmux kill-session`
 python3 pipeline.py --phases 0
 ```
 
-Note: Phase 0 may flag some PoCs for manual review. The master pipeline will pause (configurable timeout) to allow you to inspect the `pipeline/manual_supervision/` directory and approve them.
+Note: Phase 0 may flag some PoCs for manual review. By default (`manual_verification.auto_skip: true`) these are automatically excluded so unattended runs do not block, and can be re-run later; set `manual_verification.auto_skip: false` in `config.yaml` for an interactive review of `pipeline/manual_supervision/` instead.
 
 **Run Patch Generation & Validation (Phases 2 and 3) for a specific CVE:**
 

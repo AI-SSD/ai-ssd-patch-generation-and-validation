@@ -29,6 +29,13 @@ from enum import Enum
 from poc_analyzer import PoCAnalyzer
 from master_pipeline.sast_config import load_sast_config
 from master_pipeline import sast_runner  # shared Phase 1/3 SAST run + classify
+from cve_aggregator.utils.phase1_readiness import (  # shared with the dashboard
+    classify_phase1_readiness, SKIPPED_MANUAL, NOT_READY,
+)
+try:  # best-effort live-progress heartbeat for the dashboard (never fatal)
+    from cve_aggregator.utils import live_progress
+except Exception:  # pragma: no cover
+    live_progress = None
 
 # Try to import docker, provide helpful error if not installed
 try:
@@ -189,8 +196,18 @@ def _resolve_phase1_settings(cfg: dict, base_dir: Path) -> dict:
     csv_rel = output.get("csv_path", "cve_poc_complete.csv")
     csv_path = base_dir / csv_rel if not Path(csv_rel).is_absolute() else Path(csv_rel)
 
+    # The project source tree is a shared INPUT clone kept BESIDE the pipeline dir
+    # (e.g. "../glibc"), NOT a per-project output. base_dir is projects/<name>, so
+    # resolving "../glibc" against it points at the workdir, not the real clone.
+    # Resolve a relative repo path against the pipeline root (SSD_PIPELINE_ROOT,
+    # exported by the master pipeline executor) so it works regardless of CWD;
+    # fall back to base_dir when the env var is absent (standalone invocation).
     repo_rel = p1.get("project_repo_local_path", _DEFAULT_PROJECT_REPO_LOCAL_PATH)
-    repo_path = base_dir / repo_rel if not Path(repo_rel).is_absolute() else Path(repo_rel)
+    if Path(repo_rel).is_absolute():
+        repo_path = Path(repo_rel)
+    else:
+        _root = os.environ.get("SSD_PIPELINE_ROOT")
+        repo_path = (Path(_root) / repo_rel) if _root else (base_dir / repo_rel)
 
     manifest_rel = p1.get("image_manifest_path", _DEFAULT_IMAGE_MANIFEST_PATH)
     manifest_path = (
@@ -206,6 +223,9 @@ def _resolve_phase1_settings(cfg: dict, base_dir: Path) -> dict:
         "source_dir_name": p1.get("source_dir_name", _DEFAULT_SOURCE_DIR_NAME),
         "build_dir_name": p1.get("build_dir_name", _DEFAULT_BUILD_DIR_NAME),
         "install_prefix": p1.get("install_prefix", _DEFAULT_INSTALL_PREFIX),
+        # Project framing for the LLM PoC-analysis prompts (generic default lives
+        # in PoCAnalyzer; glibc sharpens it via phase1.poc_analysis). Agnostic.
+        "poc_analysis": p1.get("poc_analysis", {}) or {},
         # Project-supplied build recipe for the STANDARD (ExploitDB-PoC) path —
         # the ONLY place build-system/compiler commands live. Run as build.sh in
         # the CVE image with the generic env contract (SOURCE_DIR / BUILD_DIR /
@@ -768,29 +788,28 @@ class Phase0CSVParser:
                     continue
                 seen_cves.add(cve)
 
-                # Skip CVEs excluded by pipeline (manual review timeout)
-                if cve in self.skipped_cves:
-                    skipped_manual += 1
-                    self.logger.info(f"Skipping {cve} (pending manual verification)")
-                    continue
-
-                # Skip CVEs still pending manual review
-                manual_required = str(row.get('manual_review_required', '')).strip().lower()
-                manual_verified = str(row.get('manual_verified', '')).strip().lower()
-                if manual_required in ('true', '1', 'yes') and manual_verified != 'done':
-                    skipped_manual += 1
-                    self.logger.info(f"Skipping {cve} (manual_review_required=True, manual_verified={manual_verified})")
-                    continue
-
-                # Phase-1 readiness gate: require BOTH a fixing commit (V_COMMIT)
-                # and a runnable PoC. V_COMMIT is checked out to build the
+                # Phase-1 readiness gate (shared with the dashboard via
+                # cve_aggregator.utils.phase1_readiness so the Phase-0 card and
+                # this denominator can't drift): skip CVEs excluded by the
+                # pipeline (manual-review timeout) or still pending manual
+                # review, and require BOTH a fixing commit (V_COMMIT) and a
+                # runnable PoC. V_COMMIT is checked out to build the
                 # known-vulnerable glibc — without it there is only stock distro
                 # glibc, so no deterministic baseline is possible (the CVE would
                 # only ever reach "No fixing commit recorded → manual revision").
                 # Without a PoC there is nothing to run. Skipping here keeps these
                 # un-reproducible CVEs out of the Phase 1 denominator instead of
                 # building images for them only to fail.
-                if not row.get('V_COMMIT', '').strip() or not row.get('poc_path', '').strip():
+                verdict = classify_phase1_readiness(row, self.skipped_cves)
+                if verdict == SKIPPED_MANUAL:
+                    skipped_manual += 1
+                    if cve in self.skipped_cves:
+                        self.logger.info(f"Skipping {cve} (pending manual verification)")
+                    else:
+                        manual_verified = str(row.get('manual_verified', '')).strip().lower()
+                        self.logger.info(f"Skipping {cve} (manual_review_required=True, manual_verified={manual_verified})")
+                    continue
+                if verdict == NOT_READY:
                     skipped_not_ready += 1
                     self.logger.info(
                         f"Skipping {cve} (not Phase-1-ready: "
@@ -1835,7 +1854,11 @@ CMD ["php", "/poc/exploit.php"]
     # =========================================================================
     # Recipe version: bump to invalidate cached intree-test images when the
     # template changes.
-    INTREE_RECIPE_VERSION = "intree-v7"
+    # v8: tcpdump run_script now parses TESTLIST flags tab-aware + has a
+    # reproduction sanity gate (a "tcpdump: syntax error" CLI parse failure no
+    # longer counts as a reproduction). The old run_script was baked into cached
+    # images, so this bump forces a rebuild or the fix has no effect.
+    INTREE_RECIPE_VERSION = "intree-v8"
 
     # -------------------------------------------------------------------------
     # PROJECT-AGNOSTIC by design. The orchestrator only knows how to:
@@ -1889,17 +1912,24 @@ RUN rm -f .git/index.lock .git/refs/heads/*.lock 2>/dev/null; \\
 # bug. Pure git — project-agnostic. Any project-specific test REGISTRATION
 # (e.g. an autotools subdir Makefile edit) is the build script's job, via
 # $FIX_COMMIT.
-# THEN overlay the reproducer TEST itself from the fix commit even when it was
-# MODIFIED (not added): the fix routinely strengthens the test (adds the
-# assertion/overflow-check that detects the bug), so the vulnerable parent's
-# weaker test would trivially PASS and hide the vulnerability. The TEST is the
-# oracle and must be the fix's version; the vulnerable SOURCE stays untouched.
+# THEN overlay the reproducer TEST itself. The test is the ORACLE and must be a
+# version that DETECTS the bug (the fix strengthens it), while the vulnerable
+# SOURCE stays untouched. It may live in the FIX commit (fix-commit harvest) OR
+# in a SEPARATE later commit (a CVE-tagged test found at the repo tip by
+# commit_discovery._find_cve_tagged_tests). So resolve a ref where {test_path}
+# actually EXISTS — prefer the fix commit, else the newest commit (across all
+# refs) that touched it — instead of blindly `git checkout {fix_commit}`, which
+# silently fails + aborts the build when the test was added after the fix
+# (observed: expat CVE-2022-23852, whose basic_tests.c was split out later).
 RUN added=$(git diff-tree --no-commit-id --name-only --diff-filter=A -r {fix_commit}); \\
     for f in $added; do git checkout {fix_commit} -- "$f" 2>/dev/null && echo "overlaid added: $f"; done; \\
     if [ -n "{test_path}" ]; then \\
-        git checkout {fix_commit} -- "{test_path}" 2>/dev/null && echo "overlaid reproducer test from fix: {test_path}"; \\
+        TEST_REF="{fix_commit}"; \\
+        git cat-file -e {fix_commit}:"{test_path}" 2>/dev/null || TEST_REF=$(git rev-list -1 --all -- "{test_path}" 2>/dev/null); \\
+        [ -n "$TEST_REF" ] || TEST_REF="{fix_commit}"; \\
+        git checkout "$TEST_REF" -- "{test_path}" 2>/dev/null && echo "overlaid reproducer test from $TEST_REF: {test_path}"; \\
     fi; \\
-    if [ ! -e {test_path} ]; then echo "ERROR: test {test_path} not present after overlay" && exit 1; fi; \\
+    if [ ! -e {test_path} ]; then echo "ERROR: test {test_path} not present after overlay (no ref in history has it)" && exit 1; fi; \\
     echo "Overlay complete (test {test_path} present)"
 
 # Project-supplied build + run scripts (the ONLY place build-system/compiler/
@@ -2254,486 +2284,6 @@ class ImageManifest:
         temp_path.replace(self.manifest_path)
         self.logger.info(f"Image manifest saved: {self.manifest_path}")
 
-
-# =============================================================================
-# Dockerfile Generator (Legacy - kept for backward compatibility)
-# =============================================================================
-
-class DockerfileGenerator:
-    """Generates Dockerfiles appropriate for building vulnerable glibc versions"""
-    
-    # Dockerfile template for Ubuntu 14.04
-    TEMPLATE_14_04 = '''# =============================================================================
-# Dockerfile for {cve}
-# Vulnerable glibc commit: {commit_hash}
-# Base: Ubuntu 14.04 (GCC 4.8 - suitable for 2012-2014 code)
-# =============================================================================
-FROM ubuntu:14.04
-
-LABEL maintainer="AI-SSD Project"
-LABEL cve="{cve}"
-LABEL commit="{commit_hash}"
-
-# Prevent interactive prompts during package installation
-ENV DEBIAN_FRONTEND=noninteractive
-
-# Update and install build dependencies
-RUN apt-get update && apt-get install -y \\
-    build-essential \\
-    git \\
-    gawk \\
-    bison \\
-    texinfo \\
-    autoconf \\
-    libtool \\
-    gettext \\
-    wget \\
-    && rm -rf /var/lib/apt/lists/*
-
-# Create working directory
-WORKDIR /build
-
-# Clone glibc repository and checkout vulnerable commit
-RUN git clone --depth=1 https://sourceware.org/git/glibc.git /build/glibc-src || \\
-    git clone https://github.com/bminor/glibc.git /build/glibc-src
-
-WORKDIR /build/glibc-src
-RUN git fetch --unshallow 2>/dev/null || true && \\
-    git fetch origin {commit_hash} && \\
-    git checkout {commit_hash}
-
-# Create build directory
-RUN mkdir -p /build/glibc-build
-
-WORKDIR /build/glibc-build
-
-# Configure glibc build
-# Note: Using --disable-werror to allow building with warnings as errors disabled
-RUN ../glibc-src/configure \\
-    --prefix={install_prefix} \\
-    --disable-werror \\
-    --disable-sanity-checks \\
-    --enable-obsolete-rpc \\
-    CC="gcc -fno-stack-protector" \\
-    CFLAGS="-O2 -g -fno-stack-protector" \\
-    || (cat config.log && exit 1)
-
-# Build glibc (using -k to continue on errors, -j for parallel)
-# Save build status to check later
-RUN make -j$(nproc) -k 2>&1 | tee /build/build.log; \\
-    echo "GLIBC_BUILD_EXIT_CODE=$?" >> /build/build_status
-
-# Install to prefix (may partially succeed)
-RUN make install -k 2>&1 | tee -a /build/build.log; \\
-    echo "GLIBC_INSTALL_EXIT_CODE=$?" >> /build/build_status
-
-# Verify glibc build produced necessary files
-RUN echo "=== Checking glibc build output ===" && \\
-    ls -la {install_prefix}/lib/ 2>/dev/null || echo "WARNING: {install_prefix}/lib/ not found" && \\
-    ls {install_prefix}/lib/libc.so* 2>/dev/null || echo "WARNING: libc.so not found"
-
-# Create directory for PoC
-RUN mkdir -p /poc
-
-# Copy exploit source
-COPY poc_exploit.c /poc/exploit.c
-
-# Compile the PoC against vulnerable glibc
-# First, find the actual dynamic linker path
-# Use fallback compilation attempts if linking with specific libraries fails
-# Always fall back to system glibc if vulnerable glibc compilation fails
-WORKDIR /poc
-RUN DYNAMIC_LINKER=$(find {install_prefix}/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
-    echo "Found dynamic linker: $DYNAMIC_LINKER" && \\
-    if [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then \\
-        echo "Attempting compilation with vulnerable glibc..."; \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include \\
-            -ldl -lpthread 2>&1 || \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include \\
-            -ldl 2>&1 || \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include \\
-            -lm 2>&1 || \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include 2>&1 || \\
-        echo "Vulnerable glibc compilation failed"; \\
-    fi && \\
-    if [ ! -f /poc/exploit ]; then \\
-        echo "Falling back to system glibc compilation..." && \\
-        (gcc -o exploit exploit.c -ldl -lpthread 2>&1 || \\
-        gcc -o exploit exploit.c -ldl 2>&1 || \\
-        gcc -o exploit exploit.c -lm 2>&1 || \\
-        gcc -o exploit exploit.c 2>&1); \\
-    fi
-
-# Verify exploit binary was created
-RUN if [ ! -f /poc/exploit ]; then \\
-        echo "ERROR: Failed to compile exploit binary!" && \\
-        echo "=== Compilation environment ===" && \\
-        gcc --version && \\
-        echo "=== Source file ===" && \\
-        head -50 /poc/exploit.c && \\
-        echo "=== Attempting verbose compilation ===" && \\
-        gcc -v -o exploit exploit.c 2>&1 || true; \\
-        exit 1; \\
-    else \\
-        echo "SUCCESS: Exploit binary created" && \\
-        ls -la /poc/exploit && \\
-        file /poc/exploit; \\
-    fi
-
-# Set environment for running with vulnerable glibc
-ENV LD_LIBRARY_PATH={install_prefix}/lib
-
-# Default command: run the exploit
-CMD ["/poc/exploit"]
-'''
-
-    # Dockerfile template for Ubuntu 16.04
-    TEMPLATE_16_04 = '''# =============================================================================
-# Dockerfile for {cve}
-# Vulnerable glibc commit: {commit_hash}
-# Base: Ubuntu 16.04 (GCC 5.x - suitable for 2015-2016 code)
-# =============================================================================
-FROM ubuntu:16.04
-
-LABEL maintainer="AI-SSD Project"
-LABEL cve="{cve}"
-LABEL commit="{commit_hash}"
-
-# Prevent interactive prompts during package installation
-ENV DEBIAN_FRONTEND=noninteractive
-
-# Update and install build dependencies
-RUN apt-get update && apt-get install -y \\
-    build-essential \\
-    git \\
-    gawk \\
-    bison \\
-    texinfo \\
-    autoconf \\
-    libtool \\
-    gettext \\
-    wget \\
-    python3 \\
-    && rm -rf /var/lib/apt/lists/*
-
-# Create working directory
-WORKDIR /build
-
-# Clone glibc repository and checkout vulnerable commit
-RUN git clone https://github.com/bminor/glibc.git /build/glibc-src
-
-WORKDIR /build/glibc-src
-RUN git fetch origin {commit_hash} && \\
-    git checkout {commit_hash}
-
-# Create build directory (glibc requires out-of-tree build)
-RUN mkdir -p /build/glibc-build
-
-WORKDIR /build/glibc-build
-
-# Configure glibc build
-RUN ../glibc-src/configure \\
-    --prefix={install_prefix} \\
-    --disable-werror \\
-    --disable-sanity-checks \\
-    CC="gcc -fno-stack-protector" \\
-    CFLAGS="-O2 -g -fno-stack-protector -Wno-error" \\
-    || (cat config.log && exit 1)
-
-# Build glibc (using -k to continue on errors)
-# Save build status to check later
-RUN make -j$(nproc) -k 2>&1 | tee /build/build.log; \\
-    echo "GLIBC_BUILD_EXIT_CODE=$?" >> /build/build_status
-
-# Install to prefix
-RUN make install -k 2>&1 | tee -a /build/build.log; \\
-    echo "GLIBC_INSTALL_EXIT_CODE=$?" >> /build/build_status
-
-# Verify glibc build produced necessary files
-RUN echo "=== Checking glibc build output ===" && \\
-    ls -la {install_prefix}/lib/ 2>/dev/null || echo "WARNING: {install_prefix}/lib/ not found" && \\
-    ls {install_prefix}/lib/libc.so* 2>/dev/null || echo "WARNING: libc.so not found"
-
-# Create directory for PoC
-RUN mkdir -p /poc
-
-# Copy exploit source
-COPY poc_exploit.c /poc/exploit.c
-
-# Compile the PoC against vulnerable glibc
-# First, find the actual dynamic linker path
-# Use fallback compilation attempts if linking with specific libraries fails
-# Always fall back to system glibc if vulnerable glibc compilation fails
-WORKDIR /poc
-RUN DYNAMIC_LINKER=$(find {install_prefix}/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
-    echo "Found dynamic linker: $DYNAMIC_LINKER" && \\
-    if [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then \\
-        echo "Attempting compilation with vulnerable glibc..."; \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include \\
-            -ldl -lpthread 2>&1 || \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include \\
-            -ldl 2>&1 || \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include \\
-            -lm 2>&1 || \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include 2>&1 || \\
-        echo "Vulnerable glibc compilation failed"; \\
-    fi && \\
-    if [ ! -f /poc/exploit ]; then \\
-        echo "Falling back to system glibc compilation..." && \\
-        (gcc -o exploit exploit.c -ldl -lpthread 2>&1 || \\
-        gcc -o exploit exploit.c -ldl 2>&1 || \\
-        gcc -o exploit exploit.c -lm 2>&1 || \\
-        gcc -o exploit exploit.c 2>&1); \\
-    fi
-
-# Verify exploit binary was created
-RUN if [ ! -f /poc/exploit ]; then \\
-        echo "ERROR: Failed to compile exploit binary!" && \\
-        echo "=== Compilation environment ===" && \\
-        gcc --version && \\
-        echo "=== Source file ===" && \\
-        head -50 /poc/exploit.c && \\
-        echo "=== Attempting verbose compilation ===" && \\
-        gcc -v -o exploit exploit.c 2>&1 || true; \\
-        exit 1; \\
-    else \\
-        echo "SUCCESS: Exploit binary created" && \\
-        ls -la /poc/exploit && \\
-        file /poc/exploit; \\
-    fi
-
-# Set environment for running with vulnerable glibc
-ENV LD_LIBRARY_PATH={install_prefix}/lib
-
-# Default command: run the exploit
-CMD ["/poc/exploit"]
-'''
-
-    # Dockerfile template for Ubuntu 18.04
-    TEMPLATE_18_04 = '''# =============================================================================
-# Dockerfile for {cve}
-# Vulnerable glibc commit: {commit_hash}
-# Base: Ubuntu 18.04 (GCC 7.x - suitable for 2017-2018 code)
-# =============================================================================
-FROM ubuntu:18.04
-
-LABEL maintainer="AI-SSD Project"
-LABEL cve="{cve}"
-LABEL commit="{commit_hash}"
-
-# Prevent interactive prompts during package installation
-ENV DEBIAN_FRONTEND=noninteractive
-
-# Update and install build dependencies
-RUN apt-get update && apt-get install -y \\
-    build-essential \\
-    git \\
-    gawk \\
-    bison \\
-    texinfo \\
-    autoconf \\
-    libtool \\
-    gettext \\
-    wget \\
-    python3 \\
-    && rm -rf /var/lib/apt/lists/*
-
-# Create working directory
-WORKDIR /build
-
-# Clone glibc repository and checkout vulnerable commit
-RUN git clone https://github.com/bminor/glibc.git /build/glibc-src
-
-WORKDIR /build/glibc-src
-RUN git fetch origin {commit_hash} && \\
-    git checkout {commit_hash}
-
-# Create build directory
-RUN mkdir -p /build/glibc-build
-
-WORKDIR /build/glibc-build
-
-# Configure glibc build
-RUN ../glibc-src/configure \\
-    --prefix={install_prefix} \\
-    --disable-werror \\
-    --disable-sanity-checks \\
-    CC="gcc -fno-stack-protector" \\
-    CFLAGS="-O2 -g -fno-stack-protector -Wno-error" \\
-    || (cat config.log && exit 1)
-
-# Build glibc
-# Save build status to check later
-RUN make -j$(nproc) -k 2>&1 | tee /build/build.log; \\
-    echo "GLIBC_BUILD_EXIT_CODE=$?" >> /build/build_status
-
-# Install to prefix
-RUN make install -k 2>&1 | tee -a /build/build.log; \\
-    echo "GLIBC_INSTALL_EXIT_CODE=$?" >> /build/build_status
-
-# Verify glibc build produced necessary files
-RUN echo "=== Checking glibc build output ===" && \\
-    ls -la {install_prefix}/lib/ 2>/dev/null || echo "WARNING: {install_prefix}/lib/ not found" && \\
-    ls {install_prefix}/lib/libc.so* 2>/dev/null || echo "WARNING: libc.so not found"
-
-# Create directory for PoC
-RUN mkdir -p /poc
-
-# Copy exploit source
-COPY poc_exploit.c /poc/exploit.c
-
-# Compile the PoC against vulnerable glibc
-# First, find the actual dynamic linker path
-# Use fallback compilation attempts if linking with specific libraries fails
-# Always fall back to system glibc if vulnerable glibc compilation fails
-WORKDIR /poc
-RUN DYNAMIC_LINKER=$(find {install_prefix}/lib -name 'ld-linux*.so*' -o -name 'ld-*.so*' 2>/dev/null | head -1) && \\
-    echo "Found dynamic linker: $DYNAMIC_LINKER" && \\
-    if [ -n "$DYNAMIC_LINKER" ] && [ -f "$DYNAMIC_LINKER" ]; then \\
-        echo "Attempting compilation with vulnerable glibc..."; \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include \\
-            -ldl -lpthread 2>&1 || \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include \\
-            -ldl 2>&1 || \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include \\
-            -lm 2>&1 || \\
-        gcc -o exploit exploit.c \\
-            -Wl,-rpath,{install_prefix}/lib \\
-            -Wl,--dynamic-linker=$DYNAMIC_LINKER \\
-            -L{install_prefix}/lib \\
-            -I{install_prefix}/include 2>&1 || \\
-        echo "Vulnerable glibc compilation failed"; \\
-    fi && \\
-    if [ ! -f /poc/exploit ]; then \\
-        echo "Falling back to system glibc compilation..." && \\
-        (gcc -o exploit exploit.c -ldl -lpthread 2>&1 || \\
-        gcc -o exploit exploit.c -ldl 2>&1 || \\
-        gcc -o exploit exploit.c -lm 2>&1 || \\
-        gcc -o exploit exploit.c 2>&1); \\
-    fi
-
-# Verify exploit binary was created
-RUN if [ ! -f /poc/exploit ]; then \\
-        echo "ERROR: Failed to compile exploit binary!" && \\
-        echo "=== Compilation environment ===" && \\
-        gcc --version && \\
-        echo "=== Source file ===" && \\
-        head -50 /poc/exploit.c && \\
-        echo "=== Attempting verbose compilation ===" && \\
-        gcc -v -o exploit exploit.c 2>&1 || true; \\
-        exit 1; \\
-    else \\
-        echo "SUCCESS: Exploit binary created" && \\
-        ls -la /poc/exploit && \\
-        file /poc/exploit; \\
-    fi
-
-# Set environment for running with vulnerable glibc
-ENV LD_LIBRARY_PATH={install_prefix}/lib
-
-# Default command: run the exploit
-CMD ["/poc/exploit"]
-'''
-
-    def __init__(self, logger: logging.Logger):
-        self.logger = logger
-        self.templates = {
-            "ubuntu:14.04": self.TEMPLATE_14_04,
-            "ubuntu:16.04": self.TEMPLATE_16_04,
-            "ubuntu:18.04": self.TEMPLATE_18_04,
-        }
-    
-    def get_base_image(self, vuln: VulnerabilityInfo) -> str:
-        """Determine appropriate base image based on CVE/commit date"""
-        # Try to get year from CVE hint
-        if vuln.cve in CVE_YEAR_HINTS:
-            year = CVE_YEAR_HINTS[vuln.cve]
-            self.logger.debug(f"Using year hint for {vuln.cve}: {year}")
-            return COMMIT_OS_MAPPING.get(year, COMMIT_OS_MAPPING["default"])
-        
-        # Extract year from CVE name (e.g., CVE-2015-7547 -> 2015)
-        try:
-            parts = vuln.cve.split('-')
-            if len(parts) >= 2:
-                year = parts[1][:4]
-                if year in COMMIT_OS_MAPPING:
-                    return COMMIT_OS_MAPPING[year]
-        except (IndexError, ValueError):
-            pass
-        
-        return COMMIT_OS_MAPPING["default"]
-    
-    def generate(self, vuln: VulnerabilityInfo, output_dir: Path) -> Path:
-        """Generate Dockerfile for a vulnerability"""
-        base_image = self.get_base_image(vuln)
-        self.logger.info(f"Generating Dockerfile for {vuln.cve} using {base_image}")
-        
-        template = self.templates.get(base_image, self.TEMPLATE_16_04)
-        
-        dockerfile_content = template.format(
-            cve=vuln.cve,
-            commit_hash=vuln.commit_hash
-        )
-        
-        # Create output directory for this CVE
-        cve_dir = output_dir / vuln.cve.lower()
-        cve_dir.mkdir(parents=True, exist_ok=True)
-        
-        dockerfile_path = cve_dir / "Dockerfile"
-        with open(dockerfile_path, 'w') as f:
-            f.write(dockerfile_content)
-        
-        self.logger.debug(f"Dockerfile written to: {dockerfile_path}")
-        return dockerfile_path
-
-
-# =============================================================================
-# Docker Build and Execution Manager
-# =============================================================================
 
 class DockerManager:
     """Manages Docker image builds and container execution"""
@@ -3148,7 +2698,16 @@ class ReportGenerator:
     def add_result(self, result: ExecutionResult):
         """Add a result to the report"""
         self.results.append(result)
-    
+
+    def live_counts(self) -> dict:
+        """Live Phase-1 breakdown for the dashboard (mirrors get_progress)."""
+        reproduced = sum(1 for r in self.results if r.vulnerability_reproduced)
+        manual = sum(1 for r in self.results
+                     if (not r.vulnerability_reproduced)
+                     and getattr(r, "needs_manual_revision", False))
+        failed = len(self.results) - reproduced - manual
+        return {"reproduced": reproduced, "manual_revision": manual, "failed": failed}
+
     def generate_report(self, phase_start: datetime = None, phase_end: datetime = None) -> Path:
         """Generate JSON report file with comprehensive timing information"""
         report_path = self.results_dir / "results.json"
@@ -3323,7 +2882,6 @@ class PipelineOrchestrator:
             version_era_map=self._p1["version_era_map"],
         )
 
-        self.dockerfile_gen = DockerfileGenerator(self.logger)
         self.docker_mgr = DockerManager(self.logger, self.build_timeout,
                                         docker_platform=self._p1.get("docker_platform"))
         self.poc_mgr = PoCManager(self.exploits_dir, self.logger)
@@ -3363,7 +2921,11 @@ class PipelineOrchestrator:
             poc_launch_script=self._p1.get("poc_launch_script"),
         )
         self._manifest = ImageManifest(self._p1["image_manifest_path"], self.logger)
-        self.poc_analyzer = PoCAnalyzer(self.logger)
+        self.poc_analyzer = PoCAnalyzer(
+            self.logger,
+            poc_analysis=self._p1.get("poc_analysis"),
+            install_prefix=self._p1.get("install_prefix"),
+        )
         # Manual-revision queue for PoCs the negative filter flags or for which
         # no baseline exit code could be established (methodology v2).
         self._manual_dir = self.base_dir / "manual_supervision"
@@ -3456,6 +3018,10 @@ class PipelineOrchestrator:
         total = len(vulnerabilities)
         processed = 0
 
+        if live_progress and not self.dry_run:
+            live_progress.emit(self.results_dir, 1, total, 0,
+                               self.report_gen.live_counts())
+
         for idx, vuln in enumerate(vulnerabilities, 1):
             ubuntu_version = vuln.ubuntu_version or 'unknown'
 
@@ -3475,6 +3041,9 @@ class PipelineOrchestrator:
                 )
                 self.report_gen.add_result(result)
                 self._manifest.add_cve_image(vuln, vuln.cve_image_tag, "base_image_failed")
+                if live_progress:
+                    live_progress.emit(self.results_dir, 1, total, idx,
+                                       self.report_gen.live_counts())
                 continue
             
             self.logger.info(f"\n{'='*60}")
@@ -3510,7 +3079,15 @@ class PipelineOrchestrator:
             
             self.logger.info(f"Completed {vuln.cve}: {result.status} (duration: {result.execution_time_seconds:.1f}s)")
             processed += 1
-        
+            if live_progress:
+                live_progress.emit(self.results_dir, 1, total, idx,
+                                   self.report_gen.live_counts())
+
+        # Final heartbeat (running=False); results.json then becomes authoritative.
+        if live_progress and not self.dry_run:
+            live_progress.emit(self.results_dir, 1, total, total,
+                               self.report_gen.live_counts(), running=False)
+
         # Save manifest
         if not self.dry_run:
             self._manifest.save()
@@ -3565,6 +3142,29 @@ class PipelineOrchestrator:
             )
         except Exception as e:
             self.logger.error(f"Failed to write manual-revision marker for {vuln.cve}: {e}")
+
+    def _poc_looks_network(self, poc_path: Path) -> bool:
+        """True if the PoC appears to be a network client/server.
+
+        Used to GUARD the hang→DoS-baseline credit: a stable timeout in a network
+        PoC is almost always a peer-wait (no server to connect to in the one-shot
+        container), NOT the vulnerability — so it must not be credited as a DoS
+        reproduction. Project/language-agnostic; best-effort (unreadable → False).
+        """
+        try:
+            txt = Path(poc_path).read_text(errors="ignore")
+        except Exception:
+            return False
+        # Match UNAMBIGUOUS remote-client behaviour only. Deliberately EXCLUDES
+        # bare getaddrinfo/gethostbyname/socket()/AF_INET — those are the
+        # VULNERABLE functions a glibc resolver-CVE PoC calls locally, not
+        # network-client signals; matching them would wrongly veto legitimate
+        # glibc DoS-hang reproductions.
+        return bool(re.search(
+            r'\bconnect\s*\(|\.connect\s*\(|\bRHOST\b|\bRPORT\b|'
+            r'requests\.(get|post)|urllib\.request|http\.client|HTTPConnection|'
+            r'Net::HTTP|socket\.create_connection',
+            txt))
 
     def _try_i386_rebuild(self, vuln: VulnerabilityInfo, poc_path: Path,
                           poc_language: str, poc_metadata: dict) -> Optional[str]:
@@ -4081,8 +3681,9 @@ class PipelineOrchestrator:
                         status_bits.append(f"{key}={build_status[key]}")
                 reason = (
                     "Known-vulnerable image built, but the project did not install "
-                    "a usable shared libc into the image, so the PoC cannot be "
-                    "trusted to exercise the project build"
+                    "a usable build artifact (shared library/binary) into the image "
+                    "(PROJECT_BUILD_INSTALLED=no), so the PoC cannot be trusted to "
+                    "exercise the project build"
                 )
                 if status_bits:
                     reason = f"{reason} ({', '.join(status_bits)})"
@@ -4288,19 +3889,26 @@ class PipelineOrchestrator:
                 )
             elif (not marker_present and poc_exit_code == -1
                     and "TIMEOUT" in run_logs
-                    and poc_metadata.get("poc_category") in ("DOS", "FORMAT_STRING")):
-                # Special case: the PoC caused a container timeout (run_timeout
-                # exhausted, Docker killed the process). For DoS/FORMAT_STRING
-                # categories a hang or infinite loop IS the vulnerability being
-                # triggered (e.g. CVE-2012-3480 strtod infinite-loop). Register
-                # the timeout as the baseline "success code" (-1 = timeout) so
-                # Phase 3 can verify the patch stops the hang.
+                    and poc_metadata.get("poc_category") in ("DOS", "FORMAT_STRING", "OTHER", "INFO_LEAK")
+                    and not self._poc_looks_network(poc_path)):
+                # The PoC caused a STABLE container timeout (_capture_baseline
+                # already required UNANIMOUS timeouts across all runs). A hang /
+                # infinite loop / unbounded expansion IS the vulnerability for
+                # compute-bound DoS shapes — not just C DoS/FORMAT_STRING but also
+                # interpreted ReDoS / XML-billion-laughs / algorithmic-complexity
+                # bugs that land in OTHER/INFO_LEAK (project-agnostic; previously
+                # only DOS/FORMAT_STRING were credited — a C/glibc-shape bias). A
+                # NETWORK client is excluded (a hang there is a peer-wait, not the
+                # bug). Register the timeout as the baseline (-1) so Phase 3 can
+                # verify the patch stops the hang.
                 result.baseline_exit_code = -1  # sentinel: "timed out"
                 result.vulnerability_reproduced = True
                 result.status = ExecutionStatus.SUCCESS.value
                 self.logger.info(
-                    f"  {vuln.cve}: DoS hang reproduced — PoC caused container "
-                    f"timeout (baseline = -1/timeout)"
+                    f"  {vuln.cve}: hang/DoS reproduced — PoC caused a stable "
+                    f"container timeout "
+                    f"(category={poc_metadata.get('poc_category', 'OTHER')}, "
+                    f"baseline = -1/timeout)"
                 )
             elif not marker_present or poc_exit_code is None or poc_exit_code < 0:
                 # The wrapper did NOT run to completion for a non-DoS reason:

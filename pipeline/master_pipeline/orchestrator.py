@@ -1,7 +1,10 @@
 import csv
 import json
 import logging
+import select
 import subprocess
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -70,8 +73,20 @@ class MasterPipeline:
                 ))
                 continue
             
-            # Check phase dependencies
-            if not self._check_phase_dependencies(phase):
+            # Check phase dependencies. Three outcomes: proceed (True), a clean
+            # SKIP ("skip" — nothing to do, e.g. no patches because nothing
+            # reproduced; the run still completes + reports), or a hard FAIL.
+            _dep = self._check_phase_dependencies(phase)
+            if _dep == "skip":
+                logger.info(f"Phase {phase}: nothing to do — skipping cleanly (run continues)")
+                self.results.append(PhaseResult(
+                    phase=phase,
+                    name=self._get_phase_name(phase),
+                    status=PhaseStatus.SKIPPED,
+                    error_message="Nothing to validate (no patches — nothing reproduced)"
+                ))
+                continue
+            if not _dep:
                 logger.error(f"Phase {phase} dependencies not met")
                 self.results.append(PhaseResult(
                     phase=phase,
@@ -115,7 +130,14 @@ class MasterPipeline:
                 # Pass excluded CVEs to the executor for subsequent phases
                 self.executor.skipped_cves = sorted(self.skipped_cves)
                 logger.info(f"Excluded CVEs for Phase 1: {self.executor.skipped_cves}")
-            
+
+            # After Phase 1: optional manual-revision HOLD gate (default OFF — when
+            # off, flagged-unreproducible CVEs are silently dropped from Phase 2, the
+            # historical behavior). When on, hold and poll for dashboard decisions.
+            if phase == 1 and result.status == PhaseStatus.SUCCESS \
+                    and getattr(self.config, "manual_verify_phase1_gate", False):
+                self._wait_for_phase1_manual_revision()
+
             # Run feedback loop after Phase 3 if enabled and Phase 3 completed
             if phase == 3 and self.config.enable_feedback_loop:
                 self._run_feedback_loop()
@@ -190,29 +212,44 @@ class MasterPipeline:
             )
             return
 
-        # Show syntax reports flagged for manual supervision
+        # Make the diagnostic reports available for the reviewer regardless of mode.
         self._generate_missing_reports(csv_path, pending_cves)
+
+        # Non-interactive (dashboard / piped stdin): there is no TTY for the menu —
+        # reading the menu would hit EOF on /dev/null and busy-loop. Instead HOLD
+        # and POLL manual_supervision/ for the dashboard's decisions.
+        if not sys.stdin.isatty():
+            self._poll_manual_gate(csv_path, pending_cves, phase=0)
+            return
+
         self._show_syntax_reports(pending_cves)
 
-        # Interactive loop
+        timeout = self.config.manual_verify_timeout
+        poll = self.config.manual_verify_poll_interval
+        deadline = time.monotonic() + timeout
+
+        # Interactive loop with deadline + polling.
+        # Every `poll` seconds marker files are re-checked even without user input,
+        # so `touch manual_supervision/CVE-XXXX-YYYY.ok` on another terminal unblocks
+        # automatically. After `timeout` seconds (default 1800 = 30 min) the gate
+        # auto-skips all remaining pending CVEs instead of blocking indefinitely.
         while True:
+            remaining_secs = max(0, int(deadline - time.monotonic()))
+            countdown = f"{remaining_secs // 60}m{remaining_secs % 60:02d}s"
+
             print(f"\n{'='*70}")
-            print(f"  MANUAL VERIFICATION REQUIRED")
+            print(f"  MANUAL VERIFICATION REQUIRED  (auto-skips in {countdown})")
             print(f"{'='*70}")
             print(f"\n{len(pending_cves)} CVE(s) require manual verification:\n")
+            supervision_dir = self.config.base_dir / "manual_supervision"
+            exploits_dir = self.config.base_dir / "exploits"
             for i, cve in enumerate(pending_cves, 1):
-                supervision_dir = self.config.base_dir / "manual_supervision"
                 report_path = supervision_dir / f"{cve}_syntax_report.txt"
                 json_reports = list(supervision_dir.glob(f"{cve}_*.validation.json"))
-                
-                # Check if there is an exploit file in exploits/ or manual_supervision/
-                exploits_dir = self.config.base_dir / "exploits"
                 has_exploit = any(
                     f.stem == cve for f in exploits_dir.iterdir() if f.is_file()
                 ) if exploits_dir.exists() else False
-                
                 has_manual_exploit = any(f.suffix != ".json" for f in supervision_dir.glob(f"{cve}_*.*"))
-                
                 status_tags = []
                 if report_path.exists() or json_reports:
                     status_tags.append("report available")
@@ -220,37 +257,76 @@ class MasterPipeline:
                     status_tags.append("no PoC file")
                 tag = f" [{', '.join(status_tags)}]" if status_tags else ""
                 print(f"  {i}. {cve}{tag}")
-            
+
             print(f"\nOptions:")
             print(f"  [A] Approve all and continue")
             print(f"  [E] Exclude CVE(s) from the pipeline run and continue")
             print(f"  [V] View syntax report for a CVE")
             print(f"  [R] Refresh (re-check for .ok marker files)")
             print(f"  [S] Continue (skip all remaining pending CVEs)")
-            
-            try:
-                choice = input("\nSelect option: ").strip().upper()
-            except (EOFError, KeyboardInterrupt):
+
+            # Read input with a deadline on the poll window; also check marker files
+            # during the wait so an .ok drop unblocks without requiring a keypress.
+            prompt = f"\nSelect option (auto-skips in {countdown}): "
+            print(prompt, end="", flush=True)
+            choice = None
+            wait_until = min(time.monotonic() + poll, deadline)
+            while time.monotonic() < wait_until:
+                remaining_wait = wait_until - time.monotonic()
+                try:
+                    ready, _, _ = select.select([sys.stdin], [], [], min(remaining_wait, 5.0))
+                except (ValueError, OSError):
+                    # stdin is not a real TTY (e.g. piped); fall through to deadline logic
+                    ready = []
+                if ready:
+                    try:
+                        choice = sys.stdin.readline().strip().upper()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        logger.warning("User interrupted manual verification")
+                        self.skipped_cves.update(pending_cves)
+                        return
+                    break
+                # No input yet — poll marker files
+                self._check_marker_files(csv_path)
+                pending_cves = self._get_pending_manual_cves(csv_path)
+                if not pending_cves:
+                    print()
+                    logger.info("All CVEs approved via marker files during wait")
+                    return
+
+            # Deadline reached without any input or marker approval
+            if choice is None:
+                if time.monotonic() >= deadline:
+                    print()
+                    logger.warning(
+                        "Manual verification timeout (%ds) reached; "
+                        "auto-skipping %d remaining CVE(s): %s",
+                        timeout, len(pending_cves), ", ".join(sorted(pending_cves))
+                    )
+                    self.skipped_cves.update(pending_cves)
+                    return
+                # poll window elapsed but deadline not yet reached — refresh and redisplay
                 print()
-                logger.warning("User interrupted manual verification")
-                self.skipped_cves = set(pending_cves)
-                return
-            
+                self._check_marker_files(csv_path)
+                pending_cves = self._get_pending_manual_cves(csv_path)
+                if not pending_cves:
+                    logger.info("All CVEs approved via marker files during wait")
+                    return
+                continue
+
             if choice == 'A':
-                # Approve all pending CVEs
                 self._approve_cves(csv_path, pending_cves)
                 logger.info(f"All {len(pending_cves)} CVE(s) approved")
                 return
-            
+
             elif choice == 'E':
-                # Let user pick which CVEs to exclude
                 excluded = self._interactive_exclude(pending_cves)
                 if excluded:
                     self.skipped_cves.update(excluded)
                     remaining = [c for c in pending_cves if c not in excluded]
                     logger.info(f"Excluded {len(excluded)} CVE(s): {', '.join(excluded)}")
                     if remaining:
-                        # Ask again for the remaining ones
                         pending_cves = remaining
                         continue
                     else:
@@ -259,14 +335,12 @@ class MasterPipeline:
                 else:
                     print("No CVEs excluded.")
                     continue
-            
+
             elif choice == 'V':
-                # View a syntax report
                 self._interactive_view_report(pending_cves)
                 continue
-            
+
             elif choice == 'R':
-                # Refresh: re-check marker files and CSV
                 self._check_marker_files(csv_path)
                 pending_cves = self._get_pending_manual_cves(csv_path)
                 if not pending_cves:
@@ -274,12 +348,12 @@ class MasterPipeline:
                     return
                 print(f"Refreshed - {len(pending_cves)} CVE(s) still pending")
                 continue
-            
+
             elif choice == 'S':
                 logger.info("Skipping all remaining pending CVEs and continuing pipeline.")
-                self.skipped_cves = set(pending_cves)
+                self.skipped_cves.update(pending_cves)
                 return
-            
+
             else:
                 print(f"Invalid option '{choice}'. Please try again.")
                 continue
@@ -497,6 +571,7 @@ class MasterPipeline:
         flagged_pending: List[str] = []   # CVEs with >=1 manual-pending PoC (in order)
         has_runnable: set = set()         # CVEs with >=1 runnable PoC
         try:
+            csv.field_size_limit(sys.maxsize)
             with open(csv_path, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
@@ -799,7 +874,159 @@ RECOMMENDED ACTIONS:
                     logger.debug(f"Cleaned up manual_supervision/{stale.name}")
                 except OSError as exc:
                     logger.warning(f"Could not remove {stale.name}: {exc}")
-    
+
+    def _consume_skip_markers(self, phase: int) -> set:
+        """Honor ``<CVE>.skip`` markers the dashboard drops to *exclude* a CVE from
+        the rest of the run. Returns the set of excluded CVE ids and removes that
+        CVE's staged files from manual_supervision/ (the marker included)."""
+        marker_dir = self.config.base_dir / "manual_supervision"
+        excluded: set = set()
+        if not marker_dir.exists():
+            return excluded
+        for marker in marker_dir.glob("*.skip"):
+            cve_id = marker.stem  # CVE-XXXX-YYYY.skip -> CVE-XXXX-YYYY
+            excluded.add(cve_id)
+            logger.info(f"Manual review: '{cve_id}' discarded (skip marker) — excluding.")
+            for stale in marker_dir.glob(f"{cve_id}*"):
+                try:
+                    stale.unlink()
+                except OSError as exc:
+                    logger.warning(f"Could not remove {stale.name}: {exc}")
+        return excluded
+
+    def _poll_manual_gate(self, csv_path: Path, pending_cves: List[str], phase: int = 0):
+        """Non-interactive Phase-0 manual-review HOLD.
+
+        With no TTY (dashboard run) and auto-skip off, hold and poll
+        manual_supervision/ for the dashboard's decisions instead of prompting:
+          * ``<CVE>.ok``        -> approve (PoC copied to exploits/, CSV marked done)
+          * ``<CVE>.skip``      -> exclude that CVE from Phase 1+
+          * ``.phase0_proceed`` -> skip whatever is still pending and continue now
+        On timeout the remaining pending CVEs are auto-skipped (same outcome as the
+        interactive [S] / config auto_skip) so an unattended run never blocks forever.
+        """
+        timeout = max(1, int(self.config.manual_verify_timeout))
+        poll = max(2, int(self.config.manual_verify_poll_interval))
+        deadline = time.monotonic() + timeout
+        proceed = self.config.base_dir / "manual_supervision" / f".phase{phase}_proceed"
+        logger.warning(
+            "MANUAL REVIEW HOLD (phase %d): %d CVE(s) pending — waiting for dashboard "
+            "approve/discard (or 'proceed'); auto-skips remaining in %ds.",
+            phase, len(pending_cves), timeout)
+        while time.monotonic() < deadline:
+            self._check_marker_files(csv_path)                       # .ok approvals
+            self.skipped_cves.update(self._consume_skip_markers(phase))  # .skip exclusions
+            pending_cves = [c for c in self._get_pending_manual_cves(csv_path)
+                            if c not in self.skipped_cves]
+            if not pending_cves:
+                logger.info("Phase %d manual review: all pending items resolved.", phase)
+                return
+            if proceed.exists():
+                logger.info("Phase %d manual review: 'proceed' — skipping %d remaining.",
+                            phase, len(pending_cves))
+                self.skipped_cves.update(pending_cves)
+                try:
+                    proceed.unlink()
+                except OSError:
+                    pass
+                return
+            time.sleep(poll)
+        logger.warning("Phase %d manual review timeout (%ds) — auto-skipping %d remaining: %s",
+                       phase, timeout, len(pending_cves), ", ".join(sorted(pending_cves)))
+        self.skipped_cves.update(pending_cves)
+
+    def _phase1_manifest_path(self) -> Optional[Path]:
+        """Locate the active project's Phase-1 image manifest under base_dir/results.
+        Handles both bare ``image_manifest.json`` and project-prefixed names."""
+        results = self.config.base_dir / "results"
+        if not results.exists():
+            return None
+        exact = results / "image_manifest.json"
+        if exact.exists():
+            return exact
+        cands = sorted(results.glob("*image_manifest*.json"))
+        return cands[0] if cands else None
+
+    def _phase1_flagged_cves(self, manifest_path: Optional[Path]) -> List[str]:
+        """CVEs flagged ``needs_manual_revision`` in the Phase-1 manifest (i.e.
+        un-reproducible, routed to manual revision and excluded from Phase 2)."""
+        if not manifest_path or not manifest_path.exists():
+            return []
+        try:
+            data = json.loads(manifest_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return []
+        flagged = []
+        for entry in (data.get("cve_images") or []):
+            cve = str(entry.get("cve", "")).strip()
+            if cve and entry.get("needs_manual_revision"):
+                if self.config.cves and cve not in self.config.cves:
+                    continue
+                flagged.append(cve)
+        return list(dict.fromkeys(flagged))
+
+    def _wait_for_phase1_manual_revision(self):
+        """Phase-1 manual-revision HOLD gate (only when manual_verify_phase1_gate).
+
+        Phase 1 routes un-reproducible CVEs to ``manual_supervision/<CVE>.phase1-review.txt``
+        and flags them ``needs_manual_revision`` in the image manifest, which makes
+        Phase 2 skip them. With the gate on and no TTY (dashboard run), hold here and
+        poll for the dashboard's decisions:
+          * RETRY  -> the dashboard re-runs Phase 1 for the CVE; if it now reproduces
+                      the manifest flag clears and the item leaves the flagged set.
+          * DISCARD-> ``<CVE>.phase1-skip`` drops the review marker (CVE stays excluded).
+          * PROCEED-> ``.phase1_proceed`` continues now (flagged items stay excluded).
+        Timeout -> continue (flagged items remain excluded = historical behavior).
+        """
+        manifest_path = self._phase1_manifest_path()
+        flagged = self._phase1_flagged_cves(manifest_path)
+        if not flagged:
+            logger.info("Phase 1 manual review: nothing flagged — continuing.")
+            return
+        if sys.stdin.isatty():
+            logger.info("Phase 1: %d CVE(s) flagged for manual revision; interactive "
+                        "review is dashboard-only — continuing (flagged stay excluded).",
+                        len(flagged))
+            return
+        timeout = max(1, int(self.config.manual_verify_timeout))
+        poll = max(2, int(self.config.manual_verify_poll_interval))
+        deadline = time.monotonic() + timeout
+        marker_dir = self.config.base_dir / "manual_supervision"
+        proceed = marker_dir / ".phase1_proceed"
+        logger.warning(
+            "MANUAL REVIEW HOLD (phase 1): %d CVE(s) flagged — review/retry/discard via "
+            "the dashboard or 'proceed'; auto-continues in %ds.", len(flagged), timeout)
+        while time.monotonic() < deadline:
+            # discard markers: drop that CVE's review file; it stays excluded.
+            if marker_dir.exists():
+                for marker in list(marker_dir.glob("*.phase1-skip")):
+                    cve_id = marker.stem
+                    for stale in marker_dir.glob(f"{cve_id}.phase1-review.txt"):
+                        try:
+                            stale.unlink()
+                        except OSError:
+                            pass
+                    try:
+                        marker.unlink()
+                    except OSError:
+                        pass
+                    logger.info(f"Phase 1 manual review: '{cve_id}' discarded.")
+            flagged = self._phase1_flagged_cves(manifest_path)
+            if not flagged:
+                logger.info("Phase 1 manual review: all flagged items resolved.")
+                return
+            if proceed.exists():
+                logger.info("Phase 1 manual review: 'proceed' — continuing with %d still "
+                            "flagged (they stay excluded from Phase 2).", len(flagged))
+                try:
+                    proceed.unlink()
+                except OSError:
+                    pass
+                return
+            time.sleep(poll)
+        logger.warning("Phase 1 manual review timeout (%ds) — continuing; %d CVE(s) remain "
+                       "excluded from Phase 2.", timeout, len(flagged))
+
     def _run_feedback_loop(self):
         """
         Execute the iterative feedback loop for failed validations.
@@ -1424,7 +1651,12 @@ RECOMMENDED ACTIONS:
         # Use the first configured model for the health check probe
         models = llm_cfg.get("models", [])
         test_model = str(models[0]) if models else "qwen2.5-coder:1.5b"
-        
+
+        # Optional HTTP Basic Auth for a proxied Ollama backend (profile-driven).
+        _u = str(llm_cfg.get("ollama_username", "") or "")
+        _p = str(llm_cfg.get("ollama_password", "") or "")
+        ollama_auth = (_u, _p) if (_u and _p) else None
+
         try:
             test_payload = {
                 "model": test_model,
@@ -1432,12 +1664,14 @@ RECOMMENDED ACTIONS:
                 "stream": False,
                 "options": {"num_predict": hc_num_predict}
             }
-            
-            logger.info(f"Testing connection to {api_endpoint}...")
+
+            logger.info(f"Testing connection to {api_endpoint} (model={test_model}, "
+                        f"auth={'basic' if ollama_auth else 'none'})...")
             response = requests.post(
                 api_endpoint,
                 json=test_payload,
-                timeout=hc_timeout
+                timeout=hc_timeout,
+                auth=ollama_auth,
             )
             
             if response.status_code == 200:
@@ -1498,11 +1732,28 @@ RECOMMENDED ACTIONS:
         
         elif phase == 2:
             # Phase 2 needs Phase 1's image manifest (per-CVE baseline exit
-            # codes); without it every CVE is skipped as "no baseline".
-            manifest = self.config.base_dir / "results" / "image_manifest.json"
+            # codes); without it every CVE is skipped as "no baseline". The
+            # manifest filename is PROJECT-SPECIFIC (phase1.image_manifest_path in
+            # the active Phase 0 YAML, e.g. results/libtasn1_image_manifest.json).
+            # Resolve it from there — a hardcoded glibc-default name false-alarms
+            # "Phase 2 will skip all CVEs" for every prefixed-manifest project even
+            # when the manifest exists and Phase 2 reads it fine.
+            from .config import _load_yaml, BASE_DIR
+            cfg_path = Path(self.config.phase0_config)
+            if not cfg_path.is_absolute():
+                cfg_path = BASE_DIR / self.config.phase0_config
+            manifest_rel = "results/image_manifest.json"
+            try:
+                p1 = (_load_yaml(cfg_path) or {}).get("phase1", {}) or {}
+                manifest_rel = p1.get("image_manifest_path", manifest_rel)
+            except Exception:
+                pass
+            manifest = Path(manifest_rel)
+            if not manifest.is_absolute():
+                manifest = self.config.base_dir / manifest
             if not manifest.exists():
                 logger.warning(
-                    "Phase 1 image manifest not found (results/image_manifest.json) "
+                    f"Phase 1 image manifest not found ({manifest_rel}) "
                     "- Phase 2 will skip all CVEs (no baselines)"
                 )
             return True
@@ -1524,10 +1775,30 @@ RECOMMENDED ACTIONS:
                                 and not f.name.endswith("_invalid.c")]
             
             if not valid_patch_files:
+                # Distinguish a LEGITIMATE empty result (Phase 2 had 0 eligible
+                # CVEs — e.g. nothing reproduced — so there is simply nothing to
+                # validate) from a REAL failure (Phase 2 had tasks but every patch
+                # was invalid). The zeroed pipeline_summary.json (total_tasks == 0)
+                # that Phase 2 writes on its clean no-op is the signal. Nothing to
+                # validate ⇒ SKIP cleanly so the run still completes + reports.
+                _total_tasks = None
+                _summary_file = patches_dir / "pipeline_summary.json"
+                if _summary_file.exists():
+                    try:
+                        import json
+                        with open(_summary_file) as _sf:
+                            _total_tasks = json.load(_sf).get("summary", {}).get("total_tasks")
+                    except Exception:
+                        pass
+                if _total_tasks == 0:
+                    logger.info("Phase 3: no patches to validate (Phase 2 had nothing "
+                                "to patch — nothing reproduced) — skipping cleanly")
+                    return "skip"
+
                 logger.error("="*60)
                 logger.error("NO VALID PATCHES FOUND - Phase 3 cannot proceed")
                 logger.error("="*60)
-                
+
                 # Provide detailed diagnostics
                 if invalid_files:
                     logger.error(f"Found {len(invalid_files)} INVALID patch files (API failures):")

@@ -11,11 +11,14 @@ versions – mirroring the approach in ``extract_patches.py``.
 from __future__ import annotations
 
 import logging
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..models import ProjectState
+import base64
+
 from ..utils.git_utils import (
     build_commit_message_index,
     clone_or_update_repo,
@@ -23,6 +26,7 @@ from ..utils.git_utils import (
     get_commit_changed_files,
     get_commit_metadata,
     get_file_content_at_commit,
+    get_file_bytes_at_commit,
     get_parent_commit,
 )
 from ..utils.code_parser import find_changed_units
@@ -31,7 +35,11 @@ from ..utils.file_utils import (
     is_regression_test_path,
     resolve_test_build_subdir,
 )
-from .base import PipelineModule
+try:  # best-effort live-progress heartbeat for the dashboard (never fatal)
+    from ..utils import live_progress
+except Exception:  # pragma: no cover
+    live_progress = None
+from .base import PipelineModule, resolve_input_path
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +64,9 @@ class CommitDiscovery(PipelineModule):
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
         cfg = self.config.get("commit_discovery", {})
         repo_url: str = cfg["repo_url"]
-        repo_path = Path(cfg.get("repo_local_path", "./source_repo"))
+        # Shared INPUT clone: resolve against the pipeline root, not the Phase-0
+        # CWD (the per-project base_dir under projects/<name>).
+        repo_path = resolve_input_path(cfg.get("repo_local_path", "./source_repo"))
         extra_patterns: List[str] = cfg.get("extra_grep_patterns", [])
         clone_timeout: int = cfg.get("clone_timeout", 1800)
 
@@ -129,12 +139,27 @@ class CommitDiscovery(PipelineModule):
             )
             return idx, ps
 
+        total_cves = len(raw_cves)
+        csv_path = self.config.get("output", {}).get(
+            "csv_path", "results/cve_poc_complete.csv")
+        live_dir = Path(csv_path).parent
+        if str(live_dir) in (".", ""):
+            live_dir = Path("results")
+
+        def _emit(done, running=True):
+            if live_progress:
+                live_progress.emit(
+                    live_dir, 0, total_cves, done,
+                    {"stage": "commit discovery", "commits_found": commits_found},
+                    running=running)
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(_process_cve, (i, cve)): i
                 for i, cve in enumerate(raw_cves)
             }
             done_count = 0
+            _emit(0)
             for future in as_completed(futures):
                 result = future.result()
                 if result is None:
@@ -145,9 +170,12 @@ class CommitDiscovery(PipelineModule):
                 if ps.fix_commit_hash:
                     commits_found += 1
                 done_count += 1
+                if done_count % 5 == 0:
+                    _emit(done_count)
                 if done_count % 25 == 0:
                     self.logger.info("  Commit discovery: %d / %d …", done_count, len(raw_cves))
 
+        _emit(total_cves, running=False)
         self.logger.info("Commit Discovery: found commits for %d / %d CVEs", commits_found, len(raw_cves))
         context["raw_cves"] = raw_cves
         return context
@@ -279,11 +307,20 @@ class CommitDiscovery(PipelineModule):
         # build subdir (the dir whose Makefile registers the test) — not always
         # the test source's first path component (e.g. a sysdeps/ test gets
         # registered in math/Makefile). Read once at the fix commit.
-        # Config gate (default ON): when commit_discovery.harvest_regression_tests
-        # is false, Option A is disabled and Phase 1 falls back to PoC-only
-        # reproducers (e.g. ExploitDB). Reversible — flip the flag to re-enable.
-        harvest_regression_tests = self.config.get("commit_discovery", {}).get(
-            "harvest_regression_tests", True)
+        # Harvest the fix-commit's regression test (Option A) only when the
+        # active reproduction_strategy includes "intree". One knob drives both
+        # Phase 0 (what to harvest/emit) and the per-CVE priority; the legacy
+        # commit_discovery.harvest_regression_tests flag still works as a bridge.
+        from .base import parse_reproduction_strategy
+        harvest_regression_tests = "intree" in parse_reproduction_strategy(self.config)
+
+        # Projects whose reproducer is a DATA file (e.g. tcpdump's crafted
+        # tests/*.pcap) rather than a compilable C test opt in here. Empty for
+        # source-test projects (glibc/openssl) ⇒ no behaviour change.
+        data_test_exts = list(
+            self.config.get("commit_discovery", {}).get("regression_test_data_extensions", [])
+            or []
+        )
 
         regression_tests: List[Dict[str, str]] = []
         if harvest_regression_tests:
@@ -299,19 +336,33 @@ class CommitDiscovery(PipelineModule):
             ]
             for finfo in (ps.changed_files or []):
                 tpath = finfo["file_path"]
-                if not is_regression_test_path(tpath):
+                if not is_regression_test_path(tpath, data_test_exts):
                     continue
-                content = get_file_content_at_commit(repo_path, tpath, fix)
-                if not content:
+                entry = self._harvest_test_entry(
+                    repo_path, tpath, fix, data_test_exts, makefile_contents)
+                if entry:
+                    regression_tests.append(entry)
+
+            # Supplement: in-tree tests that reference THIS CVE by filename or
+            # content but were committed SEPARATELY from the fix (so the
+            # fix-commit scan above can't see them). Common: libtasn1 ships
+            # tests/CVE-XXXX.c, oss-fuzz projects add CVE/issue-tagged regression
+            # inputs. Project-agnostic — matched on the CVE id, read from the
+            # checked-out tree (HEAD). De-duped against the fix-commit harvest.
+            seen_paths = {t["repo_path"] for t in regression_tests}
+            for tpath in self._find_cve_tagged_tests(repo_path, cve_id, data_test_exts):
+                if tpath in seen_paths:
                     continue
-                parts = tpath.split("/")
-                name = parts[-1].rsplit(".", 1)[0]
-                default_subdir = parts[0] if len(parts) > 1 else ""
-                subdir = resolve_test_build_subdir(name, makefile_contents, default_subdir)
-                regression_tests.append({
-                    "repo_path": tpath, "subdir": subdir, "name": name,
-                    "content": content,
-                })
+                entry = self._harvest_test_entry(
+                    repo_path, tpath, "HEAD", data_test_exts, makefile_contents)
+                if not entry:
+                    continue
+                regression_tests.append(entry)
+                seen_paths.add(tpath)
+                self.logger.info(
+                    "  %s: found CVE-tagged in-tree test (outside fix commit): %s",
+                    cve_id, tpath,
+                )
         if regression_tests:
             ps.regression_tests = regression_tests
             self.logger.info(
@@ -321,4 +372,77 @@ class CommitDiscovery(PipelineModule):
             )
 
         return ps
+
+    def _harvest_test_entry(self, repo_path, tpath, ref, data_test_exts, makefile_contents):
+        """Build one ``regression_tests[]`` entry for a harvested test at *ref*.
+
+        Handles both compilable SOURCE tests (UTF-8 text content) and DATA
+        reproducers (a crafted input file such as a ``.pcap``). Data files are
+        read binary-safe and carried as base64 (``content_b64`` + ``is_data``)
+        so the global JSON map / CSV survive a non-UTF-8 file; the authoritative
+        copy is still re-checked-out by Phase 1 via TEST_PATH at the fix commit.
+        Returns ``None`` when the file can't be read at *ref*.
+        """
+        p = tpath.lower()
+        exts = {e.lower() if e.startswith(".") else "." + e.lower() for e in (data_test_exts or [])}
+        is_data = bool(exts) and any(p.endswith(e) for e in exts)
+        parts = tpath.split("/")
+        name = parts[-1].rsplit(".", 1)[0]
+        default_subdir = parts[0] if len(parts) > 1 else ""
+        subdir = resolve_test_build_subdir(name, makefile_contents, default_subdir)
+        entry: Dict[str, Any] = {"repo_path": tpath, "subdir": subdir, "name": name}
+        if is_data:
+            raw = get_file_bytes_at_commit(repo_path, tpath, ref)
+            if not raw:
+                return None
+            entry["content"] = ""
+            entry["content_b64"] = base64.b64encode(raw).decode("ascii")
+            entry["is_data"] = True
+        else:
+            content = get_file_content_at_commit(repo_path, tpath, ref)
+            if not content:
+                return None
+            entry["content"] = content
+        return entry
+
+    def _find_cve_tagged_tests(self, repo_path: Path, cve_id: str,
+                               extra_test_exts=None) -> List[str]:
+        """Return repo-relative paths of in-tree TEST sources that reference
+        *cve_id* by filename or content, searched in the checked-out tree (HEAD).
+
+        Option-A supplement for tests committed SEPARATELY from the fix commit
+        (which the fix-commit scan in :meth:`_discover` cannot see). Fully
+        project-agnostic: it matches only on the CVE id, then keeps just the
+        results that :func:`is_regression_test_path` accepts as compilable test
+        sources under a test directory — so the vulnerable lib source is excluded
+        even when it mentions the CVE in a comment. Best-effort: any git failure
+        yields an empty list (the fix-commit harvest still applies).
+        """
+        cve = (cve_id or "").strip()
+        if not cve:
+            return []
+        cands: set[str] = set()
+        try:
+            # Filename match: tracked files whose path contains the CVE id.
+            r = subprocess.run(
+                ["git", "-C", str(repo_path), "ls-files", f"*{cve}*"],
+                capture_output=True, text=True, timeout=30,
+            )
+            cands.update(l.strip() for l in r.stdout.splitlines() if l.strip())
+            # Content match: tracked files mentioning the CVE id (case-insensitive,
+            # both dashed and undashed forms). `git grep <ref>` prints "HEAD:path".
+            r = subprocess.run(
+                ["git", "-C", str(repo_path), "grep", "-l", "-i",
+                 "-e", cve, "-e", cve.replace("-", ""), "HEAD"],
+                capture_output=True, text=True, timeout=60,
+            )
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("HEAD:"):
+                    line = line[len("HEAD:"):]
+                if line:
+                    cands.add(line)
+        except Exception as exc:  # noqa: BLE001 — best-effort; never fail discovery
+            self.logger.debug("CVE-tagged test search failed for %s: %s", cve, exc)
+        return sorted(p for p in cands if is_regression_test_path(p, extra_test_exts))
 

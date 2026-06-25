@@ -7,7 +7,7 @@ The **CVE Aggregator** is the foundational "Phase 0" module of the AI-SSD Patch 
 To train or validate AI models for automated vulnerability repair, you need three critical pieces of data for every vulnerability:
 1. **Metadata:** What is the vulnerability? (CVE ID, CVSS, CWE, Description)
 2. **Context:** What code was changed to fix it? (The vulnerable function and the patched function from the project's source code history)
-3. **Validation:** How do we prove it exists? (A functional PoC script that triggers the vulnerability)
+3. **Validation:** How do we prove it exists? (A functional PoC script that triggers the vulnerability — or, when no public PoC exists, the regression test the fixing commit itself introduces)
 
 The CVE Aggregator automates the collection, validation, and structuring of this triad.
 
@@ -19,7 +19,7 @@ The aggregator operates as a sequence of discrete, decoupled modules. They commu
 2. **`CommitDiscovery`**: Clones the target project's Git repository and searches the commit history to find the exact commit that fixed the CVE. It then extracts the parent (vulnerable) commit and the specific C/C++/Java/C# functions that were modified.
 3. **`PoCMapper`**: Clones the [Exploit Database](https://github.com/offensive-security/exploitdb) and maps CVEs to available PoC scripts. It extracts the full source code of the exploit.
 4. **`DataAggregator`**: Merges all fetched metadata, git state, and PoC data into a unified, version-controlled JSON structure (`Dataset`).
-5. **`SyntaxValidator`**: Analyzes the extracted PoC scripts using language-specific tools (e.g., `gcc -fsyntax-only`, `py_compile`, `bash -n`). Invalid scripts are automatically flagged for manual review.
+5. **`SyntaxValidator`**: Analyzes the extracted PoC scripts using language-native tools (`gcc`/`g++ -fsyntax-only`, `javac`, Mono `mcs`, `py_compile`, `bash -n`, `ruby -c`, `perl -c`, `php -l`). Invalid scripts are automatically flagged for manual review.
 6. **`PoCRepairLLM`**: Uses an LLM (Ollama or OpenAI) to automatically repair syntax errors and scraping artifacts in invalid PoC scripts.
 7. **`OutputGenerator`**: Exports the final, clean data into a global JSON file, a filtered JSON file, a structured CSV (`cve_poc_complete.csv`), and standalone exploit files (`exploits/`).
 
@@ -27,10 +27,11 @@ The aggregator operates as a sequence of discrete, decoupled modules. They commu
 
 The aggregator is entirely driven by YAML configuration files. This allows you to point the pipeline at any open-source project without changing Python code.
 
-Configurations are stored in `pipeline/cve_aggregator/`. Two examples are provided:
+Configurations are stored in `pipeline/cve_aggregator/`. Thirteen project configs ship today (12 C/C++ projects plus Apache Tomcat for Java), alongside a generic `aggregator_config.yaml` template; for example:
 - `glibc_config.yaml` (GNU C Library)
-- `tomcat_config.yaml` (Apache Tomcat)
 - `kernel_config.yaml` (Linux Kernel)
+- `openssl_config.yaml`, `ffmpeg_config.yaml`, `libxml2_config.yaml`, … (further C/C++ projects)
+- `tomcat_config.yaml` (Apache Tomcat — Java)
 
 ### Creating a Custom Configuration
 To adapt the aggregator to a new project, duplicate `aggregator_config.yaml` and update the relevant sections:
@@ -80,6 +81,6 @@ All outputs are generated in the `pipeline/results/` directory (or wherever conf
 Because ExploitDB PoCs are often scraped from PDFs or websites, they frequently contain prose, missing preprocessor directives, or formatting errors. 
 
 1. If a PoC fails automated validation (Module 5) and LLM repair (Module 6), it is placed in `pipeline/manual_supervision/`.
-2. The pipeline will pause (if orchestrated via `pipeline.py`) or you can manually inspect the files.
+2. By default the master pipeline auto-excludes these pending CVEs (re-runnable later); set `manual_verification.auto_skip: false` in `config.yaml` for an interactive review menu, or simply inspect the files yourself.
 3. Fix the syntax errors in the script.
 4. From the main pipeline interactive menu, you can approve the CVE, which moves the fixed PoC to `pipeline/exploits/` and updates the CSV. Alternatively, you can drop an empty `.ok` file next to it (e.g., `CVE-2015-7547.ok`) and the pipeline will automatically process it on the next run.

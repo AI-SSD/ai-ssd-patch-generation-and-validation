@@ -1,0 +1,416 @@
+# =============================================================================
+# CVE Aggregator Pipeline – LibTIFF Configuration  (LARGE C, CLI/PARSER SHAPE)
+# =============================================================================
+# Well-known C image library with a HUGE bank of memory-safety CVEs (CWE-787/125),
+# reproduced IN-CONTAINER — unlike openssl/ffmpeg, no server/VM/sample-suite needed:
+# a crafted TIFF fed to a built CLI tool (tiffinfo/tiff2rgba) crashes the vulnerable
+# build. Chosen for (a) sheer reproducible-CVE volume and (b) exercising the CLI
+# shape end-to-end.
+#
+# HONEST SCOPE: LibTIFF is the CLI/parser shape, only PARTIALLY supported today
+# (docs/CPP_VERSATILITY_ANALYSIS.md §3):
+#  * C PoCs that LINK libtiff reproduce like glibc/libxml2 (poc_prepare links -ltiff).
+#  * PoCs that are a crafted INPUT FILE driving a tool (tiffinfo bad.tiff) need the
+#    CLI honesty pattern (§3.3) + de-glibc'd analyzer prompts (§3.1) before they
+#    record a baseline — until then they route to MANUAL (not a config error).
+#  * Option A: LibTIFF ships test/*.c (harvestable); many need test/images/*.tiff
+#    fixtures, so intree yield is partial.
+# Build hooks are UNTESTED STARTING POINTS — expect first-run VM iteration.
+# Run: python3 pipeline.py --project libtiff --phases 0 1
+# =============================================================================
+
+project:
+  name: "libtiff"
+  display_name: "LibTIFF"
+  description: "CVE and PoC dataset for LibTIFF"
+
+pipeline:
+  abort_on_error: false
+  skip_modules: []
+
+# ExploitDB preferred (LibTIFF has some public PoCs); fix-commit test as fallback.
+reproduction_strategy:
+  - exploitdb
+  - intree
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  file: "logs/libtiff_cve_aggregator.log"
+
+# ---------------------------------------------------------------------------
+# Module 1: CVE Fetching
+# ---------------------------------------------------------------------------
+cve_fetcher:
+  nvd_api_key: "043bad81-616b-445a-8e79-96e87cc96c66"
+  keywords:
+    - "libtiff"
+    - "LibTIFF"
+  cpe_match:
+    - "cpe:2.3:a:libtiff:libtiff"
+  strong_keywords:
+    - "libtiff"
+    - "LibTIFF"
+    - "tiff"
+  # Exclude downstream consumers/look-alikes that co-mention TIFF.
+  non_target_indicators:
+    - "GDAL"
+    - "ImageMagick"
+    - "GraphicsMagick"
+    - "LibreOffice"
+    - "Adobe"
+  strict_target_matching: true
+  require_project_cpe_match: false
+  project_cpe_aliases:
+    - "libtiff"
+    - "libtiff:libtiff"
+  enrich_with_cve_org: false
+  cve_org_delay: 1.0
+  min_published_year: 2004
+
+# ---------------------------------------------------------------------------
+# Module 2: Commit Discovery
+# ---------------------------------------------------------------------------
+commit_discovery:
+  repo_url: "https://gitlab.com/libtiff/libtiff.git"
+  repo_local_path: "../libtiff"
+  clone_timeout: 600
+  harvest_regression_tests: true        # superseded by reproduction_strategy; kept for clarity
+  auto_update: true
+  extra_grep_patterns: []
+  # LibTIFF tracked on its GitLab; older bugs on bugzilla.maptools.org.
+  enable_bz_fallback: true
+  allow_unscoped_extra_patterns: false
+  bugzilla_hosts:
+    - "bugzilla.maptools.org"
+    - "gitlab.com"
+  enable_online_bug_resolution: false
+  source_extensions:
+    - ".c"
+    - ".h"
+
+# ---------------------------------------------------------------------------
+# Module 3: PoC Mapping (ExploitDB)
+# ---------------------------------------------------------------------------
+poc_mapper:
+  exploitdb_path: "../exploit-database"
+  exploitdb_remote_url: "https://gitlab.com/exploit-database/exploitdb.git"
+  auto_update: true
+  deep_search: true
+  extract_content: true
+  reverse_search: true
+  enable_reverse_content_grep: true
+  require_verified: false
+  prefer_platforms:
+    - "linux"
+  non_target_indicators:
+    - "ImageMagick"
+    - "Windows"
+
+# ---------------------------------------------------------------------------
+# Module 4–7: Aggregator / Validation / Repair / Output
+# ---------------------------------------------------------------------------
+data_aggregator:
+  global_json_path: "results/libtiff_cve_poc_map.json"
+  prune_missing_cves: true
+
+syntax_validator:
+  manual_supervision_dir: "manual_supervision"
+  report_path: "results/libtiff_syntax_validation_report.json"
+  allow_manual_without_commit: false
+
+poc_repair:
+  provider: "openai"
+  openai_model: "gpt-4.1-mini"
+  openai_api_key: ""
+  api_endpoint: "http://10.3.2.171:80/api/chat"
+  model: "devstral:32k"
+  max_repair_attempts: 3
+  models_by_attempt:
+    1: "gpt-4.1-mini"
+    2: "gpt-5-mini"
+    3: "gpt-4.1"
+  api_timeout: 600
+  model_load_timeout: 300
+  num_ctx: 32768
+  max_poc_chars: 0
+  temperature: 0.4
+  report_path: "results/libtiff_poc_repair_report.json"
+  manual_review_queue_path: "results/libtiff_manual_review_queue.json"
+  gpu_wait_timeout: 120
+
+output:
+  global_json_path: "results/libtiff_cve_poc_map.json"
+  filtered_json_path: "results/libtiff_cve_poc_map_filtered.json"
+  csv_path: "results/libtiff_cve_poc_complete.csv"
+  poc_dir: "exploits"
+  filtered_require_commit: false
+  filtered_require_poc: true
+  filtered_require_verified_poc: false
+  flag_unvalidated_edb_for_manual_review: true
+  manual_supervision_dir: "manual_supervision"
+  allow_poc_without_commit: false
+  csv_fields:
+    - "CVE"
+    - "V_COMMIT"
+    - "FilePath"
+    - "F_NAME"
+    - "UNIT_TYPE"
+    - "V_FILE"
+    - "V_FUNCTION"
+    - "CVE_Description"
+    - "CWE"
+    - "CWE_Description"
+    - "project_version"
+    - "project_version_normalized"
+    - "ubuntu_version"
+    - "poc_index"
+    - "poc_path"
+    - "poc_language"
+    - "FIX_COMMIT"
+    - "TEST_PATH"
+    - "TEST_SUBDIR"
+    - "manual_review_required"
+    - "manual_verified"
+
+# ---------------------------------------------------------------------------
+# Phase 2: LLM patch generation (C)
+# ---------------------------------------------------------------------------
+phase2:
+  language: "c"
+  system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for LibTIFF (the TIFF image library and its command-line tools). Your task is
+    to fix a security vulnerability by making the SMALLEST POSSIBLE EDIT to the
+    vulnerable function — never by rewriting it.
+  feedback_system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for LibTIFF. Your previous patch attempt FAILED validation. Analyze the
+    failure and produce an improved fix as MINIMAL edits — never rewrite the whole
+    function.
+  internal_headers: []
+
+# ---------------------------------------------------------------------------
+# Phase 3: SAST (C stack — same as glibc/libxml2)
+# ---------------------------------------------------------------------------
+sast:
+  enabled: true
+  fail_on: [critical, high]
+  tool_timeout: 180
+  tools:
+    - name: cppcheck
+      detect: cppcheck
+      cmd: ["cppcheck", "--enable=all", "--xml", "--xml-version=2", "{file}"]
+      parser: cppcheck-xml
+      install: { apt: cppcheck }
+    - name: clang-tidy
+      detect: clang-tidy
+      cmd: ["clang-tidy", "--quiet", "--checks=clang-analyzer-*,bugprone-*,cert-*", "{file}", "--"]
+      parser: regex
+      regex: '^(.+?):(\d+):(\d+):\s+(warning|error):\s+(.+?)\s+\[([^\]]+)\]$'
+      groups: { file: 1, line: 2, column: 3, severity: 4, message: 5, rule: 6 }
+      severity_map: { warning: medium, error: high }
+      install: { apt: clang-tidy }
+    - name: semgrep
+      detect: semgrep
+      cmd: ["semgrep", "scan", "--sarif", "--quiet", "--metrics=off", "--config=p/c", "{file}"]
+      parser: sarif
+      install: { pip: semgrep }
+    - name: flawfinder
+      detect: flawfinder
+      cmd: ["flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      fallback_cmd: ["{python}", "-m", "flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      parser: flawfinder
+      install: { pip: flawfinder }
+
+# ---------------------------------------------------------------------------
+# Phase 1: reproduction (shared with Phase 3)
+# ---------------------------------------------------------------------------
+phase1:
+  project_repo_local_path: "../libtiff"
+  project_repo_remote_url: "https://gitlab.com/libtiff/libtiff.git"
+  docker_base_image_prefix: "ai-ssd/libtiff-base"
+  docker_cve_image_prefix: "ai-ssd/libtiff-cve"
+  image_manifest_path: "results/libtiff_image_manifest.json"
+  source_dir_name: "project-src"
+  build_dir_name: "project-build"
+  install_prefix: "/opt/project-build"
+
+  # LibTIFF autotools build deps. Codec libs are optional (configure disables the
+  # codecs it can't find; the core parser CVEs don't need them).
+  base_packages:
+    - build-essential
+    - autoconf
+    - automake
+    - libtool
+    - pkg-config
+  base_packages_optional:
+    - zlib1g-dev
+    - libjpeg-dev
+    - liblzma-dev
+    - libzstd-dev
+    - libwebp-dev
+    - wget
+    - gcc-multilib
+    - g++-multilib
+  base_setup: |
+    dpkg --add-architecture i386 && apt-get update && apt-get install -y libc6-dev-i386 || true
+
+  # LibTIFF builds cleanly across eras; map by commit date.
+  commit_era_map:
+    2004: "14.04"
+    2006: "14.04"
+    2008: "14.04"
+    2010: "14.04"
+    2012: "14.04"
+    2014: "16.04"
+    2016: "16.04"
+    2017: "18.04"
+    2018: "18.04"
+    2019: "20.04"
+    2020: "20.04"
+    2021: "22.04"
+    2022: "22.04"
+    2023: "24.04"
+    2024: "24.04"
+    2025: "24.04"
+    2026: "24.04"
+
+  version_file: ""
+  version_regex: ''
+  version_era_map: {}
+  enable_arch_fallback: true
+
+  # libtiff uses the glibc allocator — surface silent heap corruption.
+  poc_run_env:
+    MALLOC_CHECK_: "3"
+    MALLOC_PERTURB_: "42"
+
+  # ---- build_script — STARTING POINT, UNTESTED ----
+  # git checkout has no ./configure: autogen.sh/autoreconf then out-of-tree
+  # configure + make + install. The build also produces the CLI tools (tools/).
+  build_script: |
+    #!/bin/bash
+    SRC="$SOURCE_DIR"; BD="$BUILD_DIR"; PFX="$INSTALL_PREFIX"
+    ARCHFLAGS=""; HOST=""
+    if [ "$BUILD_ARCH" = "i386" ]; then ARCHFLAGS="-m32"; HOST="--host=i686-linux-gnu --build=i686-linux-gnu"; fi
+    cd "$SRC" || exit 1
+    if [ ! -x "$SRC/configure" ]; then
+      ( ./autogen.sh > /build/autogen.log 2>&1 || autoreconf -fi > /build/autogen.log 2>&1 ) || true
+    fi
+    cd "$BD" || exit 1; rm -rf ./*
+    ( "$SRC"/configure --prefix="$PFX" $HOST CFLAGS="$ARCHFLAGS -O2 -g -w -U_FORTIFY_SOURCE" 2>&1 && echo CONFIGURE_OK ) \
+      > /build/cfg.log 2>&1 || { echo "CONFIGURE_FAIL"; tail -25 /build/cfg.log; }
+    make -j"$(nproc)" -k > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
+    make install -k > /build/make_install.log 2>&1; echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status
+    if ls "$PFX"/lib/libtiff.so* 2>/dev/null | grep -q .; then echo "PROJECT_BUILD_INSTALLED=yes" >> /build/build_status; else echo "PROJECT_BUILD_INSTALLED=no" >> /build/build_status; fi
+    echo "build complete"
+
+  # ---- poc_prepare_script — compile the C PoC against the project libtiff ----
+  # Covers C PoCs that link libtiff. NOTE: crafted-FILE PoCs that drive tiffinfo
+  # bad.tiff are the CLI shape — the tools are at $INSTALL_PREFIX/bin but the CLI
+  # honesty marker (§3.3) isn't implemented yet, so those route to manual.
+  poc_prepare_script: |
+    #!/bin/bash
+    PFX="$INSTALL_PREFIX"
+    M32=""; [ "$BUILD_ARCH" = "i386" ] && M32="-m32"
+    cd /poc
+    if grep -qE '^[[:space:]]*(int|void)?[[:space:]]*main[[:space:]]*\(' /poc/exploit_raw.c; then
+      cp /poc/exploit_raw.c /poc/exploit.c
+    else
+      echo '#include <stdio.h>' > /poc/exploit.c
+      echo '#include <stdlib.h>' >> /poc/exploit.c
+      echo '#include <string.h>' >> /poc/exploit.c
+      cat /poc/exploit_raw.c >> /poc/exploit.c
+      echo '' >> /poc/exploit.c
+      echo 'int main(int argc, char *argv[]) { puts("fragment loaded"); return 0; }' >> /poc/exploit.c
+    fi
+    INC="-I$PFX/include"
+    rm -f /poc/exploit
+    gcc $M32 -O0 -g -w -D_GNU_SOURCE -o exploit exploit.c $INC -L"$PFX/lib" -Wl,-rpath,"$PFX/lib" -ltiff -ljpeg -lz -llzma -lm 2>&1 || \
+    gcc $M32 -O0 -g -w -D_GNU_SOURCE -o exploit exploit.c $INC -L"$PFX/lib" -Wl,-rpath,"$PFX/lib" -ltiff -lm 2>&1 || \
+    gcc $M32 -O0 -g -w -D_GNU_SOURCE -o exploit exploit.c -ltiff 2>&1 || \
+    gcc $M32 -O0 -g -w -o exploit exploit.c 2>&1 || \
+    echo "compile failed"
+    if [ -f /poc/exploit ]; then echo "SUCCESS"; file /poc/exploit; else echo "ERROR: failed to compile"; head -30 /poc/exploit.c; exit 1; fi
+    for c in $POC_COMPANIONS; do
+      stem="${c%.*}"
+      case "$c" in
+        *.c) ( gcc -O0 -g -w -o "/poc/$stem" "/poc/$c" -I"$PFX/include" -L"$PFX/lib" -Wl,-rpath,"$PFX/lib" -ltiff 2>&1 || gcc -O0 -g -w -o "/poc/$stem" "/poc/$c" 2>&1 || echo "WARN: companion $c" ) ;;
+        *.sh|*.py|*.pl|*.rb) chmod +x "/poc/$c" 2>/dev/null || true ;;
+      esac
+    done
+    USES=no
+    if LD_LIBRARY_PATH="$PFX/lib" ldd /poc/exploit 2>/dev/null | grep -q "$PFX"; then USES=yes; fi
+    echo "$USES" > /poc/.ssd_poc_uses_build; echo "poc_uses_project_build: $USES"
+
+  # No project loader needed — default launch (direct run, LD_LIBRARY_PATH=$RUN_LIB).
+  poc_launch_script: ""
+
+  # ---- patch_rebuild_script — incremental make + markers ----
+  patch_rebuild_script: |
+    #!/bin/bash
+    cd "$BUILD_DIR" || { echo "no build dir" > /tmp/ssd_rebuild.log; }
+    make -j"$(nproc)" -k > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
+    make install -k > /tmp/ssd_install.log 2>&1; echo "install exit: $?"
+    grep -B2 -A8 "error:" /tmp/ssd_rebuild.log 2>/dev/null | head -100 > /tmp/ssd_build_errors; true
+    case "$VULN_FILE" in
+      *.c) OBJ="$(basename "$VULN_FILE" .c).o"; find "$BUILD_DIR" -name "$OBJ" -newer "$SOURCE_DIR/$VULN_FILE" -print -quit > /tmp/ssd_obj_rebuilt; echo "obj_rebuilt: $(cat /tmp/ssd_obj_rebuilt)" ;;
+      *) echo skip > /tmp/ssd_obj_rebuilt ;;
+    esac
+    USES=no
+    if LD_LIBRARY_PATH="$INSTALL_PREFIX/lib" ldd /poc/exploit 2>/dev/null | grep -q "$INSTALL_PREFIX"; then USES=yes; fi
+    echo "$USES" > /tmp/ssd_poc_uses_build; echo "poc_uses_build: $USES"
+
+  # ---- Option A: in-tree regression test (poc_language: intree-test) ----
+  # STARTING POINT, UNTESTED. LibTIFF ships test/*.c the fix commits extend
+  # (harvested by is_regression_test_path). Many tests read a fixture from
+  # test/images/, so standalone runs may need that data present — partial yield.
+  # The pipeline overlays the test the fix ADDED on the VULNERABLE checkout;
+  # verdict: test FAILS on the vulnerable build = reproduced. Env: SOURCE_DIR,
+  # BUILD_DIR, INSTALL_PREFIX, TEST_SUBDIR, TEST_NAME, TEST_PATH, FIX_COMMIT.
+  intree_test:
+    build_script: |
+      #!/bin/bash
+      SRC="$SOURCE_DIR"; BD="$BUILD_DIR"; PFX="$INSTALL_PREFIX"
+      cd "$SRC" || exit 1
+      if [ ! -x "$SRC/configure" ]; then
+        ( ./autogen.sh > /build/autogen.log 2>&1 || autoreconf -fi > /build/autogen.log 2>&1 ) || true
+      fi
+      cd "$BD" || exit 1; rm -rf ./*
+      "$SRC"/configure --prefix="$PFX" CFLAGS="-O2 -g -w" > /build/cfg.log 2>&1 && echo CONFIG_OK || { echo CONFIG_FAIL; tail -25 /build/cfg.log; }
+      make -j"$(nproc)" -k > /build/make.log 2>&1; echo "BUILD_RC=$?" >> /build/build_status
+      make install -k >> /build/make.log 2>&1 || true
+      tail -15 /build/make.log; echo "build complete"
+    run_script: |
+      #!/bin/bash
+      PFX="$INSTALL_PREFIX"
+      cd "$BUILD_DIR" || { echo "SSD_TEST_RESULT=NORESULT (no build dir)"; exit 2; }
+      if ! ls "$PFX"/lib/libtiff.so* 2>/dev/null | grep -q .; then
+        echo "SSD_TEST_RESULT=NORESULT (no built libtiff to test against)"; exit 2
+      fi
+      export LD_LIBRARY_PATH="$PFX/lib"
+      # libtiff tests often need their image fixtures + to run from the test dir.
+      RUNDIR="$BUILD_DIR/$TEST_SUBDIR"; [ -d "$RUNDIR" ] || RUNDIR="$SOURCE_DIR/$TEST_SUBDIR"
+      # Strategy 1: the built test binary.
+      TBIN="$BUILD_DIR/$TEST_SUBDIR/$TEST_NAME"; [ -x "$TBIN" ] || TBIN="$BUILD_DIR/test/$TEST_NAME"
+      if [ -x "$TBIN" ]; then
+        echo "--- running built test: $TBIN ---"
+        ( cd "$RUNDIR" 2>/dev/null; timeout "${INTREE_TEST_TIMEOUT:-300}" "$TBIN" ) > /tmp/it.log 2>&1; rc=$?
+        tail -25 /tmp/it.log
+        if [ "$rc" -eq 0 ]; then echo "SSD_TEST_RESULT=PASS"; exit 0; else echo "SSD_TEST_RESULT=FAIL"; exit 1; fi
+      fi
+      # Strategy 2: standalone compile against the build lib (run from test dir so
+      # relative image fixtures resolve).
+      echo "--- built test not found; standalone compile of $TEST_PATH ---"
+      if gcc -O2 -g -w -D_GNU_SOURCE "$SOURCE_DIR/$TEST_PATH" -I"$PFX/include" -I"$SOURCE_DIR/libtiff" \
+            -L"$PFX/lib" -Wl,-rpath,"$PFX/lib" -ltiff -ljpeg -lz -llzma -lm -o /tmp/itest 2>/tmp/cc.log; then
+        ( cd "$RUNDIR" 2>/dev/null; timeout "${INTREE_TEST_TIMEOUT:-300}" /tmp/itest ) > /tmp/it.log 2>&1; rc=$?
+        tail -25 /tmp/it.log
+        if [ "$rc" -eq 0 ]; then echo "SSD_TEST_RESULT=PASS"; exit 0; else echo "SSD_TEST_RESULT=FAIL"; exit 1; fi
+      fi
+      echo "standalone compile failed:"; tail -10 /tmp/cc.log 2>/dev/null
+      echo "SSD_TEST_RESULT=NORESULT"; exit 2
+
+  build_system: "autotools"
+  extra_configure_flags: []

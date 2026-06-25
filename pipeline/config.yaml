@@ -10,6 +10,28 @@
 # Global Settings
 # =============================================================================
 
+# Push notifications (ntfy). Read by BOTH layers from this one block:
+#   - run_all.sh             : run / stage / project / cell (AI) transitions
+#   - master_pipeline.notify : per-phase start / done / failure inside each cell
+# run_all.sh uses it when NTFY_TOPIC is unset in the env (env still wins).
+notifications:
+  ntfy_url: "https://ntfy.sh/ai-ssd-tiago-7f3a"   # full topic URL (or self-hosted)
+  ntfy_token: ""                                   # optional Bearer token
+  enabled: true
+
+  # --- Granularity: which run state changes to push (true = "complete"). ------
+  # ISSUES (any failure / timeout / abort) are ALWAYS sent regardless of these,
+  # as long as `enabled` is true. Flip a toggle to false to mute that class.
+  notify_run: true        # benchmark start / finish                 (run_all.sh)
+  notify_stage: true      # Stage 1/2/3 start + done                 (run_all.sh)
+  notify_project: true    # each project's baseline starting         (run_all.sh)
+  notify_cell: true       # each project×profile (AI) cell start/done(run_all.sh)
+  notify_phase: true      # each phase start/done inside a cell      (master_pipeline)
+
+  # Priority of routine (non-issue) pushes: low | default | high | max.
+  # `low` delivers silently (no buzz); issues always escalate to `high`.
+  default_priority: "default"
+
 # Phase 0 configuration file (relative to base directory)
 phase0_config: "cve_aggregator/glibc_config.yaml"
 
@@ -232,6 +254,13 @@ feedback_loop:
 manual_verification:
   timeout: 1800               # Wait for manual review (seconds)
   poll_interval: 30           # Poll frequency (seconds)
-  auto_skip: true             # true = never prompt; auto-exclude every CVE still
-                              #        pending manual review (unattended runs).
-                              #        Override per-run with --auto-skip-manual.
+  auto_skip: true             # Phase 0: true = never hold, auto-exclude every CVE
+                              #   still pending review. false + a non-interactive
+                              #   (dashboard) run = HOLD and poll manual_supervision/
+                              #   for dashboard approve/retry/discard/proceed.
+                              #   Per-run override: --auto-skip-manual / env
+                              #   MANUAL_VERIFY_AUTO_SKIP (dashboard Start form).
+  phase1_gate: false          # Phase 1: false = historical (flagged items dropped
+                              #   from Phase 2). true = after Phase 1, HOLD and poll
+                              #   for dashboard retry/discard/proceed. Per-run
+                              #   override: env PHASE1_MANUAL_GATE.

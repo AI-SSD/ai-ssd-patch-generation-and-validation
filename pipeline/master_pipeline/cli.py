@@ -79,10 +79,19 @@ Examples:
     
     _cfg = get_config()
     parser.add_argument(
+        '--project',
+        type=str,
+        metavar='NAME',
+        help='Project shorthand: resolves to cve_aggregator/<NAME>_config.yaml '
+             '(e.g. --project openssl). Overrides --phase0-config. "kernel" and '
+             '"linux-kernel" both map to kernel_config.yaml.'
+    )
+    parser.add_argument(
         '--phase0-config',
         type=str,
         default=str(_cfg.get('phase0_config', 'cve_aggregator/glibc_config.yaml')),
-        help='Path to Phase 0 config file (relative to base-dir or absolute)'
+        help='Path to Phase 0 config file (relative to base-dir or absolute). '
+             'Ignored when --project is given.'
     )
     
     parser.add_argument(
@@ -169,7 +178,32 @@ Examples:
              f'(default: {MANUAL_VERIFY_AUTO_SKIP}, set via manual_verification.auto_skip)'
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # --project is a convention-based shorthand for --phase0-config: it resolves
+    # NAME -> cve_aggregator/NAME_config.yaml so a new project needs no code edit
+    # (just drop in its YAML). Resolved relative to the config dir next to the
+    # cve_aggregator package; falls back to a base-dir-relative path.
+    if args.project:
+        name = args.project.strip()
+        # The one filename that doesn't match its run_project.sh name.
+        alias = {'linux-kernel': 'kernel'}
+        # aggregator_config.yaml holds shared defaults, not a project.
+        not_projects = {'aggregator'}
+        stem = alias.get(name, name)
+        config_dir = Path(__file__).resolve().parent.parent / 'cve_aggregator'
+        candidate = config_dir / f'{stem}_config.yaml'
+        if stem in not_projects or not candidate.is_file():
+            available = sorted(p.name[:-len('_config.yaml')]
+                               for p in config_dir.glob('*_config.yaml')
+                               if p.name[:-len('_config.yaml')] not in not_projects)
+            parser.error(
+                f"unknown --project '{name}': no {stem}_config.yaml in "
+                f"{config_dir}. Available: {', '.join(available)}"
+            )
+        args.phase0_config = str(candidate)
+
+    return args
 
 
 def main():

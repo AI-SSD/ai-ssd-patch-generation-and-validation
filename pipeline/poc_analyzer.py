@@ -31,10 +31,17 @@ import re
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+import requests
+
 try:
     from openai import OpenAI
 except ImportError:
     OpenAI = None
+
+from cve_aggregator.utils.llm_compat import (
+    is_unsupported_temperature_error,
+    openai_temperature_kwargs,
+)
 
 # ---------------------------------------------------------------------------
 # Negative-signal patterns — the deterministic fallback for the negative filter.
@@ -136,6 +143,15 @@ _EXPLOIT_INTENT_PATTERNS = [
     re.compile(r'madvise\s*\(.*MADV_DONTNEED|MAP_PRIVATE.*PROT_WRITE', re.IGNORECASE),
     re.compile(r'unshare\s*\(|CLONE_NEWUSER|setns\s*\(', re.IGNORECASE),
     re.compile(r'symlink\s*\(|readlink\s*\(.*race|TOCTOU', re.IGNORECASE),
+    # --- generic / interpreted / parser / network signals (project-agnostic) ---
+    # Added so has_exploit_intent is a FAIR confidence flag for non-C PoCs too
+    # (it is no longer a hard gate). These catch crafted-input parser PoCs and
+    # network clients that the C/LPE roster above misses.
+    re.compile(r'\b(payload|exploit|proof[\s_-]?of[\s_-]?concept|poc|vulnerab|crafted|malicious|trigger)\b', re.IGNORECASE),
+    re.compile(r'socket\s*\(|connect\s*\(|AF_INET|gethostbyname|getaddrinfo\s*\(', re.IGNORECASE),
+    re.compile(r'requests\.(get|post)|urllib|http\.client|Net::HTTP|HttpURLConnection', re.IGNORECASE),
+    re.compile(r'struct\.pack|base64\.(b64)?decode'),
+    re.compile(r'(parse|load|read)\w*\s*\([^)]*(file|buf|data|input|payload|doc|xml|json|cert|der|asn1)', re.IGNORECASE),
 ]
 
 
@@ -225,18 +241,132 @@ class PoCAnalyzer:
     only (a) decides the execution strategy and (b) flags explicit failures.
     """
 
-    def __init__(self, logger: logging.Logger, model: str = "gpt-4.1-mini"):
+    def __init__(self, logger: logging.Logger, model: str = "gpt-4.1-mini",
+                 poc_analysis: Optional[Dict[str, Any]] = None,
+                 install_prefix: str = "/opt/project-build"):
         self.logger = logger
         self.api_key = self._get_openai_key()
-        self.model = model
+        # Provider/model are profile-driven (env), so Phase 1's negative filter
+        # and driver synthesis run on the SAME AI family as Phase 2 — keeping a
+        # whole run on one backend. No LLM_* env ⇒ legacy OpenAI default.
+        self._resolve_llm_backend(model)
+        # Project framing for the LLM PoC-analysis prompts (driver synthesis +
+        # execution strategy). GENERIC defaults keep the pipeline project-agnostic;
+        # a project may sharpen them via phase1.poc_analysis in its YAML (e.g. glibc
+        # supplies tzset/setlocale reach hints). No project name is hardcoded here.
+        pa = poc_analysis or {}
+        self.install_prefix = install_prefix or "/opt/project-build"
+        self.project_name = pa.get("project_name") or "the target C/C++ project"
+        self.reach_hint = pa.get("reach_hint") or (
+            "identify the project's public entry point/API that reaches the "
+            "vulnerable function and invoke it with the generated payload — e.g. "
+            "write the payload to a file and have the project parse it, or call the "
+            "relevant library function with it"
+        )
+
+    def _resolve_llm_backend(self, default_model: str) -> None:
+        """Resolve the LLM backend from the active profile (env vars).
+
+        Mirrors the env contract used by Phase 2 / the config loader so the whole
+        run stays on one AI family. When ``LLM_PROVIDER`` is unset the legacy
+        OpenAI default (``default_model``) is used.
+        """
+        def _env(name: str) -> str:
+            v = os.environ.get(name)
+            return v if v not in (None, "") else ""
+
+        def _attempt1(raw: str) -> str:
+            return raw.split(",")[0].strip() if raw else ""
+
+        provider = _env("LLM_PROVIDER").lower()
+        ramp1 = _attempt1(_env("LLM_MODELS_BY_ATTEMPT"))
+        self.client = None
+        self.ollama_auth = None
+        self.openai_base_url = _env("LLM_OPENAI_BASE_URL")
+        self.num_ctx = int(_env("LLM_NUM_CTX") or 32768)
+        self.timeout = int(_env("LLM_TIMEOUT") or 600)
+
+        if provider == "ollama":
+            self.provider = "ollama"
+            self.model = _env("LLM_MODEL") or ramp1 or "qwen2.5-coder:7b"
+            self.api_endpoint = _env("LLM_ENDPOINT") or "http://10.3.2.171:80/api/chat"
+            user, password = _env("OLLAMA_USERNAME"), _env("OLLAMA_PASSWORD")
+            self.ollama_auth = (user, password) if (user and password) else None
+            self.logger.info(
+                "Phase 1 LLM backend → ollama | model=%s | endpoint=%s | auth=%s",
+                self.model, self.api_endpoint, "basic" if self.ollama_auth else "none",
+            )
+            return
+
+        # OpenAI (default / explicit). Honors a custom base_url when set.
+        self.provider = "openai"
+        self.model = _env("LLM_OPENAI_MODEL") or ramp1 or default_model
+        self.api_endpoint = ""
         if OpenAI and self.api_key:
-            self.client = OpenAI(api_key=self.api_key)
+            kwargs: Dict[str, Any] = {"api_key": self.api_key}
+            if self.openai_base_url:
+                kwargs["base_url"] = self.openai_base_url
+            self.client = OpenAI(**kwargs)
+            self.logger.info(
+                "Phase 1 LLM backend → openai | model=%s | endpoint=%s",
+                self.model, self.openai_base_url or "<OpenAI default>",
+            )
         else:
-            self.client = None
             self.logger.warning(
                 "OpenAI client not available — negative filter will use the "
                 "deterministic regex fallback."
             )
+
+    def _llm_ready(self) -> bool:
+        """True when an LLM can be called: an OpenAI client, or the Ollama path."""
+        return self.provider == "ollama" or self.client is not None
+
+    def _chat_json(self, system_prompt: str, user_prompt: str,
+                   temperature: float = 0.0) -> Optional[Dict[str, Any]]:
+        """Provider-agnostic JSON chat. Returns a parsed dict, or None on failure.
+
+        OpenAI uses ``response_format=json_object``; Ollama uses ``format="json"``
+        with HTTP Basic Auth when the profile supplies credentials.
+        """
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if self.provider == "ollama":
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "stream": False,
+                "format": "json",
+                "options": {"temperature": temperature, "num_ctx": self.num_ctx},
+            }
+            resp = requests.post(self.api_endpoint, json=payload,
+                                 timeout=self.timeout, auth=self.ollama_auth)
+            resp.raise_for_status()
+            content = resp.json().get("message", {}).get("content", "")
+            return json.loads(content)
+
+        if not self.client:
+            return None
+        # gpt-5 / o-series reasoning models reject any non-default temperature;
+        # omit it for them (e.g. the openai-high profile puts gpt-5 at attempt 1,
+        # which is the model Phase 1 uses).
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+            **openai_temperature_kwargs(self.model, temperature),
+        }
+        try:
+            completion = self.client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            # Runtime fallback for a reasoning model the name heuristic missed.
+            if "temperature" in kwargs and is_unsupported_temperature_error(exc):
+                kwargs.pop("temperature", None)
+                completion = self.client.chat.completions.create(**kwargs)
+            else:
+                raise
+        return json.loads(completion.choices[0].message.content)
 
     def _get_openai_key(self) -> str:
         api_key = os.environ.get("OPENAI_API_KEY")
@@ -333,23 +463,33 @@ class PoCAnalyzer:
             or re.search(r"CVE-\d{4}-\d+", content, re.IGNORECASE)
         )
 
-        # ---- exploit intent -------------------------------------------------
+        # ---- exploit intent (CONFIDENCE signal, NOT a hard gate) ------------
+        # Whether the PoC contains a recognisable exploitation primitive. This is
+        # advisory ONLY and must NOT reject a PoC: the patterns are
+        # C/memory-corruption/LPE-flavoured, so a perfectly valid interpreted or
+        # parser PoC (e.g. a script that feeds a crafted document/request to the
+        # target) legitimately contains none of them. The structural gates above
+        # (size + entry point) already exclude prose advisories; exploit-intent
+        # only annotates confidence/priority. (Previously a missing token was a
+        # HARD reject — a glibc/C-crash bias that wrongly routed valid interpreted
+        # reproductions to manual.)
         result["has_exploit_intent"] = any(
             pat.search(content) for pat in _EXPLOIT_INTENT_PATTERNS
         )
 
-        # ---- final verdict --------------------------------------------------
+        # ---- final verdict (project/language-agnostic) ----------------------
         if not result["min_size_ok"]:
             result["reason"] = (
                 f"File too small ({len(non_empty_lines)} non-empty lines, need ≥15)"
             )
         elif not result["has_entrypoint"]:
             result["reason"] = "No recognisable entry point (main / def exploit / shebang)"
-        elif not result["has_exploit_intent"]:
-            result["reason"] = "No exploit-intent signals detected"
         else:
             result["is_valid"] = True
-            result["reason"] = f"Valid {result['file_type']} PoC"
+            _conf = ("exploit-intent present" if result["has_exploit_intent"]
+                     else "no exploit-intent token — low confidence "
+                          "(normal for interpreted/parser PoCs)")
+            result["reason"] = f"Valid {result['file_type']} PoC [{_conf}]"
             if not result["cve_match"] and cve:
                 result["reason"] += f" (warning: '{cve}' not found in body)"
 
@@ -411,7 +551,7 @@ class PoCAnalyzer:
         # PoCs: the driver is compiled to /poc/exploit and run through the
         # project loader, which is the C-PoC execution path.
         _is_c = poc_path.suffix.lower() in (".c", ".cpp", ".cc", ".cxx", ".c++")
-        if self.client and _is_c and looks_like_payload_generator(content):
+        if self._llm_ready() and _is_c and looks_like_payload_generator(content):
             gen = self._llm_generator_strategy(
                 content, poc_path.name, cve, vuln_function, vuln_file
             )
@@ -429,7 +569,7 @@ class PoCAnalyzer:
 
         # Stage 3: when the heuristic couldn't classify the PoC beyond "OTHER",
         # ask the LLM to derive the correct execution strategy from the source.
-        if meta["poc_category"] == "OTHER" and self.client:
+        if meta["poc_category"] == "OTHER" and self._llm_ready():
             meta = self._llm_execution_strategy(content, poc_path.name) or meta
 
         return meta
@@ -451,20 +591,20 @@ class PoCAnalyzer:
         snippet = content[:12000]
         vf = vuln_function or "the vulnerable library function"
         vfile = f" (defined in {vuln_file})" if vuln_file else ""
-        prompt = f"""You are automating vulnerability reproduction for {cve or 'a CVE'} in the
-GNU C Library (glibc). The proof-of-concept below is a PAYLOAD GENERATOR: when
+        prompt = f"""You are automating vulnerability reproduction for {cve or 'a CVE'} in
+{self.project_name}. The proof-of-concept below is a PAYLOAD GENERATOR: when
 run it only PRINTS a crafted payload to stdout and never feeds that payload into
 the vulnerable code path, so on its own it exercises nothing.
 
 The vulnerable function is `{vf}`{vfile}. Your job is to produce a small C
 DRIVER that actually triggers the bug, by feeding the generator's payload into
-the glibc entry point that reaches `{vf}`.
+the project entry point that reaches `{vf}`.
 
 Runtime contract (read carefully):
 - The compiled generator is at /poc/exploit and writes its payload to stdout.
-- The glibc under test is installed at /opt/project-build and the driver will be
-  run THROUGH that build's dynamic loader, so it WILL use the build's glibc — do
-  NOT add special link flags or rpath; compile normally.
+- The project under test is installed at {self.install_prefix} and the driver will
+  be run THROUGH that build's dynamic loader, so it WILL use the build's libraries
+  — do NOT add special link flags or rpath; compile normally.
 - Whatever ends up at /poc/exploit is what gets tested, so your driver must be
   compiled to /poc/exploit (overwriting the generator).
 - The driver must just trigger the code path and return 0 on normal completion.
@@ -485,10 +625,8 @@ setup_command MUST (robust, use '|| true' where sensible, no 'set -e'):
   2. Write the driver C source to /poc/driver.c using a QUOTED heredoc
      delimiter (e.g. cat > /poc/driver.c <<'DRIVER_EOF' ... DRIVER_EOF) so the C
      is written verbatim without shell expansion. The driver reads
-     /poc/payload.bin and feeds it into the glibc entry point reaching `{vf}`
-     (e.g. for a tzfile payload: write it to a file, point TZ at that file with
-     a leading ':' or install it under a TZ name, then call tzset()/localtime();
-     for a locale payload: install it and call setlocale()/newlocale(); etc.).
+     /poc/payload.bin and feeds it into the project entry point reaching `{vf}`
+     ({self.reach_hint}).
   3. Compile it OVERWRITING the generator:
        gcc -O0 -g -w -o /poc/exploit /poc/driver.c 2>/poc/driver_build.log || \\
        gcc -O0 -g -w -std=gnu99 -o /poc/exploit /poc/driver.c 2>>/poc/driver_build.log || true
@@ -503,16 +641,10 @@ Generator source ({filename}):
 ```"""
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are a security automation expert. Output strictly JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.0,
-                response_format={"type": "json_object"},
+            result = self._chat_json(
+                "You are a security automation expert. Output strictly JSON.",
+                prompt,
             )
-            result = json.loads(response.choices[0].message.content)
             if not isinstance(result, dict) or not result.get("execution_wrapper"):
                 self.logger.error(f"Driver synthesis for {filename} returned no execution_wrapper")
                 return None
@@ -539,7 +671,7 @@ it inside a Docker container to trigger the vulnerability.
 
 The exploit binary (or script) will already be compiled/copied to /poc/ and
 named 'exploit' (with the appropriate extension). The vulnerable library is
-installed at /opt/project-build/lib.
+installed at {self.install_prefix}/lib.
 
 Return ONLY a valid JSON object with these fields:
 {{
@@ -564,16 +696,10 @@ Source:
 ```"""
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are a security automation expert. Output strictly JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.0,
-                response_format={"type": "json_object"},
+            result = self._chat_json(
+                "You are a security automation expert. Output strictly JSON.",
+                prompt,
             )
-            result = json.loads(response.choices[0].message.content)
             self.logger.info(f"LLM execution strategy for {filename}: {result}")
             return result
         except Exception as e:
@@ -606,9 +732,15 @@ Source:
     def _strategy_from_content(self, content: str) -> Dict[str, Any]:
         """Heuristically determine category + setup + execution wrapper.
 
-        Categories are advisory metadata only (no behavioural gating). The
-        execution strategy still matters: some PoCs need arguments or stdin to
-        exercise the vulnerable code path at all.
+        PROJECT-AGNOSTIC by design: this classifies by GENERIC exploit SHAPE only
+        (format-string, linker-LPE, SUID-dropper, info-leak, generic DoS/crash). It
+        contains NO per-CVE and NO project-specific (glibc) signatures — those were
+        removed to honour the "no per-CVE configuration anywhere" rule. A PoC that
+        needs arguments to reach the bug is handled GENERICALLY: first from the
+        PoC's own usage banner (_extract_usage_example), and when the shape is
+        unrecognised (category OTHER) the orchestrator falls back to the LLM
+        execution-strategy. Categories are coarse/advisory; the execution wrapper is
+        what actually matters for running the PoC.
         """
         meta: Dict[str, Any] = {
             "poc_category": "OTHER",
@@ -629,53 +761,18 @@ Source:
             meta["execution_wrapper"] = "./exploit > /tmp/out 2>&1"
             return meta
 
-        # FORMAT_STRING — glibc locale / message-catalogue exploitation
-        _fs_locale_calls = bool(
-            re.search(r'\b(gettext|catopen|dcgettext|dgettext|catgets)\s*\(', content)
-            or re.search(r'locale subsystem|format string bug', content_lower)
-            or re.search(r'lc_messages.*\bexploit\b', content_lower)
-            or "dopercentn" in content_lower
-            or "nsfocus" in content_lower
-        )
-        _format_string_primitives = [
-            re.search(r'%\d+\$n', content) is not None,
-            re.search(r'printf.*%n', content, re.IGNORECASE) is not None,
-            re.search(r'\\x[0-9a-fA-F]{2}.*\\x[0-9a-fA-F]{2}.*\\x[0-9a-fA-F]{2}', content) is not None,
-            "shellcode" in content_lower,
-            "%08x" in content,
-        ]
-        if _fs_locale_calls and any(_format_string_primitives):
+        # FORMAT_STRING — generic format-string primitives (%N$n / printf %n / %08x).
+        if (re.search(r'%\d+\$n', content)
+                or re.search(r'printf.*%n', content, re.IGNORECASE)
+                or "%08x" in content):
             meta["poc_category"] = "FORMAT_STRING"
-            meta["setup_command"] = "mkdir -p /tmp/LC_MESSAGES 2>/dev/null; chmod 777 /tmp 2>/dev/null; true"
             meta["execution_wrapper"] = "./exploit > /tmp/out 2>&1"
             return meta
 
-        # ld.so hwcap diagnostic PoC — MUST come before generic LD_PRELOAD / LPE
-        # checks because CVE-2017-1000366 contains LD_PRELOAD/LD_LIBRARY_PATH
-        # references that would otherwise trigger the linker-LPE branch first,
-        # running the PoC bare with no arguments and printing a usage banner.
-        if (
-            "target binary" in content_lower
-            and "num_important_hwcaps" in content_lower
-            and ("ld_hwcap_mask" in content_lower or "LD_HWCAP_MASK" in content)
-        ):
-            meta["poc_category"] = "RCE"
-            meta["execution_wrapper"] = "./exploit 0 /bin/ls > /tmp/out 2>&1"
-            return meta
-
-        # LD_AUDIT / LD_PRELOAD linker-based LPE / SUID dropper
-        _linker_signals = [
-            "ld_audit", "ld_preload", "libpcprofile", "pcprofile_output",
-            "ldaudit", "ldpreload",
-        ]
+        # LD_AUDIT / LD_PRELOAD linker-based LPE / SUID dropper (generic linker shape).
+        _linker_signals = ["ld_audit", "ld_preload", "ldaudit", "ldpreload"]
         if any(sig in content_lower for sig in _linker_signals):
-            _linker_suid_signals = [
-                bool(re.search(r'chmod\s+[46]7[0-7][0-7]', content, re.IGNORECASE)),
-                bool(re.search(r'/var/tmp/\.nothing|/tmp/xp\b|/tmp/kidd0|/tmp/r00t', content)),
-                "segfault_output_name" in content_lower,
-                "libsegfault" in content_lower,
-            ]
-            if any(_linker_suid_signals):
+            if re.search(r'chmod\s+[46]7[0-7][0-7]', content, re.IGNORECASE):
                 meta["poc_category"] = "SUID_DROPPER"
                 meta["setup_command"] = "chmod 777 /tmp /var/tmp 2>/dev/null; true"
                 meta["execution_wrapper"] = "./exploit > /tmp/out 2>&1 || true"
@@ -685,7 +782,7 @@ Source:
             meta["execution_wrapper"] = "./exploit > /tmp/out 2>&1 || true"
             return meta
 
-        # SUID_DROPPER — creates a setuid-root binary as proof
+        # SUID_DROPPER — creates a setuid-root binary as proof (generic).
         _suid_dropper_signals = [
             re.search(r'chmod\s+[46]7[0-7][0-7]\s+/tmp/', content, re.IGNORECASE),
             re.search(r'chmod\s+[46]7[0-7][0-7]\s+/var/tmp/', content, re.IGNORECASE),
@@ -698,42 +795,25 @@ Source:
             meta["execution_wrapper"] = "./exploit > /tmp/out 2>&1"
             return meta
 
-        # INFO_LEAK via privileged environment variables
+        # INFO_LEAK — reads a privileged secret file (generic).
         _non_comment_lines = [
             l for l in content.splitlines()
             if not re.match(r'\s*(/\*|//|#|\*)', l)
         ]
         _content_nocomment = "\n".join(_non_comment_lines).lower()
-        _info_leak_env_signals = ["resolv_host_conf", "/etc/shadow"]
-        _info_leak_shadow_match = (
-            re.search(r'\bshadow\b', _content_nocomment) is not None
-            and ("/etc/" in _content_nocomment or "getenv" in _content_nocomment
-                 or "resolv" in _content_nocomment)
-        )
-        if any(sig in _content_nocomment for sig in _info_leak_env_signals) or _info_leak_shadow_match:
+        if (re.search(r'\bshadow\b', _content_nocomment) is not None
+                and ("/etc/" in _content_nocomment or "getenv" in _content_nocomment)):
             meta["poc_category"] = "INFO_LEAK"
             meta["execution_wrapper"] = "./exploit > /tmp/out 2>&1"
             return meta
 
-        # DoS with explicit argv (e.g. CVE-2011-2702 memcpy pattern)
-        if "memcpy(buf, argv[1], atoi(argv[2]))" in content_lower:
-            meta["poc_category"] = "DOS"
-            meta["execution_wrapper"] = (
-                f"{usage_command} > /tmp/out 2>&1" if usage_command
-                else "./exploit A 3492348247 > /tmp/out 2>&1"
-            )
-            return meta
-
-        # Terminal injection (TIOCSTI)
+        # Terminal injection (TIOCSTI) — generic.
         if re.search(r'ioctl\s*\(.*(?:TIOCSTI|0x5412)', content, re.IGNORECASE):
             meta["poc_category"] = "LPE"
             meta["execution_wrapper"] = "./exploit /dev/tty > /tmp/out 2>&1 || ./exploit > /tmp/out 2>&1"
             return meta
 
-        # LPE — generic shell spawn (setuid + execve/system + /bin/sh)
-        # NOTE: must come AFTER the hwcap check above — the CVE-2017-1000366 PoC
-        # contains /bin/sh, system, and setuid but is an ld.so hwcap exploit that
-        # requires positional arguments; matching LPE here would run it bare.
+        # LPE — generic shell spawn (setuid + execve/system + /bin/sh).
         if "/bin/sh" in content and any(
             x in content for x in ["system", "execve", "setuid", "pty"]
         ):
@@ -742,7 +822,7 @@ Source:
             meta["execution_wrapper"] = "cat /tmp/cmds.txt | ./exploit > /tmp/out 2>&1"
             return meta
 
-        # DOS — memory corruption / crash signals
+        # DOS — generic memory-corruption / crash signals.
         _dos_signals = [
             "overflow", "crash", "segfault", "memory exhaust",
             "sigsegv", "sigabrt", "corruption",
@@ -752,7 +832,7 @@ Source:
             meta["execution_wrapper"] = "./exploit > /tmp/out 2>&1"
             return meta
 
-        # INFO_LEAK — generic (address leak)
+        # INFO_LEAK — generic (address leak).
         if "leak" in content_lower and "address" in content_lower:
             meta["poc_category"] = "INFO_LEAK"
             meta["execution_wrapper"] = "./exploit > /tmp/out 2>&1"
@@ -797,7 +877,7 @@ Source:
                 "source": "binary-abstain",
             }
 
-        if not self.client:
+        if not self._llm_ready():
             if regex_hit:
                 return {
                     "failed": True,
@@ -840,22 +920,11 @@ Output:
 Respond with a strict JSON object: {{"failed": true|false, "reason": "<short>"}}"""
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a precise security analyst. You only detect "
-                            "explicit exploitation FAILURE. Output strictly JSON."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.0,
-                response_format={"type": "json_object"},
-            )
-            data = json.loads(response.choices[0].message.content)
+            data = self._chat_json(
+                "You are a precise security analyst. You only detect "
+                "explicit exploitation FAILURE. Output strictly JSON.",
+                prompt,
+            ) or {}
             failed = bool(data.get("failed", False))
             reason = str(data.get("reason", "")).strip() or "(no reason given)"
             # The deterministic signal is authoritative: if regex saw an explicit

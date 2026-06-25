@@ -1,0 +1,30 @@
+[Unit]
+Description=AI-SSD Pipeline Dashboard
+After=network.target nginx.service
+Wants=nginx.service
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/pipeline
+ExecStart=/home/admin/pipeline/serve_dashboard.sh
+Restart=always
+RestartSec=5
+# CRITICAL: the dashboard is a CONTROL PLANE. The benchmark runs it launches
+# (run_all.sh via Popen + start_new_session=True in dashboard_control.start_run)
+# are detached into their own session, but they STILL live inside this service's
+# systemd cgroup. With the systemd default KillMode=control-group, every
+# `systemctl restart`/`stop` of the dashboard SIGTERMs the entire cgroup and
+# kills the active benchmark run mid-phase (observed: a 23:24:39 dashboard
+# restart killed a glibc Phase-0 run started at 23:22:45, leaving a phantom
+# RUNNING cell). KillMode=process makes systemd signal ONLY the dashboard
+# process on stop/restart, so detached runs survive a dashboard redeploy.
+# Stop a run explicitly via the dashboard's Stop button (killpg on its pgid).
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+# Allow the virtualenv python to be found
+Environment=PATH=/home/admin/pipeline/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target

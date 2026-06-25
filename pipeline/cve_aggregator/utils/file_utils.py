@@ -174,23 +174,43 @@ def is_text_file(file_path: Path, text_extensions: Optional[Set[str]] = None) ->
         return False
 
 
-def is_regression_test_path(file_path: str) -> bool:
-    """True when *file_path* looks like a project regression test (C source).
+_TEST_DIRS = ("test", "tests", "testsuite", "regress", "regression")
+
+
+def is_regression_test_path(file_path: str, extra_test_exts=None) -> bool:
+    """True when *file_path* looks like a project regression test.
 
     Project-agnostic but tuned to common conventions: a C source whose basename
     starts with ``tst-``/``test-``/``test_``/``bug-`` (glibc, many GNU projects),
     OR that lives under a ``test``/``tests``/``testsuite`` directory. Used by
     Option A to harvest the reproducer a fixing commit ships. Excludes shell/
     Makefile/headers — only compilable test programs.
+
+    ``extra_test_exts`` (optional, e.g. ``{".pcap", ".pcapng"}``) lets a project
+    opt IN to DATA reproducers — a crafted input file fed to the project's CLI
+    rather than a compilable test (tcpdump's ``tests/<name>.pcap``). Such a file
+    qualifies ONLY when it also lives under a test directory, so library data
+    files are never misclassified. Default ``None`` ⇒ behaviour is identical to
+    the C-source-only rule (no change for glibc/openssl/etc.).
     """
     p = file_path.replace("\\", "/").lower()
-    if not p.endswith((".c", ".cc", ".cpp", ".cxx")):
+    dirs = p.split("/")[:-1]
+    under_test_dir = any(d in _TEST_DIRS for d in dirs)
+    if p.endswith((".c", ".cc", ".cpp", ".cxx")):
+        base = p.rsplit("/", 1)[-1]
+        if base.startswith(("tst-", "test-", "test_", "bug-")) or base == "test.c":
+            return True
+        # Any path COMPONENT that is a test directory. The old "/test/" substring
+        # check required a leading slash, so it MISSED top-level "test/foo.c" /
+        # "tests/foo.c" — exactly where libtasn1/openssl/libtiff keep their tests.
+        if under_test_dir:
+            return True
         return False
-    base = p.rsplit("/", 1)[-1]
-    if base.startswith(("tst-", "test-", "test_", "bug-")) or base == "test.c":
-        return True
-    if "/test/" in p or "/tests/" in p or "/testsuite/" in p:
-        return True
+    # Config-driven DATA reproducers (e.g. crafted .pcap), test-dir scoped only.
+    if extra_test_exts and under_test_dir:
+        exts = {e.lower() if e.startswith(".") else "." + e.lower() for e in extra_test_exts}
+        if any(p.endswith(e) for e in exts):
+            return True
     return False
 
 

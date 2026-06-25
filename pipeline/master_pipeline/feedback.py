@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List
-from .config import PipelineConfig, cfg_section
+from .config import PipelineConfig, cfg_section, BASE_DIR
 from .models import FeedbackLoopResult, PatchStatus
 
 class IterativeFeedbackLoop:
@@ -40,6 +40,35 @@ class IterativeFeedbackLoop:
 
         # Initialize logger
         self.logger = logging.getLogger('pipeline.feedback_loop')
+
+        # Dedicated feedback-loop log file (under the project logs dir). The
+        # feedback loop previously had NO file of its own, and its many per-retry
+        # re-validations each spawned a separate validator_<ts>.log (the Phase-3
+        # formfactor). Consolidate everything the loop does — orchestration
+        # messages, retry patch GENERATION (patch_generator logger), and retry
+        # VALIDATION (routed via ValidatorArgs.log_file) — into ONE
+        # feedback_loop_<ts>.log. Propagation stays on, so progress still shows in
+        # the main run log too.
+        self.feedback_log_file = None
+        try:
+            logs_dir = Path(self.config.base_dir) / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.feedback_log_file = logs_dir / f"feedback_loop_{ts}.log"
+            fh = logging.FileHandler(self.feedback_log_file)
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(logging.Formatter(
+                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+            self.logger.addHandler(fh)
+            self.logger.setLevel(logging.DEBUG)
+            # Retry patch-generation messages go through patch_generator's logger;
+            # tee them into the feedback log as well.
+            logging.getLogger('patch_generator').addHandler(fh)
+            self.logger.info(f"[FEEDBACK LOOP] Logging to {self.feedback_log_file}")
+        except Exception as exc:  # logging must never break the loop
+            self.feedback_log_file = None
+            self.logger.warning(f"[FEEDBACK LOOP] Could not open dedicated log: {exc}")
+
         if self.models_by_attempt:
             self.logger.info(
                 f"[FEEDBACK LOOP] Per-attempt model schedule: {self.models_by_attempt}"
@@ -57,18 +86,23 @@ class IterativeFeedbackLoop:
         """Import Phase 2 and Phase 3 modules dynamically."""
         import importlib.util
         
+        # The Phase 2/3 scripts live at the PIPELINE ROOT (BASE_DIR), not in
+        # config.base_dir — which is the per-project working dir (projects/<name>/)
+        # when launched via run_project.sh --base-dir. Resolve against BASE_DIR so
+        # the feedback loop finds them regardless of base_dir (mirrors executor.py,
+        # which runs these scripts from _pipeline_root).
         # Import patch_generator module
         gen_spec = importlib.util.spec_from_file_location(
             "patch_generator",
-            self.config.base_dir / "patch_generator.py"
+            BASE_DIR / "patch_generator.py"
         )
         self.patch_generator = importlib.util.module_from_spec(gen_spec)
         gen_spec.loader.exec_module(self.patch_generator)
-        
+
         # Import patch_validator module
         val_spec = importlib.util.spec_from_file_location(
             "patch_validator",
-            self.config.base_dir / "patch_validator.py"
+            BASE_DIR / "patch_validator.py"
         )
         self.patch_validator = importlib.util.module_from_spec(val_spec)
         val_spec.loader.exec_module(self.patch_validator)
@@ -377,19 +411,35 @@ class IterativeFeedbackLoop:
                 self.skip_sast = config.skip_sast
                 self.verbose = config.verbose
                 self.cve = cve_id
-        
+                # Active project's Phase 0 YAML — REQUIRED so the validator
+                # resolves the right image_manifest_path (and SAST tooling).
+                # Without it ValidationPipeline falls back to config.yaml's glibc
+                # default manifest, finds nothing, and every retry is falsely
+                # marked "No Phase 1 Baseline" / UNPATCHABLE without re-testing.
+                p0 = Path(config.phase0_config)
+                if not p0.is_absolute():
+                    p0 = BASE_DIR / config.phase0_config
+                self.phase0_config = str(p0)
+
         args = ValidatorArgs(self.config)
-        
+        # Route this retry's re-validation into the dedicated feedback log instead
+        # of spawning a fresh validator_<ts>.log per attempt.
+        args.log_file = str(self.feedback_log_file) if self.feedback_log_file else None
+
         # Create validator pipeline instance
         validator = self.patch_validator.ValidationPipeline(args)
         
-        # Get vulnerability info
+        # Get vulnerability info. poc_language MUST be carried through: for
+        # intree-test reproductions it drives is_intree_test, which selects the
+        # regression-test re-validation path. Omitting it makes the retry fall
+        # through to the ExploitDB run_poc path (no PoC file → spurious failure).
         vuln_info = self.patch_validator.VulnerabilityInfo(
             cve=cve_id,
             commit_hash=vuln_data.get('V_COMMIT', ''),
             file_path=vuln_data.get('FilePath', ''),
             function_name=vuln_data.get('F_NAME', ''),
-            unit_type=vuln_data.get('UNIT_TYPE', '')
+            unit_type=vuln_data.get('UNIT_TYPE', ''),
+            poc_language=vuln_data.get('poc_language', '')
         )
         
         # Validate the retry patch

@@ -43,6 +43,13 @@ from master_pipeline.config import (  # noqa: E402
 # corrupted by braces/apostrophes in comments (e.g. GNU-style `foo' quoting)
 # or by #if/#else groups that open the same brace in every branch.
 from cve_aggregator.utils.code_parser import _build_analysis_view  # noqa: E402
+from cve_aggregator.utils.llm_compat import (  # noqa: E402
+    is_openai_reasoning_model as _shared_is_openai_reasoning_model,
+)
+try:  # best-effort live-progress heartbeat for the dashboard (never fatal)
+    from cve_aggregator.utils import live_progress  # noqa: E402
+except Exception:  # pragma: no cover
+    live_progress = None
 
 _cfg = load_pipeline_config(BASE_DIR)
 _llm = _cfg.get("llm", {}) if isinstance(_cfg.get("llm"), dict) else {}
@@ -62,12 +69,22 @@ MODELS = [str(m) for m in _llm.get("models", [
 
 # OpenAI-specific settings
 OPENAI_MODEL = str(_llm.get("openai_model", "gpt-4.1-mini"))
+# Optional custom OpenAI-compatible base URL (vLLM / proxy / LM Studio). Empty
+# string ⇒ the SDK's default OpenAI endpoint. Set via profile (LLM_OPENAI_BASE_URL).
+OPENAI_BASE_URL = str(_llm.get("openai_base_url", "") or "")
 # API key: env var takes precedence over config file value
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or str(_llm.get("openai_api_key", ""))
 if not OPENAI_API_KEY:
     _key_file = BASE_DIR / "API-openai-key"
     if _key_file.exists():
         OPENAI_API_KEY = _key_file.read_text().strip()
+
+# Optional HTTP Basic Auth for a proxied Ollama backend (profile sets
+# OLLAMA_USERNAME/OLLAMA_PASSWORD, overlaid onto llm.* by the config loader).
+# None ⇒ unauthenticated (the legacy direct-server behaviour).
+_OLLAMA_USERNAME = str(_llm.get("ollama_username", "") or "")
+_OLLAMA_PASSWORD = str(_llm.get("ollama_password", "") or "")
+OLLAMA_AUTH = (_OLLAMA_USERNAME, _OLLAMA_PASSWORD) if (_OLLAMA_USERNAME and _OLLAMA_PASSWORD) else None
 
 # Optional per-attempt model escalation for the feedback loop. Keys are attempt
 # numbers (1 = the initial Phase 2 generation, 2 = first retry, ...), values are
@@ -97,6 +114,7 @@ LLM_MAX_TOKENS = int(_llm.get("max_tokens", 8192))
 CSV_PATH = BASE_DIR / str(_paths.get("csv_file", "documentation/file-function.csv"))
 OUTPUT_DIR = BASE_DIR / str(_paths.get("patches", "patches"))
 LOG_DIR = BASE_DIR / str(_paths.get("logs", "logs"))
+EXPLOITS_DIR = BASE_DIR / str(_paths.get("exploits_dir", "exploits"))
 
 # =============================================================================
 # Logging Setup
@@ -233,7 +251,7 @@ def _find_poc_source(cve_id: str, max_len: int = 3000) -> str:
     Looks for ``exploits/<CVE>.<ext>`` (the primary PoC, not _pocN variants).
     Returns the truncated source, or "" when no PoC file exists.
     """
-    exploits_dir = BASE_DIR / str(_paths.get("exploits_dir", "exploits"))
+    exploits_dir = EXPLOITS_DIR  # rebased to the active --base-dir in main()/feedback
     try:
         candidates = sorted(
             p for p in exploits_dir.glob(f"{cve_id}.*")
@@ -508,6 +526,22 @@ def check_api_health() -> bool:
     Returns:
         True if API is healthy/configured, False otherwise
     """
+    # Per-run provenance banner: record exactly which backend Phase 2 (and the
+    # feedback loop) will use, so benchmark runs are auditable from the log.
+    if LLM_PROVIDER == "openai":
+        _banner_model = OPENAI_MODEL
+        _banner_endpoint = OPENAI_BASE_URL or "<OpenAI default>"
+    else:
+        _banner_model = ", ".join(MODELS)
+        _banner_endpoint = API_ENDPOINT
+    logger.info(
+        "LLM backend → provider=%s | model=%s | endpoint=%s | auth=%s",
+        LLM_PROVIDER, _banner_model, _banner_endpoint,
+        "basic" if (LLM_PROVIDER != "openai" and OLLAMA_AUTH) else "none",
+    )
+    if FEEDBACK_MODELS_BY_ATTEMPT:
+        logger.info("LLM per-attempt ramp → %s", FEEDBACK_MODELS_BY_ATTEMPT)
+
     if LLM_PROVIDER == "openai":
         if not OPENAI_API_KEY:
             logger.error(
@@ -523,7 +557,7 @@ def check_api_health() -> bool:
     parsed = urlparse(API_ENDPOINT)
     tags_url = urlunparse((parsed.scheme, parsed.netloc, "/api/tags", "", "", ""))
     try:
-        response = requests.get(tags_url, timeout=10)
+        response = requests.get(tags_url, timeout=10, auth=OLLAMA_AUTH)
         response.raise_for_status()
         n_models = len(response.json().get("models", []))
         logger.info("✓ API health check passed (%d models available)", n_models)
@@ -565,7 +599,7 @@ def _check_gpu_status(model: str) -> None:
     parsed = urlparse(API_ENDPOINT)
     ps_url = urlunparse((parsed.scheme, parsed.netloc, "/api/ps", "", "", ""))
     try:
-        resp = requests.get(ps_url, timeout=5)
+        resp = requests.get(ps_url, timeout=5, auth=OLLAMA_AUTH)
         resp.raise_for_status()
         running = resp.json().get("models", [])
 
@@ -610,12 +644,17 @@ def _check_gpu_status(model: str) -> None:
 GPU_WAIT_TIMEOUT = int(_llm.get("gpu_wait_timeout", 120))
 
 
-def wait_for_gpu(timeout: Optional[int] = None,
+def wait_for_gpu(model: Optional[str] = None, timeout: Optional[int] = None,
                  poll_interval: int = 15) -> bool:
-    """Poll /api/ps until GPU VRAM is free, or *timeout* expires.
+    """Poll /api/ps until the backend can serve our request, or *timeout* expires.
 
-    For the "openai" provider this is a no-op (always returns True).
-    Returns True if GPU is available, False if wait timed out.
+    Returns True when ready to serve: the GPU is idle, OR our target *model* is
+    already resident. On a SHARED / persistent Ollama proxy the GPU is rarely
+    idle and keeps models loaded across requests, so a resident target model is
+    the BEST case (it serves immediately), not a busy one — waiting for the GPU
+    to fully empty would block forever. Only blocks while the GPU is occupied by
+    OTHER models and ours is not loaded. For the "openai" provider this is a
+    no-op (always True). Set llm.gpu_wait_timeout to 0 to skip the wait entirely.
     """
     if LLM_PROVIDER == "openai":
         return True  # No GPU to wait for when using OpenAI
@@ -624,6 +663,8 @@ def wait_for_gpu(timeout: Optional[int] = None,
 
     if timeout is None:
         timeout = GPU_WAIT_TIMEOUT
+    if timeout <= 0:
+        return True  # wait disabled via config (shared backend manages its own VRAM)
 
     parsed = urlparse(API_ENDPOINT)
     ps_url = urlunparse((parsed.scheme, parsed.netloc, "/api/ps", "", "", ""))
@@ -631,11 +672,17 @@ def wait_for_gpu(timeout: Optional[int] = None,
 
     while True:
         try:
-            resp = requests.get(ps_url, timeout=10)
+            resp = requests.get(ps_url, timeout=10, auth=OLLAMA_AUTH)
             resp.raise_for_status()
             running = resp.json().get("models", [])
             total_vram = sum(e.get("size_vram", 0) for e in running)
             if not running or total_vram == 0:
+                return True
+            # Our target model is already loaded → it will serve immediately; a
+            # busy GPU only matters when it is occupied by OTHER models and ours
+            # is not resident (then we wait for ollama to load/evict).
+            if model and any(e.get("name") == model or e.get("model") == model
+                             for e in running):
                 return True
         except Exception:
             return True  # can't reach /api/ps — assume available
@@ -653,34 +700,106 @@ def wait_for_gpu(timeout: Optional[int] = None,
         time.sleep(poll_interval)
 
 
+# Minimum output room (tokens) a model must have AFTER the prompt to be usable.
+# If the prompt leaves less than this within the model's window, the prompt is
+# treated as too large for that model and the ramp advances to the next one.
+_MIN_OUTPUT_HEADROOM = 1024
+_MODEL_MAX_CTX_CACHE: Dict[str, int] = {}
+
+
+def _model_max_ctx(model: str) -> int:
+    """Best-effort max context window (tokens) the model was trained for, read
+    from the Ollama server's ``/api/show`` ``model_info`` (cached per model).
+
+    Falls back to ``NUM_CTX`` when the server can't report it, so the guard still
+    catches prompts that exceed the configured window even if /api/show is
+    unavailable, and behavior is otherwise unchanged.
+    """
+    if model in _MODEL_MAX_CTX_CACHE:
+        return _MODEL_MAX_CTX_CACHE[model]
+    ctx = NUM_CTX
+    try:
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(API_ENDPOINT)
+        show_url = urlunparse((parsed.scheme, parsed.netloc, "/api/show", "", "", ""))
+        resp = requests.post(show_url, json={"model": model}, timeout=10, auth=OLLAMA_AUTH)
+        resp.raise_for_status()
+        info = resp.json().get("model_info", {}) or {}
+        # model_info keys are arch-prefixed, e.g. "qwen2.context_length".
+        for k, v in info.items():
+            if k.endswith(".context_length") and isinstance(v, (int, float)) and v > 0:
+                ctx = int(v)
+                break
+    except Exception as exc:
+        logger.debug("Could not read max context for '%s' via /api/show (%s); using %d.",
+                     model, exc, ctx)
+    _MODEL_MAX_CTX_CACHE[model] = ctx
+    return ctx
+
+
 def _call_ollama_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Call the Ollama-compatible local server API with retry logic."""
+    """Call the Ollama-compatible local server API with retry logic.
+
+    Before sending, verify the prompt fits the model's context window. If it does
+    not, the model is SKIPPED with a clearly logged reason (also recorded in
+    ``metadata['error']``) so the feedback-loop ramp advances to the next model
+    instead of the Ollama server silently truncating the prompt.
+    """
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt}
     ]
+
+    # --- Context-fit guard ---------------------------------------------------
+    model_max = _model_max_ctx(model)
+    eff_ctx = min(NUM_CTX, model_max)        # never request more than the model supports
+    est_prompt_tokens = (len(system_prompt) + len(user_prompt)) // 4   # ~4 chars/token
+    metadata: Dict[str, Any] = {
+        "model": model,
+        "provider": "ollama",
+        "timestamp_start": datetime.now().isoformat(),
+        "retries": 0,
+        "success": False,
+        "error": None,
+        "est_prompt_tokens": est_prompt_tokens,
+        "model_max_ctx": model_max,
+        "num_ctx": eff_ctx,
+    }
+    if est_prompt_tokens > eff_ctx - _MIN_OUTPUT_HEADROOM:
+        # Check against eff_ctx (what we actually allocate = min(NUM_CTX, model_max)),
+        # not model_max — otherwise a prompt could pass on the model's theoretical
+        # max yet still overflow the smaller window we send and be silently truncated.
+        reason = (f"context_exceeds_model_window: prompt ~{est_prompt_tokens} tokens "
+                  f"exceeds the usable context window ({eff_ctx} tokens; model "
+                  f"'{model}' max {model_max})")
+        logger.error(
+            "Model '%s' SKIPPED — prompt (~%d tokens) exceeds its usable context "
+            "window (%d tokens); advancing to the next model in the ramp.",
+            model, est_prompt_tokens, eff_ctx)
+        metadata["error"] = reason
+        metadata["context_skip"] = True
+        metadata["timestamp_end"] = datetime.now().isoformat()
+        return None, metadata
+
+    # Cap the output budget so prompt + output fit within the effective window.
+    num_predict = min(LLM_MAX_TOKENS, max(256, eff_ctx - est_prompt_tokens))
     payload = {
         "model": model,
         "messages": messages,
         "stream": False,
         "options": {
             "temperature": LLM_TEMPERATURE,
-            "num_ctx": NUM_CTX
+            # num_ctx capped at the model's window; output budget pinned so a long
+            # patch is not truncated by the server's default num_predict.
+            "num_ctx": eff_ctx,
+            "num_predict": num_predict,
         }
     }
-    metadata = {
-        "model": model,
-        "provider": "ollama",
-        "timestamp_start": datetime.now().isoformat(),
-        "payload_size": len(json.dumps(payload)),
-        "retries": 0,
-        "success": False,
-        "error": None
-    }
+    metadata["payload_size"] = len(json.dumps(payload))
     for attempt in range(MAX_RETRIES):
         try:
             logger.debug(f"Ollama API call attempt {attempt + 1}/{MAX_RETRIES} for model {model}")
-            response = requests.post(API_ENDPOINT, json=payload, timeout=API_TIMEOUT)
+            response = requests.post(API_ENDPOINT, json=payload, timeout=API_TIMEOUT, auth=OLLAMA_AUTH)
             response.raise_for_status()
             result = response.json()
             content = result.get('message', {}).get('content', '')
@@ -720,14 +839,11 @@ def _is_openai_reasoning_model(model: str) -> bool:
     ``max_tokens`` (they require ``max_completion_tokens``) and only accept the
     default ``temperature`` (1). Older chat models (gpt-4.1, gpt-4o, gpt-4-*,
     gpt-3.5-*) take ``max_tokens`` + a custom temperature.
+
+    Delegates to the shared rule in ``cve_aggregator.utils.llm_compat`` so the
+    model-family list lives in exactly one place across all LLM phases.
     """
-    m = (model or "").lower()
-    return (
-        m.startswith("gpt-5")
-        or m.startswith("o1")
-        or m.startswith("o3")
-        or m.startswith("o4")
-    )
+    return _shared_is_openai_reasoning_model(model)
 
 
 def _openai_sampling_kwargs(model: str) -> Dict[str, Any]:
@@ -756,7 +872,10 @@ def _call_openai_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[
             "variable or llm.openai_api_key in config.yaml."
         )
 
-    client = OpenAI(api_key=OPENAI_API_KEY, timeout=API_TIMEOUT)
+    _client_kwargs: Dict[str, Any] = {"api_key": OPENAI_API_KEY, "timeout": API_TIMEOUT}
+    if OPENAI_BASE_URL:
+        _client_kwargs["base_url"] = OPENAI_BASE_URL
+    client = OpenAI(**_client_kwargs)
     metadata: Dict[str, Any] = {
         "model": model,
         "provider": "openai",
@@ -1764,6 +1883,56 @@ def load_vulnerability_data(csv_path: Path) -> pd.DataFrame:
 # Main Pipeline
 # =============================================================================
 
+def _family_ramp_from(start_model: str) -> List[str]:
+    """Ordered family ramp (by attempt number) beginning at *start_model*.
+
+    Phase 2 uses the first model of the family; this returns that model followed
+    by the rest of the ramp so generation can fall through to the next model when
+    one cannot fit the prompt in its context window. Falls back to just
+    ``[start_model]`` when no per-attempt ramp is configured.
+    """
+    if not FEEDBACK_MODELS_BY_ATTEMPT:
+        return [start_model]
+    ordered, seen = [], set()
+    for k in sorted(FEEDBACK_MODELS_BY_ATTEMPT, key=lambda x: int(x)):
+        m = FEEDBACK_MODELS_BY_ATTEMPT[k]
+        if m and m not in seen:
+            seen.add(m)
+            ordered.append(m)
+    if start_model in ordered:
+        return ordered[ordered.index(start_model):]
+    return [start_model] + [m for m in ordered if m != start_model]
+
+
+def _generate_with_family_fallback(
+    prompt: str, start_model: str
+) -> Tuple[Optional[str], Dict[str, Any], str]:
+    """Phase-2 generation with family-ramp fallback on context overflow.
+
+    Starts with *start_model* (the first model of the family). If a model cannot
+    fit the prompt in its context window (``metadata['context_skip']``), advance
+    to the next model in the ramp and retry — so Phase 2 still produces an
+    attempt-1 patch instead of leaving nothing for the feedback loop to build on.
+    ONLY a context overflow advances the ramp; any other outcome (success, or a
+    different failure handled elsewhere) stops here. Returns
+    ``(raw_response, metadata, model_used)``.
+    """
+    ramp = _family_ramp_from(start_model)
+    raw_response: Optional[str] = None
+    metadata: Dict[str, Any] = {"error": "no model attempted"}
+    used_model = start_model
+    for candidate in ramp:
+        used_model = candidate
+        raw_response, metadata = call_llm_api(candidate, prompt)
+        if raw_response is None and metadata.get("context_skip") and candidate != ramp[-1]:
+            logger.warning(
+                "Phase 2: model '%s' cannot fit the prompt in its context window — "
+                "falling back to the next model in the family ramp.", candidate)
+            continue
+        break
+    return raw_response, metadata, used_model
+
+
 def process_single_vulnerability(
     row: pd.Series,
     model: str
@@ -1802,10 +1971,14 @@ def process_single_vulnerability(
     )
     prompt = create_patch_prompt(cve_id, function_name, vulnerable_code,
                                  file_context, vuln_context)
-    
-    # Call LLM API
-    raw_response, metadata = call_llm_api(model, prompt)
-    
+
+    # Call the LLM, starting with the first model of the family and falling
+    # through to the next model on a context-window overflow (ollama only; a
+    # no-op for OpenAI, which ignores the per-call model). The model that
+    # actually handled it is what we record for this CVE.
+    raw_response, metadata, model = _generate_with_family_fallback(prompt, model)
+    result["model"] = model
+
     if raw_response is None:
         logger.error(f"Failed to get response for {cve_id} with {model}")
         result["error"] = metadata.get("error", "Unknown error")
@@ -1931,6 +2104,15 @@ def generate_patch_with_feedback(
         - full_patched_file: Complete file with patch integrated
         - attempt_number: The attempt number
     """
+    # In-process feedback retries call this function directly (not via main()),
+    # so rebase the module-global EXPLOITS_DIR to the active run's base dir here.
+    # output_dir is <base_dir>/patches, so its parent is the run base_dir; without
+    # this the PoC lookup would fall back to the pipeline-root exploits/ and the
+    # exploit would be silently dropped from the retry prompt.
+    global EXPLOITS_DIR
+    if output_dir is not None:
+        EXPLOITS_DIR = Path(output_dir).parent / str(_paths.get("exploits_dir", "exploits"))
+
     # Resolve the model actually used for this attempt. ``generation_model`` (from
     # feedback_loop.models_by_attempt) escalates per retry; when absent we fall
     # back to the provider default (OPENAI_MODEL for OpenAI, else the loop model).
@@ -2088,7 +2270,8 @@ def generate_patch_with_feedback(
 def run_pipeline(
     csv_path: Path = CSV_PATH,
     models: List[str] = MODELS,
-    cve_filter: Optional[List[str]] = None
+    cve_filter: Optional[List[str]] = None,
+    manifest_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Run the complete patch generation pipeline.
@@ -2124,7 +2307,11 @@ def run_pipeline(
     # (a deterministic baseline exit code exists in the image manifest).
     # Generating patches for unreproduced CVEs would waste LLM calls AND
     # produce patches Phase 3 could never validate dynamically.
-    manifest_path = OUTPUT_DIR.parent / str(_paths.get("results", "results")) / "image_manifest.json"
+    # Use the PROJECT's manifest path (phase1.image_manifest_path, resolved in
+    # main()), NOT a hardcoded name — otherwise a non-glibc run reads glibc's
+    # stale results/image_manifest.json and ignores its OWN reproduced CVEs.
+    if manifest_path is None:
+        manifest_path = OUTPUT_DIR.parent / str(_paths.get("results", "results")) / "image_manifest.json"
     if manifest_path.exists():
         try:
             with open(manifest_path) as f:
@@ -2148,8 +2335,25 @@ def run_pipeline(
         logger.warning(f"No Phase 1 manifest at {manifest_path} — proceeding with all CVEs")
 
     if len(df) == 0:
-        logger.error("No CVEs eligible for patch generation — nothing to do")
-        return {"success": False, "error": "No eligible CVEs after filtering"}
+        # Legitimate empty result, NOT a failure: this run simply reproduced no
+        # CVEs in Phase 1 (e.g. a project whose only PoCs don't exercise the build),
+        # or no CVE had an extracted vulnerable function. There is nothing to patch,
+        # so exit cleanly and let Phases 3/4 run on an empty set — a red ❌ here
+        # would wrongly fail the whole pipeline over "nothing to do".
+        logger.warning("No CVEs eligible for patch generation (none reproduced in "
+                       "Phase 1 / no extracted function) — nothing to patch; exiting cleanly")
+        # Write a fresh ZEROED summary so the execution-summary table reads 0/0
+        # for THIS run — otherwise a stale pipeline_summary.json (e.g. a previous
+        # project's run in a shared base-dir) would be read and show a bogus count.
+        empty_summary = {"summary": {"total_tasks": 0, "successful": 0,
+                                     "syntax_valid": 0, "failed": 0}, "results": []}
+        try:
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            with open(OUTPUT_DIR / "pipeline_summary.json", "w") as f:
+                json.dump(empty_summary, f, indent=2)
+        except Exception as exc:
+            logger.warning(f"Could not write empty pipeline_summary.json: {exc}")
+        return {"success": True, "no_eligible_cves": True, "summary": {}}
     
     logger.info(f"Total tasks to process: {len(df) * len(models)}")
     
@@ -2157,7 +2361,18 @@ def run_pipeline(
     results = []
     total_tasks = len(df) * len(models)
     current_task = 0
-    
+    _live_dir = OUTPUT_DIR.parent / str(_paths.get("results", "results"))
+
+    def _emit_live(done, running=True):
+        if not live_progress:
+            return
+        sv = sum(1 for r in results if r.get("syntax_valid"))
+        si = sum(1 for r in results if r.get("success") and not r.get("syntax_valid"))
+        live_progress.emit(_live_dir, 2, total_tasks, done,
+                           {"syntax_valid": sv, "syntax_invalid": si}, running=running)
+
+    _emit_live(0)
+
     for model in models:
         logger.info(f"\n{'='*40}")
         logger.info(f"Processing with model: {model}")
@@ -2184,9 +2399,13 @@ def run_pipeline(
                     "timestamp_end": datetime.now().isoformat()
                 })
             
+            _emit_live(current_task)
+
             # Small delay between API calls to avoid overwhelming the server
             time.sleep(1)
-    
+
+    _emit_live(total_tasks, running=False)
+
     # Generate summary
     phase_end_time = datetime.now()
     phase_duration = (phase_end_time - phase_start_time).total_seconds()
@@ -2387,18 +2606,37 @@ Examples:
     # Re-apply the project phase2 config now that the active project YAML is
     # known (the import-time default followed config.yaml's pointer, which may
     # not be the project this run targets, e.g. tomcat vs the glibc default).
+    # Also resolve THIS project's Phase 1 manifest path (phase1.image_manifest_path)
+    # so the reproduced-CVE filter reads the right manifest, not glibc's default.
+    base_dir = Path(args.base_dir)
+    manifest_path = base_dir / "results" / "image_manifest.json"
     if args.phase0_config:
         p0 = Path(args.phase0_config)
-        _apply_phase2((_load_yaml(p0).get("phase2") if p0.exists() else {}) or {})
+        _p0doc = _load_yaml(p0) if p0.exists() else {}
+        _apply_phase2((_p0doc.get("phase2") or {}))
+        _mrel = (_p0doc.get("phase1") or {}).get("image_manifest_path")
+        if _mrel:
+            _mpath = Path(_mrel)
+            manifest_path = _mpath if _mpath.is_absolute() else base_dir / _mpath
 
     # Set up paths based on base-dir
-    base_dir = Path(args.base_dir)
     csv_path = Path(args.csv) if args.csv else CSV_PATH
     
-    # Update global OUTPUT_DIR based on base_dir
-    global OUTPUT_DIR
+    # Update global OUTPUT_DIR / EXPLOITS_DIR based on base_dir
+    global OUTPUT_DIR, EXPLOITS_DIR
     OUTPUT_DIR = base_dir / str(_paths.get("patches", "patches"))
-    
+    EXPLOITS_DIR = base_dir / str(_paths.get("exploits_dir", "exploits"))
+
+    # Re-point logging at the ACTIVE project's logs dir. The module-level
+    # setup_logging() ran at import against the pipeline-root LOG_DIR (BASE_DIR/
+    # logs), so without this Phase 2's log lands in the global logs/ instead of
+    # projects/<project>/logs/ (alongside Phase 0/1/3) — i.e. "not stored" from a
+    # per-project view. Re-init now that --base-dir is known; setup_logging()
+    # clears+re-adds handlers, so this moves the file cleanly.
+    global LOG_DIR, logger
+    LOG_DIR = base_dir / str(_paths.get("logs", "logs"))
+    logger = setup_logging()
+
     # Adjust logging level if verbose
     if args.verbose:
         logging.getLogger('patch_generator').setLevel(logging.DEBUG)
@@ -2441,17 +2679,22 @@ Examples:
             logger.error(f"  3. Is there network connectivity?")
         sys.exit(1)
     
-    # Wait for GPU availability before starting generation
+    # Pre-flight GPU readiness — ADVISORY ONLY. On a shared/persistent Ollama
+    # proxy the GPU is rarely idle and ollama loads/evicts models itself, so a
+    # "still busy" result must NOT abort the phase (the old sys.exit(2) killed
+    # every CVE in the cell when the GPU merely had a model resident — which on a
+    # proxy is the normal, ready state). Proceed and let each inference call's own
+    # timeout + retries handle a genuinely unavailable backend.
     logger.info("Checking GPU availability...")
-    if not wait_for_gpu():
+    _first_model = (args.model[0] if args.model
+                    else (MODELS[0] if (LLM_PROVIDER != "openai" and MODELS) else None))
+    if not wait_for_gpu(_first_model):
         logger.warning(
-            "GPU still busy after %d s timeout. "
-            "Patch generation may be slow (CPU-only) or time out.",
+            "GPU still busy with other models after %d s — proceeding anyway "
+            "(shared backend; ollama will load/evict as needed; each request is "
+            "still bounded by the per-call timeout).",
             GPU_WAIT_TIMEOUT,
         )
-        # Exit with code 2 so the master pipeline can detect "skipped"
-        logger.error("Exiting — GPU not available within timeout.")
-        sys.exit(2)
     
     # Resolve models for the active provider: with OpenAI every configured
     # Ollama model name would route to the SAME OpenAI model, producing N
@@ -2467,14 +2710,18 @@ Examples:
     summary = run_pipeline(
         csv_path=csv_path,
         models=models,
-        cve_filter=args.cve
+        cve_filter=args.cve,
+        manifest_path=manifest_path,
     )
 
-    # Exit with appropriate code. A hard failure (data load error, nothing
-    # eligible) must propagate as non-zero so the master pipeline does not
-    # mark Phase 2 successful with zero patches. Partial per-task failures
-    # do NOT fail the phase as long as at least one syntactically valid
-    # patch was produced (Phase 3 can still validate the rest).
+    # Exit with appropriate code.
+    #  * "nothing to patch" (no CVE reproduced / no extracted function) is a
+    #    CLEAN no-op for multi-project runs — exit 0 so the pipeline continues.
+    #  * A real hard failure (data load error) propagates as non-zero.
+    #  * Producing 0 valid patches FROM eligible CVEs is still a failure.
+    if summary.get("no_eligible_cves"):
+        logger.info("Phase 2: no CVEs to patch (none reproduced) — clean no-op, exiting 0")
+        sys.exit(0)
     if summary.get("success") is False or summary.get("error"):
         logger.error(f"Phase 2 failed: {summary.get('error', 'unknown error')}")
         sys.exit(1)

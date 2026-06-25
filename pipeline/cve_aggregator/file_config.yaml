@@ -1,0 +1,381 @@
+# =============================================================================
+# CVE Aggregator Pipeline – file / libmagic Configuration  (C LIBRARY + CLI)
+# =============================================================================
+# The `file` utility and its libmagic library. C, autotools, crash-on-parse CVEs
+# that reproduce IN-CONTAINER (no network/VM): feed a crafted file to the built
+# `file` CLI, or link libmagic in a C PoC. Exercises the library + CLI shapes.
+# IMPORTANT: libmagic needs its compiled magic DB at run time — poc_run_env sets
+# MAGIC to the build's magic.mgc so both the CLI and libmagic PoCs find it.
+# Build hooks are UNTESTED STARTING POINTS — expect first-run VM iteration.
+# Run: python3 pipeline.py --project file --phases 0 1
+# =============================================================================
+
+project:
+  name: "file"
+  display_name: "file / libmagic"
+  description: "CVE and PoC dataset for the file utility and libmagic"
+
+pipeline:
+  abort_on_error: false
+  skip_modules: []
+
+reproduction_strategy:
+  - exploitdb
+  - intree
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  file: "logs/file_cve_aggregator.log"
+
+# ---------------------------------------------------------------------------
+# Module 1: CVE Fetching
+# ---------------------------------------------------------------------------
+# "file" is a very generic word — lean HARD on the CPE match + strict matching and
+# strong non-target indicators to avoid the flood of unrelated "file" CVEs.
+cve_fetcher:
+  nvd_api_key: "043bad81-616b-445a-8e79-96e87cc96c66"
+  keywords:
+    - "libmagic"
+    - "file utility"
+    - "Christos Zoulas"
+  cpe_match:
+    - "cpe:2.3:a:file_project:file"
+  strong_keywords:
+    - "libmagic"
+    - "file utility"
+    - "the file program"
+    - "file command"
+  non_target_indicators:
+    - "file upload"
+    - "file inclusion"
+    - "file disclosure"
+    - "arbitrary file"
+    - "file write"
+    - "file read"
+    - "PHP"
+    - "WordPress"
+    - "Windows"
+  strict_target_matching: true
+  require_project_cpe_match: true       # "file" is too generic — REQUIRE the CPE match
+  project_cpe_aliases:
+    - "file_project:file"
+    - "libmagic"
+  enrich_with_cve_org: false
+  cve_org_delay: 1.0
+  min_published_year: 2007
+
+# ---------------------------------------------------------------------------
+# Module 2: Commit Discovery
+# ---------------------------------------------------------------------------
+commit_discovery:
+  repo_url: "https://github.com/file/file.git"
+  repo_local_path: "../file"
+  clone_timeout: 600
+  harvest_regression_tests: true
+  auto_update: true
+  extra_grep_patterns: []
+  enable_bz_fallback: false
+  allow_unscoped_extra_patterns: false
+  bugzilla_hosts: []
+  enable_online_bug_resolution: false
+  source_extensions:
+    - ".c"
+    - ".h"
+
+# ---------------------------------------------------------------------------
+# Module 3: PoC Mapping (ExploitDB)
+# ---------------------------------------------------------------------------
+poc_mapper:
+  exploitdb_path: "../exploit-database"
+  exploitdb_remote_url: "https://gitlab.com/exploit-database/exploitdb.git"
+  auto_update: true
+  deep_search: true
+  extract_content: true
+  reverse_search: true
+  enable_reverse_content_grep: true
+  require_verified: false
+  prefer_platforms:
+    - "linux"
+  non_target_indicators:
+    - "PHP"
+    - "Windows"
+
+# ---------------------------------------------------------------------------
+# Module 4–7: Aggregator / Validation / Repair / Output
+# ---------------------------------------------------------------------------
+data_aggregator:
+  global_json_path: "results/file_cve_poc_map.json"
+  prune_missing_cves: true
+
+syntax_validator:
+  manual_supervision_dir: "manual_supervision"
+  report_path: "results/file_syntax_validation_report.json"
+  allow_manual_without_commit: false
+
+poc_repair:
+  provider: "openai"
+  openai_model: "gpt-4.1-mini"
+  openai_api_key: ""
+  api_endpoint: "http://10.3.2.171:80/api/chat"
+  model: "devstral:32k"
+  max_repair_attempts: 3
+  models_by_attempt:
+    1: "gpt-4.1-mini"
+    2: "gpt-5-mini"
+    3: "gpt-4.1"
+  api_timeout: 600
+  model_load_timeout: 300
+  num_ctx: 32768
+  max_poc_chars: 0
+  temperature: 0.4
+  report_path: "results/file_poc_repair_report.json"
+  manual_review_queue_path: "results/file_manual_review_queue.json"
+  gpu_wait_timeout: 120
+
+output:
+  global_json_path: "results/file_cve_poc_map.json"
+  filtered_json_path: "results/file_cve_poc_map_filtered.json"
+  csv_path: "results/file_cve_poc_complete.csv"
+  poc_dir: "exploits"
+  filtered_require_commit: false
+  filtered_require_poc: true
+  filtered_require_verified_poc: false
+  flag_unvalidated_edb_for_manual_review: true
+  manual_supervision_dir: "manual_supervision"
+  allow_poc_without_commit: false
+  csv_fields:
+    - "CVE"
+    - "V_COMMIT"
+    - "FilePath"
+    - "F_NAME"
+    - "UNIT_TYPE"
+    - "V_FILE"
+    - "V_FUNCTION"
+    - "CVE_Description"
+    - "CWE"
+    - "CWE_Description"
+    - "project_version"
+    - "project_version_normalized"
+    - "ubuntu_version"
+    - "poc_index"
+    - "poc_path"
+    - "poc_language"
+    - "FIX_COMMIT"
+    - "TEST_PATH"
+    - "TEST_SUBDIR"
+    - "manual_review_required"
+    - "manual_verified"
+
+# ---------------------------------------------------------------------------
+# Phase 2: LLM patch generation (C)
+# ---------------------------------------------------------------------------
+phase2:
+  language: "c"
+  system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for the file utility and its libmagic library. Your task is to fix a security
+    vulnerability by making the SMALLEST POSSIBLE EDIT to the vulnerable function
+    — never by rewriting it.
+  feedback_system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for file/libmagic. Your previous patch attempt FAILED validation. Analyze the
+    failure and produce an improved fix as MINIMAL edits — never rewrite the whole
+    function.
+  internal_headers: []
+
+# ---------------------------------------------------------------------------
+# Phase 3: SAST (C stack)
+# ---------------------------------------------------------------------------
+sast:
+  enabled: true
+  fail_on: [critical, high]
+  tool_timeout: 180
+  tools:
+    - name: cppcheck
+      detect: cppcheck
+      cmd: ["cppcheck", "--enable=all", "--xml", "--xml-version=2", "{file}"]
+      parser: cppcheck-xml
+      install: { apt: cppcheck }
+    - name: clang-tidy
+      detect: clang-tidy
+      cmd: ["clang-tidy", "--quiet", "--checks=clang-analyzer-*,bugprone-*,cert-*", "{file}", "--"]
+      parser: regex
+      regex: '^(.+?):(\d+):(\d+):\s+(warning|error):\s+(.+?)\s+\[([^\]]+)\]$'
+      groups: { file: 1, line: 2, column: 3, severity: 4, message: 5, rule: 6 }
+      severity_map: { warning: medium, error: high }
+      install: { apt: clang-tidy }
+    - name: semgrep
+      detect: semgrep
+      cmd: ["semgrep", "scan", "--sarif", "--quiet", "--metrics=off", "--config=p/c", "{file}"]
+      parser: sarif
+      install: { pip: semgrep }
+    - name: flawfinder
+      detect: flawfinder
+      cmd: ["flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      fallback_cmd: ["{python}", "-m", "flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      parser: flawfinder
+      install: { pip: flawfinder }
+
+# ---------------------------------------------------------------------------
+# Phase 1: reproduction (shared with Phase 3)
+# ---------------------------------------------------------------------------
+phase1:
+  project_repo_local_path: "../file"
+  project_repo_remote_url: "https://github.com/file/file.git"
+  docker_base_image_prefix: "ai-ssd/file-base"
+  docker_cve_image_prefix: "ai-ssd/file-cve"
+  image_manifest_path: "results/file_image_manifest.json"
+  source_dir_name: "project-src"
+  build_dir_name: "project-build"
+  install_prefix: "/opt/project-build"
+
+  base_packages:
+    - build-essential
+    - autoconf
+    - automake
+    - libtool
+    - pkg-config
+  base_packages_optional:
+    - zlib1g-dev
+    - liblzma-dev
+    - libbz2-dev
+    - wget
+    - gcc-multilib
+    - g++-multilib
+  base_setup: |
+    dpkg --add-architecture i386 && apt-get update && apt-get install -y libc6-dev-i386 || true
+
+  commit_era_map:
+    2007: "14.04"
+    2010: "14.04"
+    2012: "14.04"
+    2014: "16.04"
+    2016: "16.04"
+    2017: "18.04"
+    2018: "18.04"
+    2019: "20.04"
+    2020: "20.04"
+    2021: "22.04"
+    2022: "22.04"
+    2023: "24.04"
+    2024: "24.04"
+    2025: "24.04"
+    2026: "24.04"
+
+  version_file: ""
+  version_regex: ''
+  version_era_map: {}
+  enable_arch_fallback: true
+
+  # libmagic needs its compiled magic DB at run time. make install writes it to
+  # $PFX/share/misc/magic.mgc; MAGIC points the CLI + libmagic PoCs at it.
+  poc_run_env:
+    MALLOC_CHECK_: "3"
+    MALLOC_PERTURB_: "42"
+    MAGIC: "/opt/project-build/share/misc/magic.mgc"
+
+  # ---- build_script — STARTING POINT, UNTESTED ----
+  # git checkout has no configure: autoreconf then out-of-tree configure + make +
+  # install. Produces libmagic.so, the `file` CLI, and the compiled magic.mgc DB.
+  build_script: |
+    #!/bin/bash
+    SRC="$SOURCE_DIR"; BD="$BUILD_DIR"; PFX="$INSTALL_PREFIX"
+    ARCHFLAGS=""; HOST=""
+    if [ "$BUILD_ARCH" = "i386" ]; then ARCHFLAGS="-m32"; HOST="--host=i686-linux-gnu --build=i686-linux-gnu"; fi
+    cd "$SRC" || exit 1
+    if [ ! -x "$SRC/configure" ]; then ( autoreconf -fi > /build/bootstrap.log 2>&1 || ./autogen.sh > /build/bootstrap.log 2>&1 ) || true; fi
+    cd "$BD" || exit 1; rm -rf ./*
+    ( "$SRC"/configure --prefix="$PFX" --disable-silent-rules $HOST CFLAGS="$ARCHFLAGS -O2 -g -w -U_FORTIFY_SOURCE" 2>&1 && echo CONFIGURE_OK ) \
+      > /build/cfg.log 2>&1 || { echo "CONFIGURE_FAIL"; tail -25 /build/cfg.log; }
+    make -j"$(nproc)" -k > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
+    make install -k > /build/make_install.log 2>&1; echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status
+    # success = libmagic.so present (CLI also installed alongside).
+    if ls "$PFX"/lib/libmagic.so* "$PFX"/lib64/libmagic.so* 2>/dev/null | grep -q .; then echo "PROJECT_BUILD_INSTALLED=yes" >> /build/build_status; else echo "PROJECT_BUILD_INSTALLED=no" >> /build/build_status; fi
+    echo "build complete"
+
+  # ---- poc_prepare_script — compile the C PoC against the project libmagic ----
+  poc_prepare_script: |
+    #!/bin/bash
+    PFX="$INSTALL_PREFIX"
+    M32=""; [ "$BUILD_ARCH" = "i386" ] && M32="-m32"
+    cd /poc
+    if grep -qE '^[[:space:]]*(int|void)?[[:space:]]*main[[:space:]]*\(' /poc/exploit_raw.c; then
+      cp /poc/exploit_raw.c /poc/exploit.c
+    else
+      printf '#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n' > /poc/exploit.c
+      cat /poc/exploit_raw.c >> /poc/exploit.c
+      printf '\nint main(int argc,char**argv){puts("fragment loaded");return 0;}\n' >> /poc/exploit.c
+    fi
+    INC="-I$PFX/include"
+    rm -f /poc/exploit
+    gcc $M32 -O0 -g -w -D_GNU_SOURCE $INC -o exploit exploit.c -L"$PFX/lib" -Wl,-rpath,"$PFX/lib" -lmagic 2>&1 || \
+    gcc $M32 -O0 -g -w -D_GNU_SOURCE -o exploit exploit.c -lmagic 2>&1 || \
+    gcc $M32 -O0 -g -w -o exploit exploit.c 2>&1 || echo "compile failed"
+    if [ -f /poc/exploit ]; then echo "SUCCESS"; file /poc/exploit; else echo "ERROR: failed to compile"; head -30 /poc/exploit.c; exit 1; fi
+    for c in $POC_COMPANIONS; do
+      stem="${c%.*}"
+      case "$c" in
+        *.c) ( gcc -O0 -g -w -o "/poc/$stem" "/poc/$c" -I"$PFX/include" -L"$PFX/lib" -Wl,-rpath,"$PFX/lib" -lmagic 2>&1 || gcc -O0 -g -w -o "/poc/$stem" "/poc/$c" 2>&1 || echo "WARN: companion $c" ) ;;
+        *.sh|*.py|*.pl|*.rb) chmod +x "/poc/$c" 2>/dev/null || true ;;
+      esac
+    done
+    USES=no
+    if LD_LIBRARY_PATH="$PFX/lib" ldd /poc/exploit 2>/dev/null | grep -q "$PFX"; then USES=yes; fi
+    echo "$USES" > /poc/.ssd_poc_uses_build; echo "poc_uses_project_build: $USES"
+
+  poc_launch_script: ""
+
+  patch_rebuild_script: |
+    #!/bin/bash
+    cd "$BUILD_DIR" || { echo "no build dir" > /tmp/ssd_rebuild.log; }
+    make -j"$(nproc)" -k > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
+    make install -k > /tmp/ssd_install.log 2>&1; echo "install exit: $?"
+    grep -B2 -A8 "error:" /tmp/ssd_rebuild.log 2>/dev/null | head -100 > /tmp/ssd_build_errors; true
+    case "$VULN_FILE" in
+      *.c) OBJ="$(basename "$VULN_FILE" .c).o"; find "$BUILD_DIR" -name "$OBJ" -newer "$SOURCE_DIR/$VULN_FILE" -print -quit > /tmp/ssd_obj_rebuilt; echo "obj_rebuilt: $(cat /tmp/ssd_obj_rebuilt)" ;;
+      *) echo skip > /tmp/ssd_obj_rebuilt ;;
+    esac
+    USES=no
+    if LD_LIBRARY_PATH="$INSTALL_PREFIX/lib" ldd /poc/exploit 2>/dev/null | grep -q "$INSTALL_PREFIX"; then USES=yes; fi
+    echo "$USES" > /tmp/ssd_poc_uses_build; echo "poc_uses_build: $USES"
+
+  # ---- Option A: in-tree regression test (UNTESTED) ----
+  # libtasn1 pattern. `file` ships tests/ (.c drivers + crafted sample files); a
+  # fix that adds a tests/ .c + a sample is harvestable. make check runs the suite.
+  intree_test:
+    build_script: |
+      #!/bin/bash
+      SRC="$SOURCE_DIR"; BD="$BUILD_DIR"; PFX="$INSTALL_PREFIX"
+      cd "$SRC" || exit 1
+      for mf in $(git diff-tree --no-commit-id --name-only -r "$FIX_COMMIT" 2>/dev/null | grep -E "Makefile\.am$|Makefile\.in$"); do
+        git checkout "$FIX_COMMIT" -- "$mf" 2>/dev/null && echo "overlaid makefile: $mf"
+      done
+      if [ ! -x "$SRC/configure" ]; then ( autoreconf -fi >/build/bootstrap.log 2>&1 || ./autogen.sh >/build/bootstrap.log 2>&1 ) || true; fi
+      cd "$BD" || exit 1; rm -rf ./*
+      "$SRC"/configure --prefix="$PFX" CFLAGS="-O2 -g -w" > /build/cfg.log 2>&1 && echo CONFIG_OK || { echo CONFIG_FAIL; tail -25 /build/cfg.log; }
+      make -j"$(nproc)" -k > /build/make.log 2>&1; echo "BUILD_RC=$?" >> /build/build_status
+      make install -k >> /build/make.log 2>&1 || true
+      tail -15 /build/make.log; echo "build complete"
+    run_script: |
+      #!/bin/bash
+      PFX="$INSTALL_PREFIX"
+      cd "$BUILD_DIR" || { echo "SSD_TEST_RESULT=NORESULT (no build dir)"; exit 2; }
+      if ! ls "$PFX"/lib/libmagic.so* "$BUILD_DIR"/src/.libs/libmagic.so* 2>/dev/null | grep -q .; then
+        echo "SSD_TEST_RESULT=NORESULT (no built libmagic to test against)"; exit 2
+      fi
+      export LD_LIBRARY_PATH="$PFX/lib:$BUILD_DIR/src/.libs"
+      export MAGIC="$PFX/share/misc/magic.mgc"
+      SUB="tests"; [ -n "$TEST_SUBDIR" ] && [ -d "$BUILD_DIR/$TEST_SUBDIR" ] && SUB="$TEST_SUBDIR"
+      echo "--- make -C $SUB check TESTS=$TEST_NAME ---"
+      timeout "${INTREE_TEST_TIMEOUT:-400}" make -C "$SUB" check TESTS="$TEST_NAME" > /tmp/mt.log 2>&1; rc=$?
+      tail -30 /tmp/mt.log
+      TRS="$BUILD_DIR/$SUB/$TEST_NAME.trs"
+      [ -f "$TRS" ] || { echo "no .trs (test not registered/built) — NORESULT"; echo "SSD_TEST_RESULT=NORESULT"; exit 2; }
+      cat "$TRS"
+      grep -qE ":test-result:[[:space:]]*PASS" "$TRS" && { echo "SSD_TEST_RESULT=PASS"; exit 0; }
+      grep -qE ":test-result:[[:space:]]*(FAIL|ERROR|XPASS)" "$TRS" && { echo "SSD_TEST_RESULT=FAIL"; exit 1; }
+      echo "SSD_TEST_RESULT=NORESULT"; exit 2
+
+  build_system: "autotools"
+  extra_configure_flags: []

@@ -1,0 +1,461 @@
+# =============================================================================
+# CVE Aggregator Pipeline – OpenSSL Configuration  (LARGE C, LIBRARY SHAPE)
+# =============================================================================
+# A large, high-profile C project after glibc/libxml2. OpenSSL is the GLIBC SHAPE
+# (C shared libraries — libssl.so / libcrypto.so — plus an `openssl` CLI), so it
+# reuses the SAME Phase-1/3 hooks (build_script / poc_prepare_script /
+# patch_rebuild_script) with a DIFFERENT build system (Perl Configure/config) and
+# DIFFERENT libraries. This is the candidate that runs CLOSEST to config-only —
+# no new pipeline code is required for the library-linking CVEs.
+#
+# HONEST SCOPE (read before running):
+#  * Library/parsing CVEs (ASN.1, X.509/PEM/DER, BN, EVP decode paths) reproduce
+#    well: a self-contained C PoC links the built libcrypto/libssl and feeds it a
+#    crafted blob — exactly the glibc/libxml2 mechanism.
+#  * Protocol / handshake CVEs (Heartbleed-style scanners, TLS-state bugs) need a
+#    RUNNING peer (s_server/s_client) — there is no service-start seam yet, so the
+#    negative filter sees the PoC fail to connect and routes them to MANUAL. That
+#    is expected, not a config bug.
+#  * `poc_analyzer.py`'s LLM execution-strategy prompts are still glibc-flavoured
+#    (the §3.1 coupling in docs/CPP_VERSATILITY_ANALYSIS.md). It only bites
+#    payload-generator/"OTHER" PoCs; self-contained PoCs use the generic path.
+# Build hooks are UNTESTED STARTING POINTS — expect first-run VM iteration (as glibc had).
+# Run: python3 pipeline.py --phase0-config cve_aggregator/openssl_config.yaml
+# =============================================================================
+
+project:
+  name: "openssl"
+  display_name: "OpenSSL"
+  description: "CVE and PoC dataset for OpenSSL"
+
+pipeline:
+  abort_on_error: false
+  skip_modules: []
+
+# Reproducer priority (see aggregator_config.yaml for all modes). ExploitDB PoC
+# preferred; the fix-commit test (Option A) is the fallback for CVEs with no PoC.
+# NOTE: "intree" only RUNS once this project has a phase1.intree_test recipe
+# (OpenSSL ships `make test`, but the recipe isn't written yet) — until then the
+# harvested tests route to manual and ExploitDB is the effective source.
+reproduction_strategy:
+  - exploitdb
+  - intree
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  file: "logs/openssl_cve_aggregator.log"
+
+# ---------------------------------------------------------------------------
+# Module 1: CVE Fetching
+# ---------------------------------------------------------------------------
+cve_fetcher:
+  nvd_api_key: "043bad81-616b-445a-8e79-96e87cc96c66"
+  keywords:
+    - "OpenSSL"
+  cpe_match:
+    - "cpe:2.3:a:openssl:openssl"
+  strong_keywords:
+    - "OpenSSL"
+    - "openssl"
+  # Exclude the forks and look-alike TLS stacks that co-mention OpenSSL.
+  non_target_indicators:
+    - "LibreSSL"
+    - "BoringSSL"
+    - "wolfSSL"
+    - "GnuTLS"
+    - "mbedTLS"
+    - "PolarSSL"
+    - "Mozilla NSS"
+    - "Network Security Services"
+    - "stunnel"
+    - "OpenVPN"
+    - "s2n"
+    - "matrixssl"
+  strict_target_matching: true
+  require_project_cpe_match: false
+  project_cpe_aliases:
+    - "openssl"
+    - "openssl:openssl"
+  enrich_with_cve_org: false
+  cve_org_delay: 1.0
+  # OpenSSL's earliest CVEs (and git history via the old CVS import) reach the
+  # late 1990s; keep a low floor.
+  min_published_year: 1999
+
+# ---------------------------------------------------------------------------
+# Module 2: Commit Discovery
+# ---------------------------------------------------------------------------
+commit_discovery:
+  repo_url: "https://github.com/openssl/openssl.git"
+  repo_local_path: "../openssl"
+  clone_timeout: 1200
+  harvest_regression_tests: false
+  auto_update: true
+  extra_grep_patterns: []
+  # OpenSSL fix commits reliably cite the CVE id; it never used Bugzilla (its
+  # tracker is RT/GitHub), so the numeric bug-id fallback is off.
+  enable_bz_fallback: false
+  allow_unscoped_extra_patterns: false
+  bugzilla_hosts: []
+  enable_online_bug_resolution: false
+  source_extensions:
+    - ".c"
+    - ".h"
+
+# ---------------------------------------------------------------------------
+# Module 3: PoC Mapping (ExploitDB)
+# ---------------------------------------------------------------------------
+poc_mapper:
+  exploitdb_path: "../exploit-database"
+  exploitdb_remote_url: "https://gitlab.com/exploit-database/exploitdb.git"
+  auto_update: true
+  deep_search: true                      # many OpenSSL PoCs name the CVE only in-source
+  extract_content: true
+  reverse_search: true
+  enable_reverse_content_grep: true
+  # OpenSSL has a healthy mix of verified and community PoCs; keep recall high.
+  require_verified: false
+  prefer_platforms:
+    - "linux"
+  non_target_indicators:
+    - "LibreSSL"
+    - "BoringSSL"
+    - "Windows"
+
+# ---------------------------------------------------------------------------
+# Module 4–7: Aggregator / Validation / Repair / Output
+# ---------------------------------------------------------------------------
+data_aggregator:
+  global_json_path: "results/openssl_cve_poc_map.json"
+  prune_missing_cves: true
+
+syntax_validator:
+  manual_supervision_dir: "manual_supervision"
+  report_path: "results/openssl_syntax_validation_report.json"
+  allow_manual_without_commit: false
+
+poc_repair:
+  provider: "openai"
+  openai_model: "gpt-4.1-mini"
+  openai_api_key: ""
+  api_endpoint: "http://10.3.2.171:80/api/chat"
+  model: "devstral:32k"
+  max_repair_attempts: 3
+  models_by_attempt:
+    1: "gpt-4.1-mini"
+    2: "gpt-5-mini"
+    3: "gpt-4.1"
+  api_timeout: 600
+  model_load_timeout: 300
+  num_ctx: 32768
+  max_poc_chars: 0
+  temperature: 0.4
+  report_path: "results/openssl_poc_repair_report.json"
+  manual_review_queue_path: "results/openssl_manual_review_queue.json"
+  gpu_wait_timeout: 120
+
+output:
+  global_json_path: "results/openssl_cve_poc_map.json"
+  filtered_json_path: "results/openssl_cve_poc_map_filtered.json"
+  csv_path: "results/openssl_cve_poc_complete.csv"
+  poc_dir: "exploits"
+  filtered_require_commit: false
+  filtered_require_poc: true
+  filtered_require_verified_poc: false
+  flag_unvalidated_edb_for_manual_review: true
+  manual_supervision_dir: "manual_supervision"
+  allow_poc_without_commit: false
+  csv_fields:
+    - "CVE"
+    - "V_COMMIT"
+    - "FilePath"
+    - "F_NAME"
+    - "UNIT_TYPE"
+    - "V_FILE"
+    - "V_FUNCTION"
+    - "CVE_Description"
+    - "CWE"
+    - "CWE_Description"
+    - "project_version"
+    - "project_version_normalized"
+    - "ubuntu_version"
+    - "poc_index"
+    - "poc_path"
+    - "poc_language"
+    - "FIX_COMMIT"
+    - "TEST_PATH"
+    - "TEST_SUBDIR"
+    - "manual_review_required"
+    - "manual_verified"
+
+# ---------------------------------------------------------------------------
+# Phase 2: LLM patch generation (C)
+# ---------------------------------------------------------------------------
+phase2:
+  language: "c"
+  system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for OpenSSL (the TLS/SSL and general-purpose cryptography library). Your task
+    is to fix a security vulnerability by making the SMALLEST POSSIBLE EDIT to the
+    vulnerable function — never by rewriting it.
+  feedback_system_prompt: >-
+    You are an expert C security engineer specializing in vulnerability patching
+    for OpenSSL. Your previous patch attempt FAILED validation. Analyze the
+    failure and produce an improved fix as MINIMAL edits — never rewrite the whole
+    function.
+  internal_headers: []
+
+# ---------------------------------------------------------------------------
+# Phase 3: SAST (C stack — same as glibc/libxml2/kernel)
+# ---------------------------------------------------------------------------
+sast:
+  enabled: true
+  fail_on: [critical, high]
+  tool_timeout: 180
+  tools:
+    - name: cppcheck
+      detect: cppcheck
+      cmd: ["cppcheck", "--enable=all", "--xml", "--xml-version=2", "{file}"]
+      parser: cppcheck-xml
+      install: { apt: cppcheck }
+    - name: clang-tidy
+      detect: clang-tidy
+      cmd: ["clang-tidy", "--quiet", "--checks=clang-analyzer-*,bugprone-*,cert-*", "{file}", "--"]
+      parser: regex
+      regex: '^(.+?):(\d+):(\d+):\s+(warning|error):\s+(.+?)\s+\[([^\]]+)\]$'
+      groups: { file: 1, line: 2, column: 3, severity: 4, message: 5, rule: 6 }
+      severity_map: { warning: medium, error: high }
+      install: { apt: clang-tidy }
+    - name: semgrep
+      detect: semgrep
+      cmd: ["semgrep", "scan", "--sarif", "--quiet", "--metrics=off", "--config=p/c", "{file}"]
+      parser: sarif
+      install: { pip: semgrep }
+    - name: flawfinder
+      detect: flawfinder
+      cmd: ["flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      fallback_cmd: ["{python}", "-m", "flawfinder", "--minlevel=1", "--dataonly", "--quiet", "{file}"]
+      parser: flawfinder
+      install: { pip: flawfinder }
+
+# ---------------------------------------------------------------------------
+# Phase 1: reproduction (shared with Phase 3)
+# ---------------------------------------------------------------------------
+phase1:
+  project_repo_local_path: "../openssl"
+  project_repo_remote_url: "https://github.com/openssl/openssl.git"
+  docker_base_image_prefix: "ai-ssd/openssl-base"
+  docker_cve_image_prefix: "ai-ssd/openssl-cve"
+  image_manifest_path: "results/openssl_image_manifest.json"
+  source_dir_name: "project-src"
+  build_dir_name: "project-build"
+  install_prefix: "/opt/project-build"
+
+  # OpenSSL's Configure is a Perl script; perl + a C toolchain is all that's
+  # required. No external crypto deps (it is the crypto).
+  base_packages:
+    - build-essential
+    - perl
+  base_packages_optional:
+    - wget
+    - zlib1g-dev
+    - gcc-multilib
+    - g++-multilib
+  base_setup: |
+    dpkg --add-architecture i386 && apt-get update && apt-get install -y libc6-dev-i386 || true
+
+  # OpenSSL builds across eras; old branches (0.9.8/1.0.x) want older toolchains.
+  # Map by commit date — older trees get older Ubuntu bases.
+  commit_era_map:
+    1999: "14.04"
+    2005: "14.04"
+    2008: "14.04"
+    2010: "14.04"
+    2012: "14.04"
+    2014: "16.04"
+    2016: "16.04"
+    2017: "18.04"
+    2018: "18.04"
+    2019: "20.04"
+    2020: "20.04"
+    2021: "22.04"
+    2022: "22.04"
+    2023: "24.04"
+    2024: "24.04"
+    2025: "24.04"
+    2026: "24.04"
+
+  version_file: ""
+  version_regex: ''
+  version_era_map: {}
+  enable_arch_fallback: true
+
+  poc_run_env: {}
+
+  # ---- build_script — STARTING POINT, UNTESTED ----
+  # OpenSSL is built IN-TREE (out-of-tree builds only landed in 1.1.1+, and the
+  # CVE set spans much older branches), so build in $SOURCE_DIR and install the
+  # software-only target (install_sw skips the slow man-page build). `shared`
+  # forces .so libraries the PoC can link. i386 uses the 32-bit config target.
+  # Writes the /build/build_status markers Phase 1/3 read.
+  build_script: |
+    #!/bin/bash
+    SRC="$SOURCE_DIR"; PFX="$INSTALL_PREFIX"
+    cd "$SRC" || exit 1
+    # Choose the config entrypoint: ./config auto-detects; i386 needs the 32-bit
+    # target. Older trees only have ./config (no ./Configure target list needed).
+    if [ "$BUILD_ARCH" = "i386" ]; then
+      CONFCMD="setarch i386 ./config -m32"
+    else
+      CONFCMD="./config"
+    fi
+    ( $CONFCMD --prefix="$PFX" --openssldir="$PFX/ssl" shared -w -Wno-error 2>&1 && echo CONFIGURE_OK ) \
+      > /build/cfg.log 2>&1 \
+      || ( echo "=== retry: no-asm ==="; make clean >/dev/null 2>&1; $CONFCMD --prefix="$PFX" --openssldir="$PFX/ssl" shared no-asm -w 2>&1 && echo CONFIGURE_OK ) \
+      > /build/cfg.log 2>&1 \
+      || { echo "CONFIGURE_FAIL"; tail -30 /build/cfg.log; }
+    # depend target is needed by some old branches before the main build.
+    make depend > /build/depend.log 2>&1 || true
+    # Build LIBS+APPS only, NOT the test suite. OpenSSL's default `all` target
+    # compiles test/*, and a single era-incompatible test that won't build sinks
+    # the whole `make` even though libssl/libcrypto are fine (this is what failed
+    # CVE-2017-3730). `build_sw` (1.1.x/3.x) builds exactly what install_sw needs;
+    # older trees (no build_sw target) fall back to a tolerant `make -k`.
+    ( make -j"$(nproc)" build_sw 2>/dev/null || make -j"$(nproc)" -k ) > /build/make.log 2>&1
+    echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
+    # install_sw = libs + headers + openssl binary, no docs (much faster than install).
+    ( make install_sw -k || make install -k ) > /build/make_install.log 2>&1; echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status
+    # Marker = presence of a shared libssl OR libcrypto in lib/ or lib64/ (the real
+    # project artifact), NOT the make exit code (which can be non-zero for an
+    # unrelated target while the libs built fine).
+    # NOTE: `ls a b c d` returns non-zero if ANY arg is missing (a normal install
+    # has lib/ XOR lib64/), which would falsely mark INSTALLED=no. Pipe through
+    # grep so the marker is "yes" when ANY libssl/libcrypto .so exists.
+    if ls "$PFX"/lib/libssl.so* "$PFX"/lib64/libssl.so* "$PFX"/lib/libcrypto.so* "$PFX"/lib64/libcrypto.so* 2>/dev/null | grep -q .; then echo "PROJECT_BUILD_INSTALLED=yes" >> /build/build_status; else echo "PROJECT_BUILD_INSTALLED=no" >> /build/build_status; fi
+    echo "build complete"
+
+  # ---- poc_prepare_script — compile the PoC against the project OpenSSL ----
+  # Library shape (like glibc/libxml2): link the build's libssl/libcrypto and run
+  # under the system loader with LD_LIBRARY_PATH at the project lib (the default
+  # poc_launch). Honesty = the PoC resolves the project's libcrypto/libssl. The
+  # lib dir is lib or lib64 depending on the era/config — probe both.
+  poc_prepare_script: |
+    #!/bin/bash
+    PFX="$INSTALL_PREFIX"
+    M32=""; [ "$BUILD_ARCH" = "i386" ] && M32="-m32"
+    cd /poc
+    if grep -qE '^[[:space:]]*(int|void)?[[:space:]]*main[[:space:]]*\(' /poc/exploit_raw.c; then
+      cp /poc/exploit_raw.c /poc/exploit.c
+    else
+      echo '#include <stdio.h>' > /poc/exploit.c
+      echo '#include <stdlib.h>' >> /poc/exploit.c
+      echo '#include <string.h>' >> /poc/exploit.c
+      cat /poc/exploit_raw.c >> /poc/exploit.c
+      echo '' >> /poc/exploit.c
+      echo 'int main(int argc, char *argv[]) { puts("fragment loaded"); return 0; }' >> /poc/exploit.c
+    fi
+    LIBDIR="$PFX/lib"; ls "$PFX"/lib64/libssl.so* >/dev/null 2>&1 && LIBDIR="$PFX/lib64"
+    INC="-I$PFX/include"
+    rm -f /poc/exploit
+    gcc $M32 -O0 -g -w -D_GNU_SOURCE -o exploit exploit.c $INC -L"$LIBDIR" -Wl,-rpath,"$LIBDIR" -lssl -lcrypto -ldl -lpthread -lm 2>&1 || \
+    gcc $M32 -O0 -g -w -D_GNU_SOURCE -o exploit exploit.c $INC -L"$LIBDIR" -Wl,-rpath,"$LIBDIR" -lcrypto -ldl -lpthread 2>&1 || \
+    gcc $M32 -O0 -g -w -D_GNU_SOURCE -o exploit exploit.c -lssl -lcrypto 2>&1 || \
+    gcc $M32 -O0 -g -w -o exploit exploit.c 2>&1 || \
+    echo "compile failed"
+    if [ -f /poc/exploit ]; then echo "SUCCESS"; file /poc/exploit; else echo "ERROR: failed to compile"; head -30 /poc/exploit.c; exit 1; fi
+    for c in $POC_COMPANIONS; do
+      stem="${c%.*}"
+      case "$c" in
+        *.c) ( gcc -O0 -g -w -o "/poc/$stem" "/poc/$c" -lssl -lcrypto 2>&1 || gcc -O0 -g -w -o "/poc/$stem" "/poc/$c" 2>&1 || echo "WARN: companion $c" ) ;;
+        *.sh|*.py|*.pl|*.rb) chmod +x "/poc/$c" 2>/dev/null || true ;;
+      esac
+    done
+    USES=no
+    if LD_LIBRARY_PATH="$LIBDIR" ldd /poc/exploit 2>/dev/null | grep -q "$PFX"; then USES=yes; fi
+    echo "$USES" > /poc/.ssd_poc_uses_build; echo "poc_uses_project_build: $USES"
+
+  # No project loader needed — default launch (direct run, LD_LIBRARY_PATH=$RUN_LIB)
+  # is correct. The generic wrapper sets RUN_LIB to install_prefix/lib; if the era
+  # installs to lib64 the rpath baked above still resolves the project libs.
+  poc_launch_script: ""
+
+  # ---- patch_rebuild_script — incremental in-tree make + markers ----
+  # OpenSSL builds in-tree, so the patched file lands in SOURCE_DIR and we rebuild
+  # there (NOT BUILD_DIR, which OpenSSL doesn't use here).
+  patch_rebuild_script: |
+    #!/bin/bash
+    cd "$SOURCE_DIR" || { echo "no source dir" > /tmp/ssd_rebuild.log; }
+    # Libs-only incremental rebuild (mirror build_script: skip the test suite).
+    ( make -j"$(nproc)" build_sw 2>/dev/null || make -j"$(nproc)" -k ) > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
+    ( make install_sw -k || make install -k ) > /tmp/ssd_install.log 2>&1; echo "install exit: $?"
+    grep -B2 -A8 "error:" /tmp/ssd_rebuild.log 2>/dev/null | head -100 > /tmp/ssd_build_errors; true
+    case "$VULN_FILE" in
+      *.c) OBJ="$(basename "$VULN_FILE" .c).o"; find "$SOURCE_DIR" -name "$OBJ" -newer "$SOURCE_DIR/$VULN_FILE" -print -quit > /tmp/ssd_obj_rebuilt; echo "obj_rebuilt: $(cat /tmp/ssd_obj_rebuilt)" ;;
+      *) echo skip > /tmp/ssd_obj_rebuilt ;;
+    esac
+    LIBDIR="$INSTALL_PREFIX/lib"; ls "$INSTALL_PREFIX"/lib64/libssl.so* >/dev/null 2>&1 && LIBDIR="$INSTALL_PREFIX/lib64"
+    USES=no
+    if LD_LIBRARY_PATH="$LIBDIR" ldd /poc/exploit 2>/dev/null | grep -q "$INSTALL_PREFIX"; then USES=yes; fi
+    echo "$USES" > /tmp/ssd_poc_uses_build; echo "poc_uses_build: $USES"
+
+  # ---- Option A: in-tree regression test (poc_language: intree-test) ----
+  # STARTING POINT, UNTESTED — expect VM iteration (as glibc's recipe needed).
+  # Fires for CVEs whose fixing commit ADDS a test/*.c that is_regression_test_path()
+  # harvests (TEST_PATH=test/foo_test.c, TEST_SUBDIR=test, TEST_NAME=foo_test,
+  # FIX_COMMIT set). The pipeline checks out the VULNERABLE commit and overlays the
+  # files the fix ADDED (the test), keeping the source vulnerable; build_script then
+  # builds, run_script runs ONLY that test. Verdict: the test FAILS on the vulnerable
+  # build = reproduced. Env available: SOURCE_DIR, BUILD_DIR, INSTALL_PREFIX,
+  # TEST_SUBDIR, TEST_NAME, TEST_PATH, FIX_COMMIT, COMMIT_HASH.
+  # NOTE on coverage: with reproduction_strategy [exploitdb, intree], intree is only
+  # used for CVEs with NO ExploitDB PoC. Flip to [intree, exploitdb] to PREFER tests.
+  # OpenSSL's test system differs by era (1.0.x test/Makefile + test/*test binaries;
+  # 1.1.x/3.x test/build.info + perl recipes) — both paths are attempted below.
+  intree_test:
+    build_script: |
+      #!/bin/bash
+      cd "$SOURCE_DIR" || exit 1
+      # Overlay the test-registration metadata the fix changed (build.info for
+      # 1.1.x/3.x, test/Makefile for 1.0.x) so the harvested test is REGISTERED,
+      # without touching the vulnerable source (metadata carries no vulnerability).
+      for mf in $(git diff-tree --no-commit-id --name-only -r "$FIX_COMMIT" 2>/dev/null | grep -E '(^|/)(build\.info|Makefile|configure\.ac)$'); do
+        git checkout "$FIX_COMMIT" -- "$mf" 2>/dev/null && echo "overlaid: $mf"
+      done
+      ( ./config --prefix="$INSTALL_PREFIX" shared -w -Wno-error 2>&1 && echo CONFIGURE_OK ) > /build/cfg.log 2>&1 \
+        || { echo CONFIGURE_FAIL; tail -25 /build/cfg.log; }
+      make depend > /build/depend.log 2>&1 || true
+      # Build the libs (build_sw skips the full test suite), then the specific test
+      # binary if the target exists; tolerate failures of unrelated targets.
+      ( make -j"$(nproc)" build_sw 2>/dev/null || make -j"$(nproc)" -k ) > /build/make.log 2>&1
+      make -j"$(nproc)" "test/$TEST_NAME" >> /build/make.log 2>&1 || true
+      echo "BUILD_RC=$?" >> /build/build_status
+      tail -15 /build/make.log; echo "build complete"
+    run_script: |
+      #!/bin/bash
+      cd "$SOURCE_DIR" || { echo "SSD_TEST_RESULT=NORESULT (no source dir)"; exit 2; }
+      # Build-honesty gate: must have built shared libs to test against; never fall
+      # through to the system OpenSSL (that would give a meaningless verdict).
+      if ! ls "$SOURCE_DIR"/libssl.so* "$INSTALL_PREFIX"/lib/libssl.so* "$INSTALL_PREFIX"/lib64/libssl.so* 2>/dev/null | grep -q .; then
+        echo "SSD_TEST_RESULT=NORESULT (no built libssl to test against)"; exit 2
+      fi
+      export LD_LIBRARY_PATH="$SOURCE_DIR:$INSTALL_PREFIX/lib:$INSTALL_PREFIX/lib64"
+      # Strategy 1: run the harvested test binary directly through the build libs.
+      TBIN="$SOURCE_DIR/test/$TEST_NAME"
+      if [ -x "$TBIN" ]; then
+        echo "--- running test binary: test/$TEST_NAME ---"
+        timeout "${INTREE_TEST_TIMEOUT:-300}" "$TBIN" > /tmp/it.log 2>&1; rc=$?
+        tail -25 /tmp/it.log
+        if [ "$rc" -eq 0 ]; then echo "SSD_TEST_RESULT=PASS"; exit 0; else echo "SSD_TEST_RESULT=FAIL"; exit 1; fi
+      fi
+      # Strategy 2: the perl harness (1.1.x/3.x). TEST_NAME may be the program name;
+      # the recipe is usually test_<name> — try both. not-ok/FAILED ⇒ FAIL.
+      echo "--- test binary not found; trying perl harness (make test) ---"
+      timeout "${INTREE_TEST_TIMEOUT:-600}" make test "TESTS=$TEST_NAME ${TEST_NAME#test_} test_${TEST_NAME}" > /tmp/mt.log 2>&1; rc=$?
+      tail -30 /tmp/mt.log
+      grep -qiE "^not ok|FAILED|ERROR IN" /tmp/mt.log && { echo "SSD_TEST_RESULT=FAIL"; exit 1; }
+      [ "$rc" -eq 0 ] && { echo "SSD_TEST_RESULT=PASS"; exit 0; }
+      echo "SSD_TEST_RESULT=NORESULT"; exit 2
+
+  build_system: "custom"
+  extra_configure_flags: []

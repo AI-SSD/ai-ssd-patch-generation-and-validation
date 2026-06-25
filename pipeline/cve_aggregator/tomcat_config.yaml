@@ -21,6 +21,14 @@ pipeline:
   abort_on_error: false          # Continue even if one module fails
   skip_modules: []
 
+# Reproducer priority (see aggregator_config.yaml for all modes). ExploitDB
+# preferred; fix-commit test (Option A) as fallback. NOTE: Tomcat has no
+# phase1.intree_test recipe and its Java/server tests don't run in this Docker
+# model, so "intree" CVEs route to manual — ExploitDB is the effective source.
+reproduction_strategy:
+  - exploitdb
+  - intree
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -41,6 +49,12 @@ cve_fetcher:
   keywords:
     - "Apache Tomcat"
     - "tomcat"
+
+  # CPE match — sent as virtualMatchString to NVD 2.0; selects CVEs NVD records as
+  # genuinely AFFECTING the product (version-ranged), far more precise/complete
+  # than keyword search. Merged + de-duped with keyword results. Mirrors glibc.
+  cpe_match:
+    - "cpe:2.3:a:apache:tomcat"
 
   # Strong keywords that MUST appear in a CVE description for it to be
   # considered relevant.  Used for deduplication filtering.
@@ -106,7 +120,7 @@ commit_discovery:
   repo_url: "https://github.com/apache/tomcat.git"
 
   # Local path to the cloned repository (relative to CWD or absolute).
-  repo_local_path: "./tomcat"
+  repo_local_path: "../tomcat"
 
   # Timeout (seconds) for the initial git clone.
   # Tomcat repo is ~350 MB — 600 s (10 min) is generous.
@@ -141,7 +155,7 @@ poc_mapper:
   # Local path to the ExploitDB git repository.
   # Points to the shared clone at the pipeline root (two levels up from
   # the per-project working directory projects/<name>/).
-  exploitdb_path: "../../exploit-database"
+  exploitdb_path: "../exploit-database"
 
   # Remote URL (for auto-clone)
   exploitdb_remote_url: "https://gitlab.com/exploit-database/exploitdb.git"
@@ -284,6 +298,9 @@ output:
     - "poc_index"
     - "poc_path"
     - "poc_language"
+    - "FIX_COMMIT"
+    - "TEST_PATH"
+    - "TEST_SUBDIR"
     - "manual_review_required"
     - "manual_verified"
 
@@ -351,7 +368,7 @@ sast:
 # ---------------------------------------------------------------------------
 phase1:
   # Local path to the project source repository (relative to pipeline base_dir)
-  project_repo_local_path: "tomcat"
+  project_repo_local_path: "../tomcat"
 
   # Remote URL used to clone the repo when it is absent locally
   project_repo_remote_url: "https://github.com/apache/tomcat.git"
@@ -412,3 +429,60 @@ phase1:
     2024: "24.04"
     2025: "24.04"
     2026: "24.04"
+
+  # ---- Base image packages (JDK + Ant to build/run Tomcat) ----
+  # default-jdk/ant come from each Ubuntu era's repos, roughly matching the
+  # JDK the era's Tomcat wants (see commit_era_map). REQUIRED for Phase 1.
+  base_packages:
+    - default-jdk
+    - ant
+  base_packages_optional:
+    - wget
+    - unzip
+  base_setup: ""
+
+  # No project-version file is read (Gate B disabled) — era comes from the
+  # commit date via commit_era_map above.
+  version_file: ""
+  version_regex: ''
+  version_era_map: {}
+
+  poc_run_env: {}
+
+  # ---- build_script — STARTING POINT, UNTESTED ----
+  # Tomcat builds with Apache Ant (build.xml -> ./output/build). Verify/iterate on
+  # the first VM run (targets, build.properties, JDK/Ant version per era). Writes
+  # the /build/build_status markers Phase 1/3 read.
+  build_script: |
+    #!/bin/bash
+    cd "$SOURCE_DIR" || exit 1
+    ant > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status
+    tail -20 /build/make.log
+    if [ -d "$SOURCE_DIR/output/build" ]; then
+      mkdir -p "$INSTALL_PREFIX"; cp -a "$SOURCE_DIR/output/build/." "$INSTALL_PREFIX/" 2>/dev/null
+      echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status
+    else
+      echo "PROJECT_INSTALL_EXIT_CODE=1" >> /build/build_status
+    fi
+    if [ -x "$INSTALL_PREFIX/bin/catalina.sh" ]; then echo "PROJECT_BUILD_INSTALLED=yes" >> /build/build_status; else echo "PROJECT_BUILD_INSTALLED=no" >> /build/build_status; fi
+    echo "build complete"
+
+  # ---- Reproduction hooks: NOT YET IMPLEMENTED (Stage 4) ----
+  # Tomcat PoCs are interpreted HTTP clients that hit a RUNNING server, so:
+  #  * poc_prepare_script/poc_launch_script (compiled-C model) DON'T apply — left
+  #    empty; interpreted PoCs use the pipeline's built-in language templates.
+  #  * Reproduction needs a NEW project-level "start the server + readiness" step
+  #    (phase1.service_start_script) that the run wrapper does not yet support, and
+  #    the no-per-CVE-config rule excludes the CVEs needing special server config.
+  #    See docs/STAGE4_TOMCAT_DESIGN.md. Until then Phase 1 routes Tomcat CVEs to
+  #    manual (build can succeed; reproduction cannot).
+  poc_prepare_script: ""
+  poc_launch_script: ""
+  # patch_rebuild_script — STARTING POINT, UNTESTED (incremental ant recompile).
+  patch_rebuild_script: |
+    #!/bin/bash
+    cd "$SOURCE_DIR" || { echo "no source dir" > /tmp/ssd_rebuild.log; }
+    ant > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
+    grep -B2 -A8 -iE "error:|\\[javac\\].*error" /tmp/ssd_rebuild.log 2>/dev/null | head -100 > /tmp/ssd_build_errors; true
+    echo skip > /tmp/ssd_obj_rebuilt
+    echo yes > /tmp/ssd_poc_uses_build

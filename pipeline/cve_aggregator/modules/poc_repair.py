@@ -24,6 +24,10 @@ import requests
 
 from ..models import CVEEntry, Dataset, SyntaxValidationResult
 from ..utils.file_utils import get_file_extension_for_language
+from ..utils.llm_compat import (
+    is_unsupported_temperature_error,
+    openai_temperature_kwargs,
+)
 from .base import PipelineModule
 from .syntax_validator import SyntaxValidator
 
@@ -508,6 +512,54 @@ class PoCRepairLLM(PipelineModule):
             for k, v in (cfg.get("models_by_attempt") or {}).items()
             if v
         }
+
+        # ---- Provider-profile (env) overrides ---------------------------------
+        # run_project.sh --profile exports LLM_*/OLLAMA_* so Phase 0 PoC repair
+        # runs on the SAME AI family as Phases 1-2 without editing this YAML.
+        # Precedence: env var > project-YAML poc_repair: > default. No-op when
+        # unset (legacy behaviour).
+        def _envv(name: str) -> Optional[str]:
+            v = _os.environ.get(name)
+            return v if v not in (None, "") else None
+
+        if _envv("LLM_PROVIDER"):
+            provider = _envv("LLM_PROVIDER").lower()
+        if _envv("LLM_ENDPOINT"):
+            api_endpoint = _envv("LLM_ENDPOINT")
+        if _envv("LLM_OPENAI_MODEL"):
+            openai_model = _envv("LLM_OPENAI_MODEL")
+        if _envv("LLM_MODEL"):
+            model = _envv("LLM_MODEL")
+        if _envv("LLM_TIMEOUT"):
+            try:
+                api_timeout = int(_envv("LLM_TIMEOUT"))
+            except ValueError:
+                pass
+        if _envv("LLM_NUM_CTX"):
+            try:
+                num_ctx = int(_envv("LLM_NUM_CTX"))
+            except ValueError:
+                pass
+        if _envv("LLM_TEMPERATURE"):
+            try:
+                temperature = float(_envv("LLM_TEMPERATURE"))
+            except ValueError:
+                pass
+        _ou, _op = _envv("OLLAMA_USERNAME"), _envv("OLLAMA_PASSWORD")
+        self._ollama_auth = (_ou, _op) if (_ou and _op) else None
+        self._openai_base_url = _envv("LLM_OPENAI_BASE_URL") or ""
+        _env_ramp = _envv("LLM_MODELS_BY_ATTEMPT")
+        if _env_ramp:
+            _ramp = [m.strip() for m in _env_ramp.split(",") if m.strip()]
+            if _ramp:
+                models_by_attempt = {str(i + 1): m for i, m in enumerate(_ramp)}
+                if provider == "openai":
+                    openai_model = _ramp[0]
+                else:
+                    model = _ramp[0]
+        # Recompute base model after any provider/model override above.
+        base_model = openai_model if provider == "openai" else model
+
         if models_by_attempt:
             self.logger.info(
                 "PoC repair per-attempt model schedule: %s", models_by_attempt
@@ -1344,9 +1396,15 @@ class PoCRepairLLM(PipelineModule):
             {"role": "user", "content": user_prompt},
         ]
 
-        options: Dict[str, Any] = {"temperature": temperature}
-        if num_ctx:
-            options["num_ctx"] = num_ctx
+        # Always pin num_ctx: without it the Ollama server falls back to its tiny
+        # default (2048 tokens), silently truncating the prompt even on a 32k-window
+        # model. Fall back to 32768 (the qwen2.5 native window / LLM_NUM_CTX
+        # convention) when unset — matching poc_analyzer.py and patch_generator.py.
+        effective_ctx = num_ctx if num_ctx else 32768
+        options: Dict[str, Any] = {
+            "temperature": temperature,
+            "num_ctx": effective_ctx,
+        }
 
         payload = {
             "model": model,
@@ -1358,7 +1416,6 @@ class PoCRepairLLM(PipelineModule):
         # Rough token estimate (~4 chars/token for code).
         total_chars = len(system_prompt) + len(user_prompt)
         est_prompt_tokens = total_chars // 4
-        effective_ctx = num_ctx or 4096
         if est_prompt_tokens > effective_ctx * 0.8:
             self.logger.warning(
                 "  Prompt may exceed context window (~%d tokens vs num_ctx=%d). "
@@ -1389,7 +1446,8 @@ class PoCRepairLLM(PipelineModule):
                     attempt + 1, max_retries, model,
                 )
                 response = requests.post(
-                    api_endpoint, json=payload, timeout=timeout
+                    api_endpoint, json=payload, timeout=timeout,
+                    auth=getattr(self, "_ollama_auth", None),
                 )
                 response.raise_for_status()
 
@@ -1464,7 +1522,11 @@ class PoCRepairLLM(PipelineModule):
                 "variable or poc_repair.openai_api_key in the config file."
             )
 
-        client = OpenAI(api_key=openai_api_key, timeout=timeout)
+        _oai_kwargs: Dict[str, Any] = {"api_key": openai_api_key, "timeout": timeout}
+        _base_url = getattr(self, "_openai_base_url", "")
+        if _base_url:
+            _oai_kwargs["base_url"] = _base_url
+        client = OpenAI(**_oai_kwargs)
         metadata: Dict[str, Any] = {
             "model": model,
             "provider": "openai",
@@ -1473,6 +1535,11 @@ class PoCRepairLLM(PipelineModule):
             "success": False,
             "error": None,
         }
+
+        # gpt-5 / o-series reasoning models reject any non-default temperature;
+        # omit it for them up front. The APIError handler below is the runtime
+        # safety net for a model the name heuristic misses.
+        sampling = openai_temperature_kwargs(model, temperature)
 
         for attempt in range(max_retries):
             try:
@@ -1486,7 +1553,7 @@ class PoCRepairLLM(PipelineModule):
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    temperature=temperature,
+                    **sampling,
                 )
                 content = completion.choices[0].message.content or ""
                 usage = completion.usage
@@ -1522,6 +1589,16 @@ class PoCRepairLLM(PipelineModule):
                 )
                 metadata["error"] = str(exc)
                 metadata["retries"] = attempt + 1
+                # Runtime fallback: a reasoning model the name heuristic missed
+                # rejects a custom temperature — drop it and retry immediately
+                # (no delay; it's a parameter fix, not a transient failure).
+                if "temperature" in sampling and is_unsupported_temperature_error(exc):
+                    self.logger.info(
+                        "  Model %s rejects a custom temperature — dropping it and retrying.",
+                        model,
+                    )
+                    sampling.pop("temperature", None)
+                    continue
 
             if attempt < max_retries - 1:
                 self.logger.info("  Retrying in %d s …", retry_delay)
@@ -1569,7 +1646,8 @@ class PoCRepairLLM(PipelineModule):
         parsed = urlparse(api_endpoint)
         base_url = urlunparse((parsed.scheme, parsed.netloc, "/api/tags", "", "", ""))
         try:
-            resp = requests.get(base_url, timeout=10)
+            resp = requests.get(base_url, timeout=10,
+                                 auth=getattr(self, "_ollama_auth", None))
             resp.raise_for_status()
             self.logger.info(
                 "✓ LLM API health check passed (%s reachable, %d models listed)",
@@ -1613,7 +1691,8 @@ class PoCRepairLLM(PipelineModule):
         parsed = urlparse(api_endpoint)
         ps_url = urlunparse((parsed.scheme, parsed.netloc, "/api/ps", "", "", ""))
         try:
-            resp = requests.get(ps_url, timeout=5)
+            resp = requests.get(ps_url, timeout=5,
+                                 auth=getattr(self, "_ollama_auth", None))
             resp.raise_for_status()
             running = resp.json().get("models", [])
 
@@ -1677,7 +1756,8 @@ class PoCRepairLLM(PipelineModule):
 
         while True:
             try:
-                resp = requests.get(ps_url, timeout=10)
+                resp = requests.get(ps_url, timeout=10,
+                                    auth=getattr(self, "_ollama_auth", None))
                 resp.raise_for_status()
                 running = resp.json().get("models", [])
                 total_vram = sum(e.get("size_vram", 0) for e in running)
@@ -1727,6 +1807,7 @@ class PoCRepairLLM(PipelineModule):
                     gen_url,
                     json={"model": model, "keep_alive": "10m"},
                     timeout=timeout,
+                    auth=getattr(self, "_ollama_auth", None),
                 )
             except Exception:
                 pass  # expected — loading large model may take a while
@@ -1737,7 +1818,8 @@ class PoCRepairLLM(PipelineModule):
         start = time.time()
         while True:
             try:
-                resp = requests.get(ps_url, timeout=5)
+                resp = requests.get(ps_url, timeout=5,
+                                    auth=getattr(self, "_ollama_auth", None))
                 resp.raise_for_status()
                 for entry in resp.json().get("models", []):
                     if model_base in entry.get("name", "").lower():

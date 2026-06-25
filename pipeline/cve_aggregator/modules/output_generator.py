@@ -10,6 +10,7 @@ Produces all final artefacts:
 
 from __future__ import annotations
 
+import base64
 import csv
 import io
 import json
@@ -24,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from ..models import CVEEntry, Dataset
+from .base import parse_reproduction_strategy
 from ..utils.cwe_lookup import get_cwe_descriptions
 from ..utils.file_utils import (
     clean_poc_content,
@@ -481,12 +483,20 @@ class OutputGenerator(PipelineModule):
                 return None
             self._write_manual_poc_report(cve_id, entry, cfg)
 
-        # ---- Save ALL PoC files and collect per-exploit info ----
-        poc_infos: List[Dict[str, Any]] = []  # one dict per valid exploit
+        # ---- Save PoC files per the reproduction_strategy (ordered priority) ----
+        # Each source emits into its own list; only sources in the strategy run
+        # (gated via the loop iterable, so the loop bodies are untouched). The two
+        # lists are then assembled in strategy order so the PRIMARY reproducer
+        # (poc_index 0, the one Phase 1 uses) is the prioritised source.
+        strategy = parse_reproduction_strategy(self.config)
+        do_exploitdb = "exploitdb" in strategy
+        do_intree = "intree" in strategy
+        exploitdb_infos: List[Dict[str, Any]] = []
+        intree_infos: List[Dict[str, Any]] = []
         any_poc_saved = False
 
         saved_idx = 0  # sequential index for saved PoC files
-        for orig_idx, exploit in enumerate(entry.exploits):
+        for orig_idx, exploit in enumerate(entry.exploits if do_exploitdb else []):
             # Skip unverified PoCs when require_verified_poc is set
             if require_verified_poc and not exploit.verified:
                 self.logger.debug("Skipping unverified PoC %d for %s", orig_idx, cve_id)
@@ -579,7 +589,7 @@ class OutputGenerator(PipelineModule):
                         cve_id, exploit, poc_dir / f"{cve_id}.d", cfg,
                     )
 
-            poc_infos.append({
+            exploitdb_infos.append({
                 "poc_index": saved_idx,
                 "poc_path": str(poc_path) if poc_saved else "",
                 "poc_language": poc_lang,
@@ -594,20 +604,41 @@ class OutputGenerator(PipelineModule):
         # baseline = the test FAILS on the vulnerable build. The test source is
         # also saved for inspection. Always offered (in addition to any ExploitDB
         # PoC) since it is typically the authoritative, deterministic reproducer.
-        for rt in reg_tests:
+        for rt in (reg_tests if do_intree else []):
+            is_data = bool(rt.get("is_data"))
             test_src = rt.get("content") or ""
-            if not test_src:
+            test_b64 = rt.get("content_b64") or ""
+            if is_data:
+                if not test_b64:
+                    continue
+            elif not test_src:
                 continue
-            test_file = poc_dir / f"{cve_id}.test{saved_idx}.c"
             saved = False
-            try:
-                test_file.write_text(test_src, encoding="utf-8")
-                saved = True
-                any_poc_saved = True
-            except IOError as exc:
-                self.logger.warning("Failed to save regression test for %s: %s",
-                                    cve_id, exc)
-            poc_infos.append({
+            if is_data:
+                # DATA reproducer (e.g. a crafted .pcap): keep the real extension
+                # and write the RAW bytes (a UTF-8 .c write would corrupt it).
+                # Phase 1 re-checks-out the authoritative copy by TEST_PATH at the
+                # fix commit, so a save failure here is non-fatal for reproduction.
+                repo_rel = rt.get("repo_path", "")
+                ext = repo_rel.rsplit(".", 1)[-1] if "." in repo_rel else "bin"
+                test_file = poc_dir / f"{cve_id}.test{saved_idx}.{ext}"
+                try:
+                    test_file.write_bytes(base64.b64decode(test_b64))
+                    saved = True
+                    any_poc_saved = True
+                except (IOError, ValueError) as exc:
+                    self.logger.warning("Failed to save data regression test for %s: %s",
+                                        cve_id, exc)
+            else:
+                test_file = poc_dir / f"{cve_id}.test{saved_idx}.c"
+                try:
+                    test_file.write_text(test_src, encoding="utf-8")
+                    saved = True
+                    any_poc_saved = True
+                except IOError as exc:
+                    self.logger.warning("Failed to save regression test for %s: %s",
+                                        cve_id, exc)
+            intree_infos.append({
                 "poc_index": saved_idx,
                 "poc_path": str(test_file) if saved else "",
                 "poc_language": "intree-test",
@@ -618,6 +649,20 @@ class OutputGenerator(PipelineModule):
                 "fix_commit": ps.fix_commit_hash or "",
             })
             saved_idx += 1
+
+        # ---- Assemble in strategy priority order ----
+        # The first emitted entry becomes poc_index 0 — the PRIMARY reproducer
+        # Phase 1 picks (it de-dups to the first CSV row per CVE). The two
+        # emitters ran in code order, so re-index here to honour the strategy
+        # (e.g. [intree, exploitdb] puts the fix-commit test first).
+        poc_infos: List[Dict[str, Any]] = []
+        _by_source = {"exploitdb": exploitdb_infos, "intree": intree_infos}
+        _idx = 0
+        for _src in strategy:
+            for info in _by_source.get(_src, []):
+                info["poc_index"] = _idx
+                poc_infos.append(info)
+                _idx += 1
 
         # If no valid PoC could be extracted, still keep one placeholder
         # so the CVE is not silently dropped from the CSV. When the CVE qualifies
