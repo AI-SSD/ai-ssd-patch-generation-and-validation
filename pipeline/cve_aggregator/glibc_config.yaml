@@ -322,6 +322,13 @@ poc_repair:
   # with provider: ollama (any model family). Set ids your provider can actually
   # serve — an unknown id makes that attempt fail gracefully and the loop moves on.
   #
+  # DUAL ROLE (provider: ollama): this same ordered list is also the
+  # context-window fallback ramp. If a PoC's repair prompt does not fit the
+  # current model's context window, repair advances to the next (larger-context)
+  # model in this list instead of silently truncating the PoC — so size the list
+  # ascending by context window as well as capability. No-op for provider:
+  # openai (its windows are large enough that this never triggers).
+  #
   # Example for provider: openai
   # models_by_attempt:
   #   1: "gpt-4.1-mini"        # first repair
@@ -355,7 +362,21 @@ poc_repair:
 
   # Maximum characters of PoC source code included in the prompt.
   # 0 = no truncation (recommended when running on GPU with sufficient VRAM).
+  # NOTE: with provider: ollama the context-window ramp (see models_by_attempt)
+  # is the preferred way to handle oversized PoCs — it advances to a
+  # larger-context model instead of truncating. Leave this at 0 unless you must.
   max_poc_chars: 0
+
+  # Estimated local generation speed (tokens/sec), used ONLY by the pre-flight
+  # "too slow to repair within api_timeout" skip (provider: ollama). The default
+  # 3 tok/s is a conservative CPU-only figure: at that rate any PoC larger than
+  # ~api_timeout*0.8*rate output tokens is routed to manual review BEFORE the
+  # repair loop — which also pre-empts the context-window ramp on large PoCs.
+  # Set this to your GPU's real throughput (e.g. 30-100) so the ramp can engage.
+  local_token_rate: 3
+  # Same estimate for the OpenAI provider; openai windows are large so the
+  # context ramp is a no-op there and only this time gate applies.
+  openai_token_rate: 150
 
   # Sampling temperature for the LLM.
   # Base temperature – the code staggers it upward on each retry.

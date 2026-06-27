@@ -28,10 +28,14 @@ _csv.field_size_limit(_sys.maxsize)
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
+import socket
 import subprocess
+import tempfile
 import time
+import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 
 from cve_aggregator.utils.phase1_readiness import summarize_phase0_readiness
@@ -295,6 +299,367 @@ def resume_run() -> Dict[str, Any]:
     return _signal_run(signal.SIGCONT)
 
 
+# ---------------------------------------------------------------------------
+# Per-cell control (project pages): pause/resume toggle, stop, resume-after-fail.
+#
+# Unlike the whole-run controls above (which signal run_all.sh's process group),
+# these target ONE cell (project__profile). Cells launched by run_all.sh share
+# its process group, so killpg can't isolate one — instead we signal the cell's
+# own process SUBTREE (its pipeline.py / phase-subprocess leaders, located via
+# their --base-dir cmdline, plus all descendants). Every action is appended,
+# timestamped, to projects/<cell>/logs/control_audit.log so there is a durable
+# record of WHEN each pause/resume/stop/resume-after-fail occurred.
+# ---------------------------------------------------------------------------
+CONTROL_AUDIT = "control_audit.log"
+
+
+def _valid_cell(cell: str) -> bool:
+    """A real project__profile working dir (guards path joins on the cell name)."""
+    return bool(re.fullmatch(r"[A-Za-z0-9._+-]+__[A-Za-z0-9._+-]+", cell or "")) \
+        and os.path.isdir(os.path.join(PROJECTS_DIR, cell))
+
+
+def _cell_audit_path(cell: str) -> str:
+    return os.path.join(PROJECTS_DIR, cell, "logs", CONTROL_AUDIT)
+
+
+def _audit_cell(cell: str, msg: str) -> None:
+    """Append one timestamped control event to the cell's audit log (best-effort)."""
+    try:
+        d = os.path.join(PROJECTS_DIR, cell, "logs")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, CONTROL_AUDIT), "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}  {msg}\n")
+    except OSError:
+        pass
+
+
+def _read_audit(cell: str, n: int = 6) -> List[str]:
+    try:
+        with open(_cell_audit_path(cell), encoding="utf-8", errors="replace") as f:
+            return [ln.rstrip("\n") for ln in f.readlines()[-n:]]
+    except OSError:
+        return []
+
+
+def _latest_cell_state(cell: str) -> Tuple[Optional[str], List[str], Optional[str]]:
+    """(state, fields, statefile) from the newest run dir that has this cell's
+    ``.state`` (format ``STATE|STAGE|STARTED|ENDED|EXIT|LOGFILE``)."""
+    for d in sorted(glob.glob(os.path.join(RUNS_DIR, "*")), reverse=True):
+        if os.path.basename(d) == "latest":
+            continue
+        sf = os.path.join(d, "cells", cell + ".state")
+        if os.path.isfile(sf):
+            try:
+                parts = open(sf, encoding="utf-8").read().strip().split("|")
+            except OSError:
+                parts = []
+            return (parts[0] if parts else None), parts, sf
+    return None, [], None
+
+
+def _cell_phases_from_state(parts: List[str]) -> str:
+    """Phases to replay for resume-after-fail. Prefer the exact list the cell
+    logged ("Phases to Execute: [2, 3, 4]"); fall back to the stage convention
+    (baseline=>'0 1', sweep=>'2 3 4')."""
+    log = parts[5] if len(parts) > 5 else ""
+    try:
+        if log and os.path.isfile(log):
+            txt = open(log, encoding="utf-8", errors="replace").read(20000)
+            m = re.search(r"Phases to Execute:\s*\[([0-9,\s]+)\]", txt)
+            if m:
+                ph = [c for c in re.split(r"[,\s]+", m.group(1).strip()) if c in PHASES]
+                if ph:
+                    return " ".join(ph)
+    except OSError:
+        pass
+    stage = parts[1] if len(parts) > 1 else ""
+    return "0 1" if stage == "baseline" else "2 3 4"
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _all_pids() -> List[int]:
+    try:
+        return [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return []
+
+
+def _proc_ppid(pid: int) -> Optional[int]:
+    """Parent PID from /proc/<pid>/stat (field 4, after the state char)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+        return int(data[data.rindex(")") + 2:].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+# Pipeline entry points whose cmdline carries the cell's --base-dir. Requiring
+# one of these (alongside the base-dir path) keeps _cell_root_pids from matching
+# unrelated processes that merely mention the path (a tail, an editor, a curl
+# whose JSON names the cell).
+_CELL_PROC_TOKENS = ("pipeline.py", "patch_generator.py", "orchestrator.py",
+                     "patch_validator.py", "reporter.py", "poc_repair",
+                     "cve_aggregator", "run_project.sh")
+
+
+def _cmd_targets_base(cmd: str, base: str) -> bool:
+    """True if *base* appears in *cmd* as a whole path (the --base-dir value or a
+    prefix of a path UNDER it), not merely as a substring of a longer cell name.
+    Critical because one cell name can be a prefix of another, e.g.
+    ``…__ollama-proxy-qwen`` is a prefix of ``…__ollama-proxy-qwen-coder`` — a
+    plain ``base in cmd`` would mis-attribute the coder's processes to the qwen
+    cell. We require the char after the match to be a path/arg boundary."""
+    i = cmd.find(base)
+    while i >= 0:
+        nxt = cmd[i + len(base): i + len(base) + 1]
+        if nxt in ("", " ", "/", "\t", "\n"):
+            return True
+        i = cmd.find(base, i + 1)
+    return False
+
+
+def _cell_root_pids(cell: str) -> List[int]:
+    """Live PIDs that are pipeline processes for this cell (cmdline carries the
+    cell's base-dir AND a pipeline entry point) — the leaders that anchor the
+    cell's process subtree."""
+    base = os.path.join(PROJECTS_DIR, cell)
+    me = os.getpid()
+    out = []
+    for pid in _all_pids():
+        if pid == me:
+            continue
+        cmd = _proc_cmdline(pid)
+        if _cmd_targets_base(cmd, base) and any(tok in cmd for tok in _CELL_PROC_TOKENS):
+            out.append(pid)
+    return out
+
+
+def _proc_subtree(roots: List[int]) -> List[int]:
+    """``roots`` plus every descendant (so a paused/stopped cell takes its phase
+    subprocess — patch_generator.py, the docker driver, … — down with it)."""
+    children: Dict[int, List[int]] = {}
+    for pid in _all_pids():
+        pp = _proc_ppid(pid)
+        if pp is not None:
+            children.setdefault(pp, []).append(pid)
+    seen: set = set()
+    stack = list(roots)
+    while stack:
+        p = stack.pop()
+        if p in seen:
+            continue
+        seen.add(p)
+        stack.extend(children.get(p, []))
+    return sorted(seen)
+
+
+def _signal_cell_tree(cell: str, sig: int) -> Tuple[int, List[int]]:
+    roots = _cell_root_pids(cell)
+    if not roots:
+        return 0, []
+    done = []
+    for pid in _proc_subtree(roots):
+        try:
+            os.kill(pid, sig)
+            done.append(pid)
+        except OSError:
+            pass
+    return len(done), done
+
+
+def cell_status(cell: str) -> Dict[str, Any]:
+    """Live/paused/last-state + which controls are valid, for the project page."""
+    if not _valid_cell(cell):
+        return {"cell": cell, "live": False, "paused": False, "last_state": None,
+                "can_pause": False, "can_resume": False, "can_stop": False,
+                "can_resume_fail": False, "audit": [], "error": "unknown cell"}
+    roots = _cell_root_pids(cell)
+    live = bool(roots)
+    states = [s for s in (_proc_state(p) for p in roots) if s]
+    paused = bool(live and states and all(s == "T" for s in states))
+    last_state, _parts, _sf = _latest_cell_state(cell)
+    return {
+        "cell": cell, "live": live, "paused": paused, "last_state": last_state,
+        "pids": roots,
+        "can_pause": live and not paused,
+        "can_resume": live and paused,
+        "can_stop": live,
+        "can_resume_fail": (not live) and (last_state in ("FAILED", "ABORTED")),
+        "audit": _read_audit(cell),
+    }
+
+
+def live_cells() -> Dict[str, bool]:
+    """One /proc sweep → ``{cell: paused}`` for EVERY cell with a live pipeline
+    process (paused=True when all its matched leaders are stopped, 'T'). Lets the
+    grid render RUNNING/RESUMED/PAUSED from real liveness without a per-cell scan
+    — so a resume-after-fail in progress no longer shows its stale FAILED .state."""
+    if not os.path.isdir(PROJECTS_DIR):
+        return {}
+    bases = {os.path.join(PROJECTS_DIR, d): d
+             for d in os.listdir(PROJECTS_DIR)
+             if "__" in d and os.path.isdir(os.path.join(PROJECTS_DIR, d))}
+    me = os.getpid()
+    states: Dict[str, List[Optional[str]]] = {}
+    for pid in _all_pids():
+        if pid == me:
+            continue
+        cmd = _proc_cmdline(pid)
+        if not any(tok in cmd for tok in _CELL_PROC_TOKENS):
+            continue
+        for base, cell in bases.items():
+            if _cmd_targets_base(cmd, base):
+                states.setdefault(cell, []).append(_proc_state(pid))
+                break
+    return {cell: (bool(s) and all(x == "T" for x in s))
+            for cell, s in states.items()}
+
+
+def pause_cell(cell: str) -> Dict[str, Any]:
+    if not _valid_cell(cell):
+        return {"ok": False, "error": "unknown cell"}
+    st = cell_status(cell)
+    if not st["live"]:
+        return {"ok": False, "error": "cell is not running"}
+    if st["paused"]:
+        return {"ok": False, "error": "cell is already paused"}
+    n, pids = _signal_cell_tree(cell, signal.SIGSTOP)
+    if not n:
+        return {"ok": False, "error": "no signalable process found"}
+    _audit_cell(cell, f"PAUSE  via dashboard — SIGSTOP {n} proc(s) {pids}")
+    return {"ok": True, "cell": cell, "action": "pause", "signaled": n}
+
+
+def resume_cell(cell: str) -> Dict[str, Any]:
+    if not _valid_cell(cell):
+        return {"ok": False, "error": "unknown cell"}
+    st = cell_status(cell)
+    if not st["live"]:
+        return {"ok": False, "error": "cell is not running"}
+    n, _pids = _signal_cell_tree(cell, signal.SIGCONT)
+    if not n:
+        return {"ok": False, "error": "no signalable process found"}
+    _audit_cell(cell, f"RESUME via dashboard — SIGCONT {n} proc(s)")
+    return {"ok": True, "cell": cell, "action": "resume", "signaled": n}
+
+
+def pause_toggle_cell(cell: str) -> Dict[str, Any]:
+    """The single button that flips between Pause and Resume by current state."""
+    if not _valid_cell(cell):
+        return {"ok": False, "error": "unknown cell"}
+    st = cell_status(cell)
+    if not st["live"]:
+        return {"ok": False, "error": "cell is not running"}
+    return resume_cell(cell) if st["paused"] else pause_cell(cell)
+
+
+def stop_cell(cell: str) -> Dict[str, Any]:
+    if not _valid_cell(cell):
+        return {"ok": False, "error": "unknown cell"}
+    st = cell_status(cell)
+    if not st["live"]:
+        return {"ok": False, "error": "cell is not running"}
+    if st["paused"]:                      # un-stop first so it can act on the TERM
+        _signal_cell_tree(cell, signal.SIGCONT)
+    n, pids = _signal_cell_tree(cell, signal.SIGTERM)
+    if not n:
+        return {"ok": False, "error": "no signalable process found"}
+    _audit_cell(cell, f"STOP   via dashboard — SIGTERM {n} proc(s) {pids}")
+    return {"ok": True, "cell": cell, "action": "stop", "signaled": n}
+
+
+_RESUME_WRAPPER = r'''#!/usr/bin/env bash
+set -uo pipefail
+ROOT=@@ROOT@@
+LOG=@@LOG@@
+STATE=@@STATE@@
+AUDIT=@@AUDIT@@
+START=$(date +%s)
+{
+  echo "================================================================"
+  echo " RESUME-AFTER-FAIL — @@CELL@@ (phases @@PHASES@@)"
+  echo " Triggered from the dashboard at $(date -Is)."
+  echo " Previous cell state was FAILED/ABORTED — this run supersedes it."
+  echo "================================================================"
+} | tee "$LOG"
+RUN_INLINE=1 bash "$ROOT/run_project.sh" @@PROJ@@ --profile @@PROF@@ --phases @@PHASES@@ >> "$LOG" 2>&1
+RC=$?
+END=$(date +%s)
+ST=DONE; [ "$RC" -ne 0 ] && ST=FAILED
+printf '%s|resume|%s|%s|%s|%s\n' "$ST" "$START" "$END" "$RC" "$LOG" > "$STATE"
+printf '%s  RESUME-AFTER-FAIL finished rc=%s dur=%ss -> %s\n' "$(date -Is)" "$RC" "$((END-START))" "$ST" >> "$AUDIT"
+'''
+
+
+def resume_failed_cell(cell: str) -> Dict[str, Any]:
+    """Re-launch a FAILED/ABORTED cell standalone (detached), replaying the same
+    phases. The wrapper rewrites the cell ``.state`` with THIS run's clean
+    duration on exit (so the failed attempt drops out of any cell-duration total)
+    and records start+finish in the audit log."""
+    if not _valid_cell(cell):
+        return {"ok": False, "error": "unknown cell"}
+    st = cell_status(cell)
+    if st["live"]:
+        return {"ok": False, "error": "cell is currently running — stop it first"}
+    last, parts, sf = _latest_cell_state(cell)
+    if last not in ("FAILED", "ABORTED"):
+        return {"ok": False, "error": f"resume-after-fail only applies to a "
+                f"FAILED/ABORTED cell (last state: {last or 'unknown'})"}
+    proj, _, prof = cell.partition("__")
+    if proj not in set(list_projects()):
+        return {"ok": False, "error": f"unknown project {proj!r}"}
+    if prof not in {p["name"] for p in list_profiles()}:
+        return {"ok": False, "error": f"unknown profile {prof!r}"}
+    phases = _cell_phases_from_state(parts)
+    if not re.fullmatch(r"[0-4](?: [0-4])*", phases):
+        return {"ok": False, "error": f"refusing to launch with unsafe phases {phases!r}"}
+    run_dir = os.path.dirname(os.path.dirname(sf))   # …/runs/<run_id>
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    log = os.path.join(run_dir, "logs", f"{cell}.resume_{ts}.log")
+    wrapper = os.path.join(run_dir, f"resume_{cell}_{ts}.sh")
+    script = (_RESUME_WRAPPER
+              .replace("@@ROOT@@", shlex.quote(ROOT))
+              .replace("@@LOG@@", shlex.quote(log))
+              .replace("@@STATE@@", shlex.quote(sf))
+              .replace("@@AUDIT@@", shlex.quote(_cell_audit_path(cell)))
+              .replace("@@PROJ@@", shlex.quote(proj))
+              .replace("@@PROF@@", shlex.quote(prof))
+              .replace("@@PHASES@@", phases)
+              .replace("@@CELL@@", cell))
+    try:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(wrapper, "w", encoding="utf-8") as f:
+            f.write(script)
+        os.chmod(wrapper, 0o755)
+    except OSError as e:
+        return {"ok": False, "error": f"could not stage wrapper: {e}"}
+    try:
+        proc = subprocess.Popen(
+            ["bash", wrapper], cwd=ROOT, env=dict(os.environ),
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        return {"ok": False, "error": f"launch failed: {e}"}
+    try:  # reflect RUNNING at once so the page flips to pause/stop controls
+        with open(sf, "w", encoding="utf-8") as f:
+            f.write(f"RUNNING|resume|{int(time.time())}|||{log}")
+    except OSError:
+        pass
+    _audit_cell(cell, f"RESUME-AFTER-FAIL via dashboard — relaunch phases "
+                      f"'{phases}' (pid {proc.pid}); log {log}")
+    return {"ok": True, "cell": cell, "action": "resume_fail",
+            "pid": proc.pid, "phases": phases, "log": log}
+
+
 def start_run(projects: List[str], profiles: List[str], baseline_profile: str,
               baseline_phases: List[str], sweep_phases: List[str],
               manual_phase0_hold: bool = False, manual_phase1_gate: bool = False,
@@ -416,6 +781,108 @@ def _under(path: str, roots: List[str]) -> bool:
     rp = os.path.realpath(path)
     return any(rp == os.path.realpath(r) or rp.startswith(os.path.realpath(r) + os.sep)
                for r in roots)
+
+
+# ---------------------------------------------------------------------------
+# Archive one execution — a single ZIP with everything needed to preserve a
+# project__profile run (results, logs, reports, metrics, patches, validation
+# outputs, exploits, manual review) plus the config that produced it. The web
+# layer (dashboard_server.py) streams the file to the browser and deletes it.
+# ---------------------------------------------------------------------------
+def _archive_manifest(cell: str, project: str, profile: str, cell_dir: str,
+                      extras: List[Tuple[str, str]], ts: str) -> str:
+    lines = [
+        "AI-SSD pipeline execution archive",
+        "=" * 40,
+        f"cell:      {cell}",
+        f"project:   {project}",
+        f"profile:   {profile}",
+        f"model(s):  {', '.join(profile_models(profile)) or 'n/a'}",
+        f"archived:  {ts}",
+        f"host:      {socket.gethostname()}",
+        f"size:      {human_bytes(_dir_size(cell_dir))} (cell artifacts, uncompressed)",
+        "",
+        "Layout (relative to this archive's top folder):",
+        "  results/              Phase 0-1 datasets, manifests, run records, metrics",
+        "  exploits/             PoC scripts used for reproduction",
+        "  patches/              generated patches per CVE / model",
+        "  validation_results/   Phase 3 verdicts (PoC + SAST)",
+        "  validation_builds/    Phase 3 build artifacts",
+        "  reports/              Phase 4 report + charts",
+        "  logs/                 per-phase logs",
+        "  manual_supervision/   manual-review queue + decisions",
+        "  config/               config.yaml + project Phase-0 YAML + profile .env",
+        "  MANIFEST.txt          this file",
+        "",
+        "Bundled config files:",
+    ]
+    lines += [f"  {rel}" for _src, rel in extras] or ["  (none found)"]
+    return "\n".join(lines) + "\n"
+
+
+def build_cell_archive(cell: str) -> Dict[str, Any]:
+    """Build a single ZIP archiving one ``projects/<project>__<profile>/`` run:
+    the WHOLE cell tree (results, logs, reports, metrics, patches, validation
+    outputs, exploits, manual review) PLUS the config that produced it (global
+    ``config.yaml``, the project Phase-0 YAML, the profile ``.env``) and a
+    ``MANIFEST.txt``. Returns ``{"path", "filename", "size_bytes"}``; the caller
+    streams the file and removes it. Raises ``ValueError`` for an unknown cell.
+
+    Files are compressed (``ZIP_DEFLATED``), so even an oversized artifact (e.g.
+    an unbounded ``results.json``) packs down rather than ballooning the download.
+    """
+    if not _valid_cell(cell):
+        raise ValueError("unknown cell")
+    cell_dir = os.path.join(PROJECTS_DIR, cell)
+    if not _under(cell_dir, [PROJECTS_DIR]):   # defense in depth on the cell name
+        raise ValueError("unknown cell")
+    project, _, profile = cell.partition("__")
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    arcroot = f"{cell}_{ts}"                    # top-level folder inside the ZIP
+
+    # Config that produced the run (disk path -> arcname under <arcroot>/config/).
+    extras: List[Tuple[str, str]] = []
+    gcfg = os.path.join(ROOT, "config.yaml")
+    if os.path.isfile(gcfg):
+        extras.append((gcfg, "config/config.yaml"))
+    prel = _config_map().get(project, os.path.join("cve_aggregator", f"{project}_config.yaml"))
+    pcfg = os.path.join(ROOT, prel)
+    if os.path.isfile(pcfg):
+        extras.append((pcfg, f"config/{os.path.basename(pcfg)}"))
+    penv = os.path.join(PROFILES_DIR, profile + ".env")
+    if os.path.isfile(penv):
+        extras.append((penv, f"config/{profile}.env"))
+
+    fd, tmp = tempfile.mkstemp(prefix="ssd_archive_", suffix=".zip")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED,
+                             allowZip64=True) as zf:
+            zf.writestr(f"{arcroot}/MANIFEST.txt",
+                        _archive_manifest(cell, project, profile, cell_dir, extras, ts))
+            for dp, _dn, fn in os.walk(cell_dir):
+                for f in fn:
+                    fp = os.path.join(dp, f)
+                    if os.path.islink(fp):
+                        continue               # don't follow symlinks out of the tree
+                    arc = f"{arcroot}/" + os.path.relpath(fp, cell_dir)
+                    try:
+                        zf.write(fp, arc)
+                    except OSError:
+                        pass                   # file vanished mid-walk (live run) — skip
+            for src, rel in extras:
+                try:
+                    zf.write(src, f"{arcroot}/{rel}")
+                except OSError:
+                    pass
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return {"path": tmp, "filename": f"{arcroot}.zip",
+            "size_bytes": os.path.getsize(tmp)}
 
 
 def _docker(*args: str, timeout: int = 60) -> Tuple[int, str]:
@@ -585,10 +1052,41 @@ def _load_phase1_counts(path: str) -> Dict[str, int]:
 
 def _load_feedback_counts(path: str) -> Dict[str, int]:
     """Counts for the Iterative Feedback Loop card, from the cell's
-    ``results/feedback_loop_results_*.json`` summary."""
+    ``results/feedback_loop_results_*.json`` summary.
+
+    Also derives a PoC-only / SAST-only / both-failed three-way breakdown from
+    the final validation attempt stored per result in ``validation_history``.
+    The final attempt is the last entry in the history list (attempt with the
+    highest attempt number); its ``poc_blocked`` / ``sast_passed`` fields give
+    the definitive failure reason for non-successful patches.
+    """
     d = json.loads(open(path).read())
     s = d.get("summary", {}) or {}
     ob = d.get("outcome_breakdown", {}) or {}
+
+    # Three-way breakdown from per-result validation history
+    poc_only = sast_only = both_failed = 0
+    for r in (d.get("results") or []):
+        # Only consider patches that ultimately did NOT succeed
+        final_status = str(r.get("final_status") or "").lower().rsplit(".", 1)[-1]
+        if final_status == "success":
+            continue
+        history = r.get("validation_history") or []
+        if not history:
+            continue
+        # Last entry = the final attempt (highest attempt index)
+        last = max(history, key=lambda h: int(h.get("attempt") or 0), default=None)
+        if last is None:
+            continue
+        poc_blocked = bool(last.get("poc_blocked"))
+        sast_passed = bool(last.get("sast_passed"))
+        if not poc_blocked and not sast_passed:
+            both_failed += 1
+        elif not poc_blocked:
+            poc_only += 1
+        elif not sast_passed:
+            sast_only += 1
+
     return {
         "total": int(s.get("total_patches_processed") or 0),
         "successful": int(s.get("successful") or 0),
@@ -596,6 +1094,9 @@ def _load_feedback_counts(path: str) -> Dict[str, int]:
         "failed": int(s.get("failed") or 0),
         "after_retry": int(ob.get("successful_after_retry") or 0),
         "retries": int(s.get("total_retry_attempts") or 0),
+        "failed_poc_only": poc_only,
+        "failed_sast_only": sast_only,
+        "failed_both": both_failed,
     }
 
 
@@ -644,7 +1145,11 @@ def _load_pipeline_success(cell_dir: str) -> Optional[Dict[str, int]]:
     Merges (unions) the Phase 3 validation summary with the feedback-loop final
     verdict: a CVE is fixed if it passed the initial validation OR was salvaged
     by a retry. Counting either source alone undercounts (validation misses
-    retry saves; feedback misses first-try successes)."""
+    retry saves; feedback misses first-try successes).
+
+    While the feedback loop is still running (no final artifact yet), the live
+    heartbeat's ``successful`` count is folded in. The loop only retries Phase-3
+    failures so its fixed set is disjoint from Phase 3's — no double-counting."""
     fixed: set = set()
     allc: set = set()
     found = False
@@ -662,6 +1167,14 @@ def _load_pipeline_success(cell_dir: str) -> Optional[Dict[str, int]]:
         fixed |= set(s["fixed_cves"]); allc |= set(s["all_cves"])
     if not found:
         return None
+    # No final feedback artifact yet — check the live heartbeat so the banner
+    # reflects in-progress retry successes without waiting for the loop to finish.
+    if not fb:
+        live_pfb, _ = _read_live(os.path.join(cell_dir, "results"), "fb")
+        if live_pfb:
+            fb_succ = int((live_pfb.get("counts") or {}).get("successful") or 0)
+            if fb_succ:
+                return {"fixed": len(fixed) + fb_succ, "validated": len(allc)}
     return {"fixed": len(fixed), "validated": len(allc)}
 
 
@@ -778,9 +1291,12 @@ def get_progress() -> Dict[str, Any]:
     p3: Dict[str, Any] = {"cells": 0, "total": 0, "success": 0, "poc_blocked": 0,
                            "sast_passed": 0, "poc_still_works": 0, "sast_failures": 0,
                            "build_failures": 0, "execution_errors": 0, "no_baseline": 0,
+                           "failed_poc_only": 0, "failed_sast_only": 0, "failed_both": 0,
                            "by_cell": {}}
     pfb: Dict[str, Any] = {"cells": 0, "total": 0, "successful": 0, "unpatchable": 0,
-                            "failed": 0, "after_retry": 0, "retries": 0, "by_cell": {}}
+                            "failed": 0, "after_retry": 0, "retries": 0,
+                            "failed_poc_only": 0, "failed_sast_only": 0, "failed_both": 0,
+                            "by_cell": {}}
     p4: Dict[str, Any] = {"cells": 0, "reports": 0, "charts": 0, "by_cell": {}}
     # Full-pipeline outcome: unique CVEs fixed end-to-end (PoC blocked + SAST passed).
     psum: Dict[str, Any] = {"cells": 0, "fixed": 0, "validated": 0, "by_cell": {}}
@@ -860,7 +1376,10 @@ def get_progress() -> Dict[str, Any]:
                 pass
             p2["cells"] += 1
             cs2: Dict[str, Any] = {"total_tasks": 0, "syntax_valid": 0,
-                                   "syntax_invalid": 0, "done": 0, "running": False}
+                                   "syntax_invalid": 0, "task_cves": 0,
+                                   "funnel_reproduced": None,
+                                   "skipped_no_function": None,
+                                   "done": 0, "running": False}
             try:
                 data = json.loads(open(r2_path).read())
                 s = data.get("summary", {})
@@ -868,6 +1387,24 @@ def get_progress() -> Dict[str, Any]:
                 cs2["syntax_valid"] = s.get("syntax_valid", 0)
                 cs2["syntax_invalid"] = (data.get("outcome_breakdown", {})
                                          .get("syntax_invalid_count", 0))
+                # Distinct CVE count (the funnel hand-off unit). total_tasks counts
+                # CVE×model, so for reconciling Phase 1→2 we need unique CVEs. Prefer
+                # the per-CVE map; fall back to the results list, then total_tasks.
+                cve_stats = data.get("cve_statistics") or {}
+                if cve_stats:
+                    cs2["task_cves"] = len(cve_stats)
+                else:
+                    cs2["task_cves"] = len({(r.get("cve_id") or "").upper()
+                                            for r in (data.get("results") or [])
+                                            if r.get("cve_id")}) or cs2["total_tasks"]
+                # Authoritative funnel hand-off (Phase 2 records the exact reproduced
+                # set it consumed + how many it dropped for no patchable function).
+                # Preferred over cross-artifact inference so a partial/scoped re-run
+                # can't fabricate a drop; older artifacts lack it → None → the
+                # renderer falls back to inference.
+                fn = data.get("funnel") or {}
+                cs2["funnel_reproduced"] = fn.get("phase1_reproduced")
+                cs2["skipped_no_function"] = fn.get("skipped_no_function_count")
             except Exception:
                 pass
             for k in ("total_tasks", "syntax_valid", "syntax_invalid"):
@@ -888,10 +1425,23 @@ def get_progress() -> Dict[str, Any]:
                                     "sast_passed": 0, "poc_still_works": 0,
                                     "sast_failures": 0, "build_failures": 0,
                                     "execution_errors": 0, "no_baseline": 0,
+                                    "validated_cves": 0, "skipped_distinct": None,
+                                    "failed_poc_only": 0, "failed_sast_only": 0,
+                                    "failed_both": 0,
                                     "done": 0, "running": False}
             try:
                 data = json.loads(open(v3_files[-1]).read())
                 cs3["total"] = data.get("metadata", {}).get("total_validations", 0)
+                # Distinct CVE count actually validated (model-agnostic hand-off
+                # unit), for reconciling Phase 2→3. Prefer the per-CVE map.
+                by_cve = data.get("by_cve") or {}
+                cs3["validated_cves"] = len(by_cve) or len(
+                    {(r.get("cve_id") or "").upper()
+                     for r in (data.get("all_results") or []) if r.get("cve_id")}
+                ) or cs3["total"]
+                # Authoritative Phase 2→3 skip count (test-file targets / no usable
+                # patch); preferred over inference, None on older artifacts.
+                cs3["skipped_distinct"] = (data.get("skipped") or {}).get("distinct_cves")
                 s3 = data.get("summary", {})
                 fb = data.get("failure_breakdown", {})
                 cs3["success"] = s3.get("successful", 0)
@@ -906,6 +1456,23 @@ def get_progress() -> Dict[str, Any]:
                              cs3["sast_failures"] + cs3["build_failures"] +
                              cs3["execution_errors"])
                 cs3["no_baseline"] = max(0, cs3["total"] - accounted)
+                # Three-way failure breakdown from individual validation records.
+                # Only attempted when the file is small enough to parse in full;
+                # large runs may omit these (they show 0) to protect the dashboard.
+                try:
+                    fsize = os.path.getsize(v3_files[-1])
+                except OSError:
+                    fsize = _MAX_FULL_PARSE_BYTES + 1
+                if fsize <= _MAX_FULL_PARSE_BYTES:
+                    for r in (data.get("all_results") or []):
+                        poc_b = bool(r.get("poc_blocked"))
+                        sast_p = bool(r.get("sast_passed"))
+                        if not poc_b and not sast_p:
+                            cs3["failed_both"] += 1
+                        elif not poc_b:
+                            cs3["failed_poc_only"] += 1
+                        elif not sast_p:
+                            cs3["failed_sast_only"] += 1
             except Exception:
                 pass
             for k in cs3:
@@ -922,14 +1489,17 @@ def get_progress() -> Dict[str, Any]:
             pfb["cells"] += 1
             csfb: Dict[str, Any] = {"total": 0, "successful": 0, "unpatchable": 0,
                                      "failed": 0, "after_retry": 0, "retries": 0,
+                                     "failed_poc_only": 0, "failed_sast_only": 0,
+                                     "failed_both": 0,
                                      "done": 0, "running": False}
             try:
                 csfb.update(_cached_artifact(fb_files[-1], _load_feedback_counts))
             except Exception:
                 pass
             for k in ("total", "successful", "unpatchable", "failed",
-                      "after_retry", "retries"):
-                pfb[k] += csfb[k]
+                      "after_retry", "retries",
+                      "failed_poc_only", "failed_sast_only", "failed_both"):
+                pfb[k] += csfb.get(k, 0)
             csfb["done"] = csfb["total"]
             pfb["by_cell"][cell] = csfb
 
@@ -991,16 +1561,23 @@ def get_progress() -> Dict[str, Any]:
                     stats.setdefault(k, 0)
             elif phase == 2:
                 stats.setdefault("total_tasks", stats["total"])
+                stats.setdefault("task_cves", stats["total"])
+                stats.setdefault("funnel_reproduced", None)
+                stats.setdefault("skipped_no_function", None)
                 for k in ("syntax_valid", "syntax_invalid"):
                     stats.setdefault(k, 0)
             elif phase == 3:
+                stats.setdefault("validated_cves", stats["total"])
+                stats.setdefault("skipped_distinct", None)
                 for k in ("success", "poc_blocked", "sast_passed",
                           "poc_still_works", "sast_failures", "build_failures",
-                          "execution_errors", "no_baseline"):
+                          "execution_errors", "no_baseline",
+                          "failed_poc_only", "failed_sast_only", "failed_both"):
                     stats.setdefault(k, 0)
             elif phase == "fb":
                 for k in ("successful", "unpatchable", "failed",
-                          "after_retry", "retries"):
+                          "after_retry", "retries",
+                          "failed_poc_only", "failed_sast_only", "failed_both"):
                     stats.setdefault(k, 0)
             elif phase == 4:
                 stats.setdefault("charts", 0)

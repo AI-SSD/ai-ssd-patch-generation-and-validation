@@ -29,7 +29,8 @@ except Exception as _e:  # keep the viewer working even if the engine fails to l
 HERE = os.path.dirname(os.path.abspath(__file__))
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 HCOL = {"DONE": "#1b5e20", "FAILED": "#b71c1c", "RUNNING": "#f9a825", "PENDING": "#424242",
-        "SKIPPED": "#6a1b9a", "STALE": "#8d6e63", "ABORTED": "#9e2a2b"}
+        "SKIPPED": "#6a1b9a", "STALE": "#8d6e63", "ABORTED": "#9e2a2b",
+        "RESUMED": "#1565c0", "PAUSED": "#455a64"}
 RUN_DIR = None        # initial arg from main(); may be None if not yet available
 _RUN_DIR_ARG = None   # raw arg passed at startup (path string or None)
 
@@ -114,8 +115,18 @@ def load_cells(run_dir):
     return sorted(cells, key=lambda c: (c["proj"], c["prof"]))
 
 
-def disp_state(c, complete):
-    return "STALE" if (complete and c["state"] == "RUNNING") else c["state"]
+def disp_state(c, complete, live=None):
+    """Grid status. Liveness (/proc) overrides a stale .state: a cell that is
+    actually running but whose .state still says FAILED/ABORTED (a resume-after-
+    fail in progress) shows RESUMED; a live cell that is SIGSTOP'd shows PAUSED;
+    otherwise a live cell is RUNNING. Falls back to the recorded .state (with the
+    complete+RUNNING => STALE rule) when the cell has no live process."""
+    st = c["state"]
+    if live and c["name"] in live:
+        if live[c["name"]]:
+            return "PAUSED"
+        return "RESUMED" if st in ("FAILED", "ABORTED") else "RUNNING"
+    return "STALE" if (complete and st == "RUNNING") else st
 
 
 def elapsed_of(c, now):
@@ -159,20 +170,26 @@ def grid_content(run_dir):
         prog = {}
     running_phase = prog.get("running_phase", {})
     psum = prog.get("pipeline_success", {})
+    try:
+        live = ctl.live_cells() if ctl else {}
+    except Exception:
+        live = {}
     counts, rows = {}, ""
     for c in cells:
-        ds = disp_state(c, complete); counts[ds] = counts.get(ds, 0) + 1
+        ds = disp_state(c, complete, live); counts[ds] = counts.get(ds, 0) + 1
         link = "/cell/" + quote(c["name"])
+        dlink = "/api/download?cell=" + quote(c["name"])
         # The pipeline phase running right now (incl. the feedback loop as its
         # own phase), distinct from the run_all.sh sweep "stage" column.
-        ph = running_phase.get(c["name"], "") if ds == "RUNNING" else ""
+        ph = running_phase.get(c["name"], "") if ds in ("RUNNING", "RESUMED") else ""
         ph_cell = (f"<span style='color:#f9a825;font-weight:700'>{html.escape(ph)}</span>"
                    if ph else "<span style='color:#555'>—</span>")
         rows += (f"<tr><td>{c['proj']}</td><td><a href='{link}'>{c['prof']}</a></td>"
                  f"<td>{c['stage']}</td>"
                  f"<td>{ph_cell}</td>"
                  f"<td><span class=b style='background:{HCOL.get(ds, '#333')}'>{ds}</span></td>"
-                 f"<td>{elapsed_of(c, now)}</td><td><a href='{link}'>logs &rsaquo;</a></td></tr>")
+                 f"<td>{elapsed_of(c, now)}</td><td><a href='{link}'>logs &rsaquo;</a> &nbsp; "
+                 f"<a href='{dlink}' title='Download all artifacts for this cell as a ZIP'>&#8681; zip</a></td></tr>")
     summ = " &nbsp; ".join(f"{k}: <b>{v}</b>" for k, v in sorted(counts.items()))
     # Run-wide sum-up: unique CVEs fixed end-to-end across every cell that has
     # produced validation results (PoC blocked + SAST passed).
@@ -265,7 +282,7 @@ def cell_progress_html(cell: str) -> str:
               + row("Attempted", f"{d1}/{s1['total']}" if s1.get("running") else s1["total"])
               + row("Reproduced ✓", f"{s1['reproduced']}/{d1}{pct(s1['reproduced'], d1)}", "#6c6")
               + (row("Manual rev ⚠", s1["manual_revision"], warn=True) if s1["manual_revision"] else "")
-              + (row("Failed ✗", s1["failed"], "#f88") if s1["failed"] else ""))
+              + (row("Failed on PoC ✗", s1["failed"], "#f88") if s1["failed"] else ""))
         card1 = card(*title_for("Phase 1 — Reproduction", s1), c1)
     else:
         card1 = card("Phase 1 — Reproduction", "#555", "<tr><td style='color:#555'>not started</td></tr>", active=False)
@@ -273,10 +290,29 @@ def cell_progress_html(cell: str) -> str:
     # Phase 2
     if s2:
         d2 = s2.get("done", s2["total_tasks"])
+        # Funnel reconciliation: Phase 2 only generates patches for CVEs Phase 1
+        # reproduced AND that carry an extractable vulnerable function. The gap to
+        # Phase 1's "Reproduced" count is reproduced CVEs with no patchable
+        # function (empty V_FUNCTION/F_NAME/FilePath — e.g. test-only fix commits),
+        # so 26 reproduced → 24 patch tasks reads as a drop, not a lost count.
+        # Explicit chain rows so the headline numbers reconcile: "Reproduced (in)"
+        # == Phase 1's Reproduced, minus the no-patchable-function CVEs == "Patch
+        # tasks". Prefer Phase 2's recorded funnel (immune to a Phase-1-only re-run);
+        # fall back to inference for older artifacts lacking the block.
+        chain2 = ""
+        if s1 and not s2.get("running"):
+            nofunc = s2.get("skipped_no_function")
+            repro_in = s2.get("funnel_reproduced") or int(s1.get("reproduced", 0))
+            if nofunc is None:
+                tcves = int(s2.get("task_cves") or s2["total_tasks"])
+                nofunc = max(0, int(s1.get("reproduced", 0)) - tcves)
+            chain2 = (row("Reproduced (in)", repro_in, "#6cf")
+                      + (row("&minus; no patchable fn", nofunc, "#fc6") if nofunc else ""))
         c2 = (prog(s2, "tasks")
+              + chain2
               + row("Patch tasks", f"{d2}/{s2['total_tasks']}" if s2.get("running") else s2["total_tasks"])
               + row("Valid patch ✓", f"{s2['syntax_valid']}/{d2}{pct(s2['syntax_valid'], d2)}", "#6c6")
-              + (row("Invalid ✗", s2["syntax_invalid"], "#f88") if s2["syntax_invalid"] else ""))
+              + (row("Invalid (still validated)", s2["syntax_invalid"], "#f88") if s2["syntax_invalid"] else ""))
         card2 = card(*title_for("Phase 2 — Patch Gen", s2), c2)
     else:
         card2 = card("Phase 2 — Patch Gen", "#555", "<tr><td style='color:#555'>not started</td></tr>", active=False)
@@ -284,25 +320,63 @@ def cell_progress_html(cell: str) -> str:
     # Phase 3
     if s3:
         d3 = s3.get("done", s3["total"])
+        # Explicit chain rows: "Patches (in)" == Phase 2's "Patch tasks" (ALL
+        # generated patches — valid AND invalid; syntax validity is not a gate),
+        # minus patches whose target is a test file or that produced no usable patch
+        # == "Validated". Prefer Phase 3's recorded skip count; fall back to
+        # inference. Require Phase 2 settled too: while it re-runs, its live overlay
+        # reports the PLANNED total and would skew the drop.
+        chain3 = ""
+        tcves = int(s2.get("task_cves") or s2.get("total_tasks", 0)) if s2 else 0
+        if s2 and not s2.get("running") and not s3.get("running"):
+            skipped = s3.get("skipped_distinct")
+            if skipped is None:
+                vcves = int(s3.get("validated_cves") or s3["total"])
+                skipped = max(0, tcves - vcves)
+            chain3 = (row("Patches (in)", tcves, "#6cf")
+                      + (row("&minus; test-only / no patch", skipped, "#fc6") if skipped else ""))
         c3 = (prog(s3, "validated")
+              + chain3
               + row("Validated", f"{d3}/{s3['total']}" if s3.get("running") else s3["total"])
               + row("SUCCESS ✓", f"{s3['success']}/{d3}{pct(s3['success'], d3)}", "#6c6")
               + (row("PoC still works ✗", s3["poc_still_works"], "#f88") if s3["poc_still_works"] else "")
+              # Every validated patch lands in exactly one bucket; show them all so
+              # success + the failure rows sum to "Validated" (execution_errors was
+              # the one bucket previously hidden, leaving 23 ≠ 1+18).
+              + (row("Execution error ✗", s3["execution_errors"], "#f88") if s3["execution_errors"] else "")
               + (row("SAST failed ⚠", s3["sast_failures"], warn=True) if s3["sast_failures"] else "")
               + (row("Build error ✗", s3["build_failures"], "#f88") if s3["build_failures"] else "")
-              + (row("No baseline", s3["no_baseline"], "#666") if s3["no_baseline"] else ""))
+              + (row("No baseline", s3["no_baseline"], "#666") if s3["no_baseline"] else "")
+              # Three-way breakdown: how many patches failed on PoC only, SAST only, or both.
+              # Only shown when at least one of the three counts is non-zero.
+              + ((
+                  (row("\u2514 PoC only ✗", s3["failed_poc_only"], "#f88") if s3.get("failed_poc_only") else "")
+                  + (row("\u2514 SAST only ⚠", s3["failed_sast_only"], warn=True) if s3.get("failed_sast_only") else "")
+                  + (row("\u2514 PoC + SAST ✗", s3["failed_both"], "#f88") if s3.get("failed_both") else "")
+              ) if (s3.get("failed_poc_only") or s3.get("failed_sast_only") or s3.get("failed_both")) else ""))
         card3 = card(*title_for("Phase 3 — Validation", s3), c3)
     else:
         card3 = card("Phase 3 — Validation", "#555", "<tr><td style='color:#555'>not started</td></tr>", active=False)
 
     # Feedback Loop (self-healing) — runs between Phases 2 and 3 on failures
     if sfb:
+        # The loop retries only the patches that failed Phase 3 in a retryable way
+        # (PoC still works) — so its input equals Phase 3's "PoC still works" count;
+        # first-try successes and execution errors are not retried. Lead row labels
+        # this hand-off so the number chains from the Phase 3 card.
+        in_lbl = "Failed (in)" if (s3 and not sfb.get("running")) else "Patches"
         cfb = (prog(sfb, "patches")
-               + row("Patches", f"{sfb.get('done', sfb['total'])}/{sfb['total']}" if sfb.get("running") else sfb["total"])
+               + row(in_lbl, f"{sfb.get('done', sfb['total'])}/{sfb['total']}" if sfb.get("running") else sfb["total"], "#6cf")
                + row("Fixed by retry ✓", f"{sfb['after_retry']}", "#6c6")
                + row("Succeeded", f"{sfb['successful']}/{sfb['total']}{pct(sfb['successful'], sfb['total'])}", "#6c6")
                + (row("Unpatchable ✗", sfb["unpatchable"], "#f88") if sfb["unpatchable"] else "")
-               + row("Retry attempts", sfb["retries"], "#6cf"))
+               + row("Retry attempts", sfb["retries"], "#6cf")
+               # Three-way breakdown for ultimately-failed patches
+               + ((
+                   (row("\u2514 PoC only ✗", sfb["failed_poc_only"], "#f88") if sfb.get("failed_poc_only") else "")
+                   + (row("\u2514 SAST only ⚠", sfb["failed_sast_only"], warn=True) if sfb.get("failed_sast_only") else "")
+                   + (row("\u2514 PoC + SAST ✗", sfb["failed_both"], "#f88") if sfb.get("failed_both") else "")
+               ) if (sfb.get("failed_poc_only") or sfb.get("failed_sast_only") or sfb.get("failed_both")) else ""))
         cardfb = card(*title_for("Feedback Loop — Self-Healing", sfb), cfb)
     else:
         cardfb = card("Feedback Loop — Self-Healing", "#555", "<tr><td style='color:#555'>not started</td></tr>", active=False)
@@ -375,6 +449,48 @@ def cell_content(run_dir, cell):
             "detailed build/LLM output.</small></p><ul>" + items + "</ul>")
 
 
+_CELLCTL_BAR = (
+    "<div id=cellctl class=res style='display:flex;gap:.5rem;align-items:center;flex-wrap:wrap'>"
+    "<span id=cellctl_state style='font-size:13px'>&hellip;</span>"
+    "<span id=cellctl_btns></span>"
+    "<span id=cellctl_res style='font-size:13px'></span></div>"
+    "<div id=cellctl_audit style='font-size:12px;color:#888;margin:.1rem 0 .7rem;white-space:pre-wrap'></div>")
+
+_CELLCTL_JS = r"""
+function cpost(u,b){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(function(r){return r.json();});}
+function cesc(s){return (s+'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function cellAct(action,confirmMsg){
+  if(confirmMsg && !confirm(confirmMsg))return;
+  var rr=document.getElementById('cellctl_res'); if(rr)rr.innerHTML=' &hellip;';
+  cpost('/api/control',{action:action,cell:CELL}).then(function(r){
+    if(rr)rr.innerHTML = r.ok ? ' <span class=ok>'+cesc(r.action||action)+' ok</span>'
+                              : ' <span class=err>'+cesc(r.error||'failed')+'</span>';
+    setTimeout(cellStatus,500);
+  }).catch(function(){if(rr)rr.innerHTML=' <span class=err>request failed</span>';});
+}
+function cellStatus(){
+  fetch('/api/cell/status?cell='+encodeURIComponent(CELL)).then(function(r){return r.json();}).then(function(s){
+    var stt = s.live ? (s.paused?'paused':'running') : (s.last_state||'idle');
+    var col = s.live ? (s.paused?'#fc6':'#6c6')
+                     : ((s.last_state==='FAILED'||s.last_state==='ABORTED')?'#f88':'#9cf');
+    var el=document.getElementById('cellctl_state');
+    if(el)el.innerHTML='this cell: <b style="color:'+col+'">'+cesc(stt)+'</b>';
+    var b='';
+    if(s.can_pause)       b+='<button class="act pause" onclick="cellAct(\'cell_pause_toggle\')">&#9208; Pause</button>';
+    if(s.can_resume)      b+='<button class="act resume" onclick="cellAct(\'cell_pause_toggle\')">&#9654; Resume</button>';
+    if(s.can_stop)        b+='<button class="act stop" onclick="cellAct(\'cell_stop\',\'Stop this cell? It will be marked FAILED and can be resumed after.\')">&#9209; Stop</button>';
+    if(s.can_resume_fail) b+='<button class="act start" onclick="cellAct(\'cell_resume_fail\')">&#8635; Resume run</button>';
+    if(!b)b='<small style="color:#666">no actions available for the current state</small>';
+    var bt=document.getElementById('cellctl_btns'); if(bt)bt.innerHTML=b;
+    var au=document.getElementById('cellctl_audit');
+    if(au){var lines=(s.audit||[]).slice(-4).map(cesc).join('\n');
+           au.textContent = lines ? ('control log:\n'+lines) : '';}
+  }).catch(function(){});
+}
+cellStatus();setInterval(cellStatus,4000);
+"""
+
+
 def cell_page(run_dir, cell):
     cell_q = quote(cell)
     stats_js = ("setInterval(function(){"
@@ -382,11 +498,15 @@ def cell_page(run_dir, cell):
                 ".then(function(r){return r.text();})"
                 ".then(function(h){var el=document.getElementById('cell-progress');if(el)el.innerHTML=h;})"
                 ".catch(function(){});},4000);")
-    body = (f"<p><a href='/'>&laquo; grid</a></p><h2>{html.escape(cell)}</h2>"
+    cellctl_js = "var CELL=" + json.dumps(cell) + ";" + _CELLCTL_JS
+    body = (f"<p><a href='/'>&laquo; grid</a> &nbsp;|&nbsp; <a href='/api/download?cell={cell_q}' "
+            f"title='Download all artifacts for this cell as a ZIP'>&#8681; download results (ZIP)</a></p>"
+            f"<h2>{html.escape(cell)}</h2>"
+            + _CELLCTL_BAR
             + f"<div id=cell-progress>{cell_progress_html(cell)}</div>"
             + toggle_bar("the log list refreshes every 8s; click a log to read it")
             + "<div id=content>" + cell_content(run_dir, cell) + "</div>")
-    return page(cell, body, fragment_js(f"/cell/{cell_q}?body=1", 8) + stats_js)
+    return page(cell, body, fragment_js(f"/cell/{cell_q}?body=1", 8) + stats_js + cellctl_js)
 
 
 # ---- log view ------------------------------------------------------------
@@ -751,6 +871,25 @@ class H(BaseHTTPRequestHandler):
     def _send_json(self, obj, code=200):
         self._send(json.dumps(obj), code, ctype="application/json; charset=utf-8")
 
+    def _send_file(self, path, filename, ctype="application/zip"):
+        """Stream a file as an attachment download (chunked — never read whole into RAM)."""
+        try:
+            size = os.path.getsize(path)
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition",
+                             'attachment; filename="%s"' % filename.replace('"', ""))
+            self.end_headers()
+            with open(path, "rb") as fh:
+                while True:
+                    chunk = fh.read(256 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except BrokenPipeError:
+            pass
+
     def _is_local(self):
         # Mutating endpoints are reachable only from localhost — i.e. through the
         # auth-terminating nginx reverse proxy on the same host. A direct request
@@ -812,6 +951,10 @@ class H(BaseHTTPRequestHandler):
                 cell_param = (q.get("cell") or [""])[0]
                 self._send(cell_progress_html(cell_param) if cell_param else "",
                            ctype="text/html; charset=utf-8")
+            elif path == "/api/cell/status":
+                cell_param = (q.get("cell") or [""])[0]
+                self._send_json(ctl.cell_status(cell_param) if ctl
+                                else {"error": "control engine unavailable"})
             elif path.startswith("/cell/"):
                 if not rd:
                     self._send("<h3>No active run</h3><a href=/>← grid</a>", 404)
@@ -826,6 +969,30 @@ class H(BaseHTTPRequestHandler):
                 pg = view_page(rd, (q.get("f") or [""])[0], bool(q.get("full"))) if rd else None
                 self._send(pg if pg else "<h3>403 — not a log file</h3><a href=/>&laquo; grid</a>",
                            200 if pg else 403)
+            elif path == "/api/download":
+                # Bundle one project__profile execution (results, logs, reports,
+                # metrics, config, patches, validation outputs) into a single ZIP.
+                cell = (q.get("cell") or [""])[0]
+                if ctl is None:
+                    self._send("control engine unavailable", 503,
+                               ctype="text/plain; charset=utf-8")
+                elif not self._is_local():
+                    self._send("forbidden (downloads are localhost-only — reach the "
+                               "dashboard via the nginx auth proxy)", 403,
+                               ctype="text/plain; charset=utf-8")
+                else:
+                    try:
+                        arc = ctl.build_cell_archive(cell)
+                    except ValueError:
+                        self._send("<h3>404 — unknown cell</h3><a href=/>&laquo; grid</a>", 404)
+                    else:
+                        try:
+                            self._send_file(arc["path"], arc["filename"])
+                        finally:
+                            try:
+                                os.remove(arc["path"])
+                            except OSError:
+                                pass
             else:
                 self._send("<h3>404</h3><a href=/>&laquo; grid</a>", 404)
         except Exception as e:
@@ -895,6 +1062,13 @@ class H(BaseHTTPRequestHandler):
             return ctl.pause_run()
         if action == "resume":
             return ctl.resume_run()
+        # Per-cell controls (project pages) — target ONE cell, not the whole run.
+        if action == "cell_pause_toggle":
+            return ctl.pause_toggle_cell(str(body.get("cell", "")))
+        if action == "cell_stop":
+            return ctl.stop_cell(str(body.get("cell", "")))
+        if action == "cell_resume_fail":
+            return ctl.resume_failed_cell(str(body.get("cell", "")))
         return {"ok": False, "error": f"unknown action {action!r}"}
 
     def _handle_preview(self, body):

@@ -583,4 +583,50 @@ The end-to-end data contract was traced against code and is **structurally consi
 
 9. **[RESOLVED 2026-06-25] 30-min manual pause implemented.** `_wait_for_manual_verification` now consumes `manual_verify_timeout` and `poll_interval` via `select.select`; marker files are polled between prompts; countdown shown; auto-skips on timeout.
 
-10. **Phase 4 report never run against a real pipeline output; stale-chart and mtime-summary-selection hazards unverified in practice.**
+10. **Phase 4 report never run against a real pipeline output; stale-chart and mtime-summary-selection hazards unverified in practice.** **[PARTIALLY ANSWERED — 2026-06-25 run]** the full-scale run below exercised Phase 4 end-to-end for all 12 cells (`reports/pipeline_report_*.md` + PNG charts produced), so the "never run against real output" caveat no longer holds; the stale-chart / mtime-selection hazards remain unaudited against that output.
+
+---
+
+## Experimental Validation & Runtime Optimization (first full-scale run, 2026-06-25)
+
+> Added after the audit body. The audit above is a static read of the code; this section records the **first full-scale execution** of the whole pipeline, the **runtime optimizations implemented immediately after it**, and the **before/after evaluation** they enable. The run's complete artifacts are archived (`run-archives/2026-06-25_pre-optimization-baseline/`, full fidelity, sha256-verified).
+
+### What was run
+
+A complete **3 projects × 4 models = 12-cell matrix** over **218 aggregated CVEs**, on the **pre-optimization** code (every phase **sequential**). Matrix run `runs/20260625_163449`. Profile→model: `ollama-proxy-qwen`→**qwen2.5:1.5b**, `ollama-proxy-qwen-coder`→**qwen2.5-coder:1.5b**, `openai-fast`→**gpt-4.1-nano**, `openai-mix`→**gpt-4.1-mini**. Projects: glibc, openssl, tcpdump.
+
+Phases 0–1 carry no LLM and so are identical across a project's four cells (**verified**: glibc 26/58 reproduced, openssl 10/22, in all four cells) — empirical confirmation of the "Phase 1 manifest → Phase 2/3" model-independence asserted structurally in *Cross-Phase Data Flow*.
+
+### Results (extracted from run artifacts)
+
+**Reproduction (Phase 0–1, model-independent):** glibc 26/58 (32→manual), openssl 10/22 (12→manual), tcpdump 122/138 (16→manual).
+
+**Quality** — `Total successful = Phase-3-initial passes (validation_summary.summary.successful) + feedback repairs (outcome_breakdown.successful_after_retry)`; the two are **disjoint** (the feedback loop only re-processes Phase-3 failures). NB: the pipeline's `pipeline_run.patches_successful` field counts **only** the feedback repairs and excludes the initial passes, so it must not be read as the grand total.
+
+| Project (validated/model) | qwen2.5:1.5b | qwen2.5-coder:1.5b | gpt-4.1-nano | gpt-4.1-mini |
+|---|--:|--:|--:|--:|
+| glibc (23)   | 2  | 1  | 3  | 5  |
+| openssl (9)  | 0  | 0  | 1  | 1  |
+| tcpdump (120)| 22 | 24 | 51 | 56 |
+
+- **Model ordering is consistent**: `gpt-4.1-mini ≥ gpt-4.1-nano ≥ {qwen-coder:1.5b, qwen:1.5b}` in every project.
+- **`successful_first_try = 0` in all 12 cells** — every repaired patch came via the feedback loop (`successful_after_retry`). The dashed Phase-3→Phase-2 edge audited in *Cross-Cutting* is, empirically, the **sole** source of correct patches in this run — a sharp reversal of the pilot's 0% retry rate, and a strong argument for the in-process feedback path despite the "diverges from the subprocess model" hazard flagged in Top Risks.
+
+**Runtime (sequential baseline):** Phase 1 and Phase 3 dominate every cell; per-cell totals (incl. the in-process feedback loop) range 56m (openssl·qwen-coder) to 11h57m (tcpdump·qwen-coder). Full per-phase table in the archive `ARCHIVE-README.md` §5.3.
+
+**Data-handling artefact (NOT a runtime optimization target):** each tcpdump cell's `results/results.json` is **≈6.6 GB** (vs. 220 KB on glibc) because Phase 1 captures each PoC's **entire stdout unbounded** into the per-CVE record (`orchestrator.py` `_run_baseline_once` → `_extract_result_record`, the `run_logs` field) and one tcpdump PoC emits millions of repetitions of a single token. Independent of the optimizations below; a candidate future fix is to bound captured PoC/tool output before serialization.
+
+### Runtime optimizations implemented AFTER this run
+
+Both are **opt-in, sequential-by-default** (so the archived run is a clean baseline) and **runtime-only** (patch logic unchanged → quality must be preserved). Verified by diffing the archived pre-optimization snapshot against the current code.
+
+| # | Phase | Optimization | Code |
+|---|---|---|---|
+| 1 | 1 | **Concurrent baseline capture.** New `baseline_max_parallel`: the N baseline PoC runs execute concurrently. Decisive for **timeout/hang** baselines, where unanimity needs every run to reach `run_timeout` — collapses `baseline_runs × run_timeout` of waiting into ≈ one `run_timeout`. `max_parallel=1` is byte-for-byte the old sequential+early-stop path. | `orchestrator.py`: `_load_baseline_policy` (now returns the triple, ~`163–192`), new `_run_baseline_once`/`_finalize_baseline` helpers (~`3294–3336`), `ThreadPoolExecutor` path in `_capture_baseline` (~`3398–3433`) |
+| 2 | 3 | **Concurrent patch validation.** New `--max-workers`: independent patches validated in parallel (each a Docker rebuild + PoC re-run + host SAST on `(cve, model)`-unique names). `1` = sequential (default). | `patch_validator.py`: `self.max_workers` (~`1467`), `_validate_one` + parallel merge block (~`1559–1614`), `--max-workers` arg (~`2098–2106`) |
+
+Other diffs (`patch_generator.py`, `master_pipeline/feedback.py`, `master_pipeline/orchestrator.py`) are **cosmetic logging only**; `config.yaml` is unchanged.
+
+### Planned before/after evaluation
+
+Re-run the identical matrix on the optimized code and compare along: **projects** (glibc/openssl/tcpdump) × **models** (the four above) × **result quality** (must match the table above — a correctness-regression check on the optimizations) × **runtime before** (this sequential baseline) × **runtime after** (parallel) × **speedup** (expected concentrated in Phases 1 and 3). Reporting per-phase and end-to-end speedup against unchanged quality isolates the optimizations' benefit from model/project effects.

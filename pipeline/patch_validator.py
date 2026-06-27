@@ -33,6 +33,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Try to import docker, provide helpful error if not installed
 try:
@@ -450,10 +451,16 @@ class PatchDiscovery:
     def __init__(self, patches_dir: Path, logger: logging.Logger):
         self.patches_dir = patches_dir
         self.logger = logger
-    
+        # Patches that exist on disk but are deliberately NOT validated (test-file
+        # targets, no usable patch produced). Recorded here so the Phase 3 summary
+        # can report the Phase 2 → Phase 3 hand-off drop instead of silently
+        # shrinking total_validations. Populated by _load_patch_info().
+        self.skipped_patches: List[Dict[str, str]] = []
+
     def discover_patches(self, cve_filter: Optional[str] = None) -> List[PatchInfo]:
         """Discover all patches in the patches directory"""
         patches = []
+        self.skipped_patches = []   # fresh per discovery run
         
         self.logger.info(f"Discovering patches in: {self.patches_dir}")
         
@@ -560,6 +567,10 @@ class PatchDiscovery:
                     f"{cve_id}/{model_name}: patch target {original_filepath!r} is a TEST file, "
                     f"not vulnerable source — skipping (a test-file patch cannot be a real fix)"
                 )
+                self.skipped_patches.append({
+                    "cve": cve_id, "model": model_name,
+                    "reason": "test_file_target", "target": original_filepath,
+                })
                 return None
 
         # Only return if we have a valid patched file
@@ -576,8 +587,11 @@ class PatchDiscovery:
             )
             self.logger.debug(f"Loaded patch: {cve_id}/{model_name} (valid={is_valid})")
             return patch_info
-        
+
         self.logger.warning(f"No valid patch file found in {model_dir}")
+        self.skipped_patches.append({
+            "cve": cve_id, "model": model_name, "reason": "no_patch_file",
+        })
         return None
 
 
@@ -1306,6 +1320,17 @@ class ValidationReportGenerator:
         patch_not_found = sum(1 for r in self.results if r.status == ValidationStatus.PATCH_NOT_FOUND.value)
         unknown_errors = sum(1 for r in self.results if r.status == ValidationStatus.UNKNOWN_ERROR.value)
         
+        # Patches discovered but deliberately NOT validated (test-file targets / no
+        # usable patch). Recorded so total_validations + skipped reconciles with the
+        # Phase 2 patch-task count (the funnel hand-off), instead of total_validations
+        # silently shrinking.
+        skipped = list(getattr(self, "skipped_patches", []) or [])
+        skipped_cves = sorted({(s.get("cve") or "").upper() for s in skipped if s.get("cve")})
+        skipped_by_reason: Dict[str, int] = {}
+        for s in skipped:
+            r = s.get("reason", "unknown")
+            skipped_by_reason[r] = skipped_by_reason.get(r, 0) + 1
+
         # Calculate total execution time
         total_execution_time = sum(r.execution_time_seconds for r in self.results)
         
@@ -1336,6 +1361,7 @@ class ValidationReportGenerator:
                 "generated_at": datetime.now().isoformat(),
                 "phase": "Phase 3 - Multi-Layered Validation",
                 "total_validations": total,
+                "patches_skipped": len(skipped),
             },
             "phase_timing": {
                 "start_time": phase_start.isoformat() if phase_start else None,
@@ -1358,6 +1384,13 @@ class ValidationReportGenerator:
                 "patch_not_found": patch_not_found,
                 "unknown_errors": unknown_errors,
                 "total_failures": total - successful,
+            },
+            "skipped": {
+                "total": len(skipped),
+                "distinct_cves": len(skipped_cves),
+                "by_reason": skipped_by_reason,
+                "cves": skipped_cves,
+                "detail": skipped,
             },
             "timing_by_cve": cve_timings,
             "timing_by_model": model_timings,
@@ -1431,6 +1464,11 @@ class ValidationPipeline:
         self.exploits_dir = Path(args.exploits_dir).resolve()
         self.build_timeout = args.build_timeout
         self.run_timeout = args.run_timeout
+        # Patches validated concurrently. Each patch is an independent, CPU/IO-bound
+        # Docker rebuild + PoC re-run on DISTINCT image/container/build-dir names
+        # (cve+model), so they don't collide; results are merged on the main thread.
+        # 1 = sequential (the default, byte-for-byte the prior behavior).
+        self.max_workers = max(1, int(getattr(args, "max_workers", 1) or 1))
         self.cleanup = args.cleanup
         self.specific_cve = args.cve
 
@@ -1502,7 +1540,10 @@ class ValidationPipeline:
         
         # Discover patches
         patches = self.patch_discovery.discover_patches(self.specific_cve)
-        
+        # Carry the deliberately-skipped patches (test-file targets / no usable
+        # patch) into the summary so the Phase 2 → Phase 3 hand-off is auditable.
+        self.report_gen.skipped_patches = list(self.patch_discovery.skipped_patches)
+
         if not patches:
             self.logger.error("No patches found to validate")
             sys.exit(1)
@@ -1515,28 +1556,61 @@ class ValidationPipeline:
             live_progress.emit(_live_dir, 3, total_patches, 0,
                                self.report_gen.live_counts())
 
-        # Process each patch
-        for idx, patch_info in enumerate(patches, 1):
-            self.logger.info(f"\n{'='*60}")
-            self.logger.info(f"Validating ({idx}/{len(patches)}): {patch_info.cve_id} / {patch_info.model_name}")
-            self.logger.info(f"{'='*60}")
-            
-            # Get vulnerability info
+        # Validate one patch: the heavy, CPU/IO-bound Docker rebuild + PoC re-run +
+        # host-side SAST. Pure w.r.t. shared state — it only READS self.manifest /
+        # the vuln map and works on image/container/build-dir names unique to
+        # (cve, model), so it is safe to run concurrently. Returns (patch_info,
+        # result) with result=None when the CVE has no vulnerability info.
+        def _validate_one(patch_info):
+            self.logger.info(
+                f"\n{'='*60}\nValidating: {patch_info.cve_id} / {patch_info.model_name}\n{'='*60}"
+            )
             vuln_info = vuln_info_map.get(patch_info.cve_id)
             if not vuln_info:
                 self.logger.warning(f"No vulnerability info found for {patch_info.cve_id}")
-                if live_progress:
-                    live_progress.emit(_live_dir, 3, total_patches, idx,
-                                       self.report_gen.live_counts())
-                continue
-
+                return patch_info, None
             result = self._validate_patch(patch_info, vuln_info)
-            self.report_gen.add_result(result)
-            self.logger.info(f"Validation completed for {patch_info.cve_id}/{patch_info.model_name}: "
-                           f"{result.status} (duration: {result.execution_time_seconds:.1f}s)")
+            self.logger.info(
+                f"Validation completed for {patch_info.cve_id}/{patch_info.model_name}: "
+                f"{result.status} (duration: {result.execution_time_seconds:.1f}s)"
+            )
+            return patch_info, result
+
+        # Merge a finished result. MAIN-THREAD ONLY (called sequentially below in
+        # both modes), so report_gen / live_progress need no locking.
+        def _merge(result, done):
+            if result is not None:
+                self.report_gen.add_result(result)
             if live_progress:
-                live_progress.emit(_live_dir, 3, total_patches, idx,
+                live_progress.emit(_live_dir, 3, total_patches, done,
                                    self.report_gen.live_counts())
+
+        if self.max_workers <= 1:
+            # Sequential — identical to the prior behavior.
+            for idx, patch_info in enumerate(patches, 1):
+                _, result = _validate_one(patch_info)
+                _merge(result, idx)
+        else:
+            # Parallel: workers run _validate_one (independent Docker work); the
+            # main thread merges each result as it completes.
+            self.logger.info(
+                f"Validating {total_patches} patches with {self.max_workers} parallel workers "
+                f"(Docker rebuild/PoC re-run is CPU/IO-bound)."
+            )
+            done = 0
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = {executor.submit(_validate_one, p): p for p in patches}
+                for future in as_completed(futures):
+                    done += 1
+                    try:
+                        _, result = future.result()
+                    except Exception as exc:
+                        p = futures[future]
+                        self.logger.error(
+                            f"Validation thread crashed for {p.cve_id}/{p.model_name}: {exc}"
+                        )
+                        result = None
+                    _merge(result, done)
 
         if live_progress:
             live_progress.emit(_live_dir, 3, total_patches, total_patches,
@@ -2019,7 +2093,16 @@ Examples:
         default=int(_val_cfg.get("poc_timeout", _cfg.get("run_timeout", 300))),
         help='Container run timeout in seconds (default: from config.yaml)'
     )
-    
+
+    parser.add_argument(
+        '--max-workers',
+        type=int,
+        default=int(_val_cfg.get("max_workers", 1)),
+        help='Validate this many patches concurrently (Docker rebuild + PoC re-run '
+             'are CPU/IO-bound, not GPU). 1 = sequential (default). Raise on a '
+             'multi-core host with enough RAM (each build is a full project compile).'
+    )
+
     parser.add_argument(
         '--skip-sast',
         action='store_true',

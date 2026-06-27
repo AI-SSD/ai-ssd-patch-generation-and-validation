@@ -164,13 +164,13 @@ class IterativeFeedbackLoop:
             result.final_patch_path = initial_validation_result.patch_file
             result.total_duration_seconds = (end_time - start_time).total_seconds()
             result.end_time = end_time.isoformat()
-            self.logger.info(f"✓ {cve_id}/{model_name} passed on first attempt")
+            self.logger.info(f"  ✓ passed on first attempt (no retry needed)")
             return result
         
         # Initial validation failed - enter feedback loop
         self.logger.info(
-            f"[FEEDBACK LOOP] Starting retry cycle for {cve_id}/{model_name} "
-            f"(max {self.max_retries} retries)"
+            f"  initial attempt failed ({initial_validation_result.status})"
+            f" — entering retry cycle (max {self.max_retries})"
         )
         
         current_validation = initial_validation_result
@@ -199,8 +199,8 @@ class IterativeFeedbackLoop:
             # Resolve the model for THIS attempt (attempt number = retry + 1).
             attempt_model = self._model_for_attempt(retry + 1)
             self.logger.info(
-                f"[RETRY {retry}/{self.max_retries}] {cve_id}/{model_name}"
-                + (f" using model {attempt_model}" if attempt_model else "")
+                f"\n  ┌─ Retry {retry}/{self.max_retries}"
+                + (f"  →  {attempt_model}" if attempt_model else "")
             )
 
             # Extract failure context from previous validation
@@ -220,9 +220,7 @@ class IterativeFeedbackLoop:
             if not new_patch_result.get("success"):
                 attempt_end_time = datetime.now()
                 attempt_duration = (attempt_end_time - attempt_start_time).total_seconds()
-                self.logger.warning(
-                    f"Failed to generate retry patch #{retry + 1} for {cve_id}/{model_name}"
-                )
+                self.logger.warning(f"  └─ ✗ generation failed (retry {retry + 1})")
                 result.validation_history.append({
                     "attempt": retry + 1,
                     "is_retry": True,
@@ -275,9 +273,7 @@ class IterativeFeedbackLoop:
                 result.total_duration_seconds = (success_end_time - start_time).total_seconds()
                 result.end_time = success_end_time.isoformat()
                 
-                self.logger.info(
-                    f"✓✓ {cve_id}/{model_name} SUCCEEDED on attempt #{retry + 1}"
-                )
+                self.logger.info(f"  └─ ✓ FIXED on attempt #{retry + 1}")
                 
                 # Copy successful retry patch to main patches directory
                 self._promote_successful_patch(
@@ -293,18 +289,14 @@ class IterativeFeedbackLoop:
             current_validation = new_validation
             previous_patch = new_patch_result.get("patched_function", previous_patch)
 
-            self.logger.warning(
-                f"Retry #{retry} failed for {cve_id}/{model_name}: {new_validation.status}"
-            )
+            self.logger.warning(f"  └─ ✗ retry {retry}/{self.max_retries} failed: {new_validation.status}")
 
             # Environment conditions cannot be fixed by regenerating the
             # patch — abort the retry cycle instead of burning LLM calls.
             if new_validation.status in ("No Phase 1 Baseline", "Execution Error",
                                          "Patch Not Found"):
                 self.logger.warning(
-                    f"Aborting retry cycle for {cve_id}/{model_name}: "
-                    f"'{new_validation.status}' is an environment condition that "
-                    f"patch regeneration cannot fix"
+                    f"  └─ aborting: '{new_validation.status}' cannot be fixed by regeneration"
                 )
                 break
         
@@ -319,7 +311,7 @@ class IterativeFeedbackLoop:
         result.end_time = final_end_time.isoformat()
         
         self.logger.error(
-            f"✗✗ {cve_id}/{model_name} marked as UNPATCHABLE after {result.total_attempts} attempts"
+            f"  ✗ UNPATCHABLE after {result.total_attempts} attempt(s)"
         )
         
         return result

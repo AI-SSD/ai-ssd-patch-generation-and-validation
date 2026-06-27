@@ -1173,7 +1173,9 @@ RECOMMENDED ACTIONS:
             
             initial_result = LoadedValidationResult(failed)
             
-            logger.info(f"\n[FEEDBACK LOOP] Processing ({idx}/{len(failed_patches)}): {cve_id}/{model_name}")
+            logger.info(f"\n{'═' * 60}")
+            logger.info(f"  [{idx}/{len(failed_patches)}] {cve_id}  (base: {model_name})")
+            logger.info(f"{'═' * 60}")
             
             # Run feedback loop for this patch
             try:
@@ -1184,8 +1186,11 @@ RECOMMENDED ACTIONS:
                     initial_validation_result=initial_result
                 )
                 self.feedback_results.append(feedback_result)
-                logger.info(f"[FEEDBACK LOOP] Completed {cve_id}/{model_name}: {feedback_result.final_status.value} "
-                           f"(attempts: {feedback_result.total_attempts}, duration: {feedback_result.total_duration_seconds:.1f}s)")
+                status_sym = "✓" if feedback_result.final_status == PatchStatus.SUCCESS else "✗"
+                logger.info(
+                    f"{status_sym} {cve_id}: {feedback_result.final_status.value}"
+                    f"  ({feedback_result.total_attempts} attempt(s), {feedback_result.total_duration_seconds:.0f}s)"
+                )
             except Exception as e:
                 logger.exception(f"Error in feedback loop for {cve_id}/{model_name}: {e}")
                 # Create failed result with proper timestamps

@@ -56,6 +56,9 @@ _ISSRE_2026___Tiago_Almeida_
 ExploitForge_anon
 /ExploitForge_anon.zip
 
+# Archived pipeline runs (large binary tarballs + extracted artifacts)
+run-archives/
+
 pipeline/API-openai-key
 pipeline/API-nvd-key
 pipeline/API-ollama-proxy

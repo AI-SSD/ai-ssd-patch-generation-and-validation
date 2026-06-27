@@ -23,6 +23,7 @@ from ..utils.git_utils import (
     build_commit_message_index,
     clone_or_update_repo,
     find_cve_fix_commit,
+    find_cve_referencing_commits,
     get_commit_changed_files,
     get_commit_metadata,
     get_file_content_at_commit,
@@ -324,24 +325,46 @@ class CommitDiscovery(PipelineModule):
 
         regression_tests: List[Dict[str, str]] = []
         if harvest_regression_tests:
-            # Makefiles the fixing commit touched, used to resolve each test's REAL
+            # Harvest tests from the chosen fix commit AND any SIBLING commits that
+            # cite the same CVE in their message. The fix and its regression test
+            # are sometimes committed separately (OpenSSL CVE-2016-7055: the fix is
+            # crypto/bn/asm/x86_64-mont.pl, the test a later test/bntest.c commit).
+            # Primary-fix selection now records the CODE commit as the fix, so the
+            # sibling test commit must be mined too or the in-tree reproducer would
+            # be lost. Project-agnostic — keyed only on the CVE id.
+            harvest_sources: List[Tuple[str, List[Dict[str, str]]]] = [
+                (fix, list(ps.changed_files or []))
+            ]
+            for sib in find_cve_referencing_commits(
+                repo_path, cve_id, commit_index=commit_index
+            ):
+                if sib and sib != fix:
+                    harvest_sources.append((sib, get_commit_changed_files(repo_path, sib)))
+
+            # Makefiles touched by ANY harvest source resolve each test's REAL
             # build subdir (the dir whose Makefile registers the test).
-            changed_makefiles = [
-                f["file_path"] for f in (ps.changed_files or [])
-                if f["file_path"].replace("\\", "/").rsplit("/", 1)[-1] == "Makefile"
-            ]
-            makefile_contents = [
-                (m, get_file_content_at_commit(repo_path, m, fix) or "")
-                for m in changed_makefiles
-            ]
-            for finfo in (ps.changed_files or []):
-                tpath = finfo["file_path"]
-                if not is_regression_test_path(tpath, data_test_exts):
-                    continue
-                entry = self._harvest_test_entry(
-                    repo_path, tpath, fix, data_test_exts, makefile_contents)
-                if entry:
-                    regression_tests.append(entry)
+            makefile_contents: List[Tuple[str, str]] = []
+            seen_makefiles: set = set()
+            for ref, files in harvest_sources:
+                for f in files:
+                    fp = f["file_path"]
+                    if (fp.replace("\\", "/").rsplit("/", 1)[-1] == "Makefile"
+                            and fp not in seen_makefiles):
+                        seen_makefiles.add(fp)
+                        makefile_contents.append(
+                            (fp, get_file_content_at_commit(repo_path, fp, ref) or ""))
+
+            seen_paths: set = set()
+            for ref, files in harvest_sources:
+                for finfo in files:
+                    tpath = finfo["file_path"]
+                    if tpath in seen_paths or not is_regression_test_path(tpath, data_test_exts):
+                        continue
+                    entry = self._harvest_test_entry(
+                        repo_path, tpath, ref, data_test_exts, makefile_contents)
+                    if entry:
+                        regression_tests.append(entry)
+                        seen_paths.add(tpath)
 
             # Supplement: in-tree tests that reference THIS CVE by filename or
             # content but were committed SEPARATELY from the fix (so the
@@ -349,7 +372,6 @@ class CommitDiscovery(PipelineModule):
             # tests/CVE-XXXX.c, oss-fuzz projects add CVE/issue-tagged regression
             # inputs. Project-agnostic — matched on the CVE id, read from the
             # checked-out tree (HEAD). De-duped against the fix-commit harvest.
-            seen_paths = {t["repo_path"] for t in regression_tests}
             for tpath in self._find_cve_tagged_tests(repo_path, cve_id, data_test_exts):
                 if tpath in seen_paths:
                     continue

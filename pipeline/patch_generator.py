@@ -17,6 +17,7 @@ import json
 import time
 import logging
 import tempfile
+import threading
 import subprocess
 from pathlib import Path
 from datetime import datetime
@@ -43,6 +44,7 @@ from master_pipeline.config import (  # noqa: E402
 # corrupted by braces/apostrophes in comments (e.g. GNU-style `foo' quoting)
 # or by #if/#else groups that open the same brace in every branch.
 from cve_aggregator.utils.code_parser import _build_analysis_view  # noqa: E402
+from cve_aggregator.utils.gpu_lock import gpu_lock  # noqa: E402
 from cve_aggregator.utils.llm_compat import (  # noqa: E402
     is_openai_reasoning_model as _shared_is_openai_reasoning_model,
 )
@@ -101,10 +103,21 @@ FEEDBACK_MODELS_BY_ATTEMPT = {
 if LLM_PROVIDER == "openai" and FEEDBACK_MODELS_BY_ATTEMPT.get("1"):
     OPENAI_MODEL = FEEDBACK_MODELS_BY_ATTEMPT["1"]
 
+# Host-global GPU mutex: serialize GPU-bound inference across concurrent cells so
+# the single shared Ollama GPU isn't thrashed by two model families at once. No-op
+# for the OpenAI provider and uncontended (≈free) when only one cell runs. Disable
+# with llm.gpu_lock: false or SSD_GPU_LOCK=0.
+GPU_LOCK_ENABLED = bool(_llm.get("gpu_lock", True))
+
 # Shared request settings
 API_TIMEOUT = int(_llm.get("timeout", 600))
 MAX_RETRIES = int(_llm.get("retry_attempts", 3))
 RETRY_DELAY = int(_llm.get("retry_delay", 5))
+# How often (seconds) the background pulser refreshes the live-progress heartbeat
+# while a single CVE is being processed, so the executor's idle watchdog does not
+# false-kill a phase that is healthy but blocked inside one long LLM call. Must be
+# well under the Phase-2 idle timeout (config phase_idle_timeouts[2]). 0 disables.
+LLM_HEARTBEAT_INTERVAL = int(_llm.get("heartbeat_interval", 60))
 
 # LLM Parameters
 LLM_TEMPERATURE = float(_llm.get("temperature", 0.2))
@@ -737,6 +750,80 @@ def _model_max_ctx(model: str) -> int:
     return ctx
 
 
+def _request_with_deadline(method: str, url: str, deadline: float, **kwargs):
+    """Run a blocking ``requests`` call under a HARD wall-clock *deadline* (s).
+
+    ``requests``' own ``timeout=`` is an *inactivity* (between-bytes) timeout, so a
+    wedged backend that dribbles a byte every few seconds can block far past it —
+    this is exactly the failure that stalled a Phase-2 run for ~30 min on a single
+    CVE. Running the call in a daemon thread and joining for ``deadline`` seconds
+    turns it into a true total-time cap: if it has not returned by then we raise
+    ``Timeout`` and abandon the worker (it dies on its own once its socket times
+    out). The worker does NOT hold the GPU lock — the dispatcher does — so
+    abandoning it is safe. This is what makes one hung LLM call recoverable
+    (caught per-attempt, then per-CVE) instead of phase-fatal.
+    """
+    box: Dict[str, Any] = {}
+
+    def _worker():
+        try:
+            box["resp"] = requests.request(method, url, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 — re-raised in the caller below
+            box["exc"] = exc
+
+    t = threading.Thread(target=_worker, daemon=True, name="llm-http")
+    t.start()
+    t.join(deadline)
+    if t.is_alive():
+        raise requests.exceptions.Timeout(
+            f"hard deadline {deadline:.0f}s exceeded (backend unresponsive)")
+    if "exc" in box:
+        raise box["exc"]
+    return box["resp"]
+
+
+class _HeartbeatPulser:
+    """Background daemon that periodically refreshes the live-progress heartbeat.
+
+    The executor's idle watchdog keys "is this phase alive?" off the mtime of
+    ``results/.live_progress_p{N}.json``, which the main loop only rewrites *after*
+    each CVE completes. A single long (or wedged) LLM call therefore produces no
+    heartbeat for its whole duration and can trip the idle kill, taking the rest
+    of the phase (and Phases 3–4) down with it. This pulser re-emits the heartbeat
+    every ``interval`` seconds for as long as a CVE is being processed, so a
+    healthy-but-slow CVE keeps the watchdog satisfied while the hard per-call
+    deadline above still bounds a genuinely stuck one. Strictly best-effort: the
+    pulse callback swallows its own errors and the thread only ever writes a tiny
+    file, so it cannot disturb or slow the run, and it never touches the GPU lock.
+    """
+
+    def __init__(self, pulse, interval: int):
+        self._pulse = pulse
+        self._interval = max(5, int(interval)) if interval else 0
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def __enter__(self):
+        if self._pulse and self._interval:
+            self._thread = threading.Thread(
+                target=self._run, daemon=True, name="phase2-heartbeat")
+            self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.wait(self._interval):
+            try:
+                self._pulse()
+            except Exception:  # noqa: BLE001 — heartbeat must never break a run
+                pass
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        return False
+
+
 def _call_ollama_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[Optional[str], Dict[str, Any]]:
     """Call the Ollama-compatible local server API with retry logic.
 
@@ -799,7 +886,11 @@ def _call_ollama_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[
     for attempt in range(MAX_RETRIES):
         try:
             logger.debug(f"Ollama API call attempt {attempt + 1}/{MAX_RETRIES} for model {model}")
-            response = requests.post(API_ENDPOINT, json=payload, timeout=API_TIMEOUT, auth=OLLAMA_AUTH)
+            # HARD wall-clock cap (not just requests' inactivity timeout) so a
+            # wedged/dribbling backend can't block this attempt past API_TIMEOUT.
+            response = _request_with_deadline(
+                "POST", API_ENDPOINT, deadline=API_TIMEOUT,
+                json=payload, timeout=API_TIMEOUT, auth=OLLAMA_AUTH)
             response.raise_for_status()
             result = response.json()
             content = result.get('message', {}).get('content', '')
@@ -985,9 +1076,17 @@ def call_llm_api(model: str, user_prompt: str, system_prompt: Optional[str] = No
     # import (main() re-applies phase2 once --phase0-config is known) is honored.
     if system_prompt is None:
         system_prompt = SYSTEM_PROMPT
-    if LLM_PROVIDER == "openai":
-        return _call_openai_api(model_override or OPENAI_MODEL, user_prompt, system_prompt)
-    return _call_ollama_api(model_override or model, user_prompt, system_prompt)
+    # Hold the host-global GPU mutex for the duration of this inference so a
+    # concurrent cell's GPU work can't thrash the shared model. No-op for OpenAI
+    # and uncontended when a single cell runs. Per-call here is safe: Phase 2 and
+    # the feedback loop both reach this dispatcher sequentially (no intra-process
+    # threads), and releasing between calls lets other GPU tasks interleave.
+    _used_model = (model_override or OPENAI_MODEL) if LLM_PROVIDER == "openai" else (model_override or model)
+    with gpu_lock(LLM_PROVIDER, enabled=GPU_LOCK_ENABLED, endpoint=API_ENDPOINT,
+                  logger=logger, label=f"phase2:{_used_model}"):
+        if LLM_PROVIDER == "openai":
+            return _call_openai_api(model_override or OPENAI_MODEL, user_prompt, system_prompt)
+        return _call_ollama_api(model_override or model, user_prompt, system_prompt)
 
 # =============================================================================
 # Code Extraction & Cleaning
@@ -1953,7 +2052,9 @@ def process_single_vulnerability(
     file_context = row['V_FILE']
     original_filepath = row['FilePath']
     
-    logger.info(f"Processing {cve_id} - {function_name} with {model}")
+    logger.info(f"\n{'─' * 60}")
+    logger.info(f"  {cve_id}  [{function_name}]  model={model}")
+    logger.info(f"{'─' * 60}")
     
     result = {
         "cve_id": cve_id,
@@ -2118,9 +2219,8 @@ def generate_patch_with_feedback(
     # back to the provider default (OPENAI_MODEL for OpenAI, else the loop model).
     effective_model = generation_model or (OPENAI_MODEL if LLM_PROVIDER == "openai" else model)
     logger.info(
-        f"[FEEDBACK LOOP] Generating retry patch #{attempt_number} for {cve_id} "
-        f"with {effective_model}"
-        + (f" (escalated from loop model {model})" if generation_model and generation_model != model else "")
+        f"    generating with {effective_model}"
+        + (f" (escalated from {model})" if generation_model and generation_model != model else "")
     )
 
     result = {
@@ -2312,6 +2412,7 @@ def run_pipeline(
     # stale results/image_manifest.json and ignores its OWN reproduced CVEs.
     if manifest_path is None:
         manifest_path = OUTPUT_DIR.parent / str(_paths.get("results", "results")) / "image_manifest.json"
+    reproduced = None   # set when the manifest is read; drives funnel bookkeeping
     if manifest_path.exists():
         try:
             with open(manifest_path) as f:
@@ -2334,6 +2435,32 @@ def run_pipeline(
     else:
         logger.warning(f"No Phase 1 manifest at {manifest_path} — proceeding with all CVEs")
 
+    # Funnel bookkeeping (persisted so the dashboard reconciles Phase 1 → Phase 2
+    # from the artifact instead of inferring it): CVEs Phase 1 reproduced but
+    # skipped here for having no extractable vulnerable function (empty
+    # V_FUNCTION/F_NAME/FilePath — e.g. test-only fix commits). The only filters
+    # between "reproduced" and "patch task" are the reproduced gate itself and the
+    # no-function drop in load_vulnerability_data(), so this difference is exactly
+    # the no-function set.
+    _df_cves = {str(c).upper() for c in df['CVE'].unique()}
+    if reproduced is not None:
+        _repro_up = {str(c).upper() for c in reproduced}
+        # A --cve filter restricts this run to a subset; without intersecting,
+        # reproduced CVEs outside the filter would be mislabeled "no function".
+        if cve_filter:
+            _repro_up &= {str(c).upper() for c in cve_filter}
+        skipped_no_function = sorted(_repro_up - _df_cves)
+        phase1_reproduced = len(_repro_up)
+    else:
+        skipped_no_function = []
+        phase1_reproduced = None
+    funnel = {
+        "phase1_reproduced": phase1_reproduced,
+        "patch_cves": len(_df_cves),
+        "skipped_no_function": skipped_no_function,
+        "skipped_no_function_count": len(skipped_no_function),
+    }
+
     if len(df) == 0:
         # Legitimate empty result, NOT a failure: this run simply reproduced no
         # CVEs in Phase 1 (e.g. a project whose only PoCs don't exercise the build),
@@ -2346,7 +2473,8 @@ def run_pipeline(
         # for THIS run — otherwise a stale pipeline_summary.json (e.g. a previous
         # project's run in a shared base-dir) would be read and show a bogus count.
         empty_summary = {"summary": {"total_tasks": 0, "successful": 0,
-                                     "syntax_valid": 0, "failed": 0}, "results": []}
+                                     "syntax_valid": 0, "failed": 0},
+                         "funnel": funnel, "results": []}
         try:
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             with open(OUTPUT_DIR / "pipeline_summary.json", "w") as f:
@@ -2384,7 +2512,14 @@ def run_pipeline(
             logger.info(f"\nTask {current_task}/{total_tasks} - {row['CVE']} with {model}")
             
             try:
-                result = process_single_vulnerability(row, model)
+                # Keep the idle watchdog informed for the whole CVE (LLM call +
+                # post-processing), not just at completion, so a healthy-but-slow
+                # CVE is not mistaken for a stalled phase. The hard per-call
+                # deadline still bounds a genuinely stuck call; a failure there is
+                # caught here, recorded, and the loop moves on (stall isolation).
+                with _HeartbeatPulser(lambda: _emit_live(len(results)),
+                                      LLM_HEARTBEAT_INTERVAL):
+                    result = process_single_vulnerability(row, model)
                 results.append(result)
                 task_duration = (datetime.now() - task_start).total_seconds()
                 logger.info(f"Completed task {current_task}/{total_tasks} in {task_duration:.1f}s")
@@ -2503,6 +2638,7 @@ def run_pipeline(
             "success_rate": f"{(api_success/total_tasks*100):.1f}%" if total_tasks > 0 else "N/A",
             "syntax_valid_rate": f"{(syntax_valid/total_tasks*100):.1f}%" if total_tasks > 0 else "N/A",
         },
+        "funnel": funnel,
         "model_statistics": model_stats,
         "cve_statistics": cve_stats,
         "results": results

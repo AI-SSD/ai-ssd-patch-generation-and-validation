@@ -24,6 +24,7 @@ import requests
 
 from ..models import CVEEntry, Dataset, SyntaxValidationResult
 from ..utils.file_utils import get_file_extension_for_language
+from ..utils.gpu_lock import gpu_lock
 from ..utils.llm_compat import (
     is_unsupported_temperature_error,
     openai_temperature_kwargs,
@@ -32,6 +33,28 @@ from .base import PipelineModule
 from .syntax_validator import SyntaxValidator
 
 logger = logging.getLogger(__name__)
+
+
+# Minimum output room (tokens) a model must have AFTER the prompt to be usable.
+# If the prompt leaves less than this within the model's window, the prompt is
+# treated as too large for that model and the repair ramp advances to the next
+# (larger-context) model instead of letting the server silently truncate it.
+# Mirrors patch_generator.py's Phase-2 guard.
+_MIN_OUTPUT_HEADROOM = 1024
+
+# Per-model max-context cache (read once from Ollama's /api/show, then reused).
+# Shared across the repair worker threads — best-effort, dict writes are atomic
+# enough under the GIL (worst case is a redundant /api/show probe).
+_MODEL_MAX_CTX_CACHE: Dict[str, int] = {}
+
+# Languages PoCRepairLLM can meaningfully repair (those with a syntax validator
+# and language-specific guidance). Anything else — plain-text advisories, .txt
+# write-ups, unknown/binary content — is prose, not a runnable PoC: trying to
+# "fix the syntax" of prose is impossible and only wastes LLM attempts, so such
+# items are skipped at collection time and only ACTUAL code PoCs reach the ramp.
+_REPAIRABLE_LANGUAGES = frozenset({
+    "c", "cpp", "csharp", "java", "python", "shell", "ruby", "perl", "php",
+})
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -778,8 +801,17 @@ class PoCRepairLLM(PipelineModule):
             len(items_to_repair), max_repair_workers,
         )
 
+        # Hold the host-global GPU mutex ONCE around the whole repair pool. The
+        # worker threads below all use the SAME model, so they batch fine on one
+        # GPU under a single held lock; the lock only excludes OTHER processes
+        # (other model families / a concurrent sweep cell) from thrashing the GPU.
+        # Acquiring per-worker instead would self-deadlock (separate flock fds in
+        # one process block each other). No-op for OpenAI / uncontended runs.
         repair_results: List[Dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=max_repair_workers) as executor:
+        gpu_lock_cfg = bool(cfg.get("gpu_lock", True))
+        with gpu_lock(provider, enabled=gpu_lock_cfg, endpoint=api_endpoint,
+                      logger=self.logger, label="phase0-repair"), \
+                ThreadPoolExecutor(max_workers=max_repair_workers) as executor:
             futures = {
                 executor.submit(_run_repair, item): item
                 for item in items_to_repair
@@ -1031,6 +1063,14 @@ class PoCRepairLLM(PipelineModule):
             if errors in (["unrecognised_language"], ["metasploit_module"]):
                 continue
 
+            # Skip non-code PoCs: plain-text advisories / .txt write-ups and any
+            # content whose (detected) language has no syntax validator. These
+            # are prose, not runnable PoCs — there is no syntax to repair, so a
+            # repair attempt (and the model ramp) would only burn LLM calls.
+            # Only ACTUAL code PoCs in a repairable language proceed to repair.
+            if (language or "").lower() not in _REPAIRABLE_LANGUAGES:
+                continue
+
             invalid.append({
                 "cve_id": cve_id,
                 "exploit_idx": exploit_idx,
@@ -1162,12 +1202,15 @@ class PoCRepairLLM(PipelineModule):
 
         # Truncate PoC code to avoid exceeding the model's context window.
         # The truncation notice lets the LLM know the file was cut, so it
-        # doesn't hallucinate a complete file from a partial one.
+        # doesn't hallucinate a complete file from a partial one. The notice is
+        # written with the language's own comment prefix — a bare '#' would be an
+        # invalid preprocessor directive in C/C++/Java/PHP and inject an error.
         if max_poc_chars and len(original_code) > max_poc_chars:
             truncated_chars = len(original_code) - max_poc_chars
+            cprefix = _COMMENT_PREFIX.get(language, "//")
             prompt_code = (
                 original_code[:max_poc_chars]
-                + f"\n# ... [{truncated_chars} characters truncated — fix only what is shown]"
+                + f"\n{cprefix} ... [{truncated_chars} characters truncated — fix only what is shown]"
             )
             self.logger.debug(
                 "  PoC truncated from %d to %d chars for prompt.",
@@ -1175,6 +1218,14 @@ class PoCRepairLLM(PipelineModule):
             )
         else:
             prompt_code = original_code
+
+        # Estimate the repaired-output size so the context-fit guard reserves
+        # room for it. Unlike Phase 2 (which returns a single function), PoC
+        # repair returns the ENTIRE file, so the output is roughly the size of
+        # the code we send — reserving only a flat headroom would let a mid-size
+        # PoC pass the prompt-fit check yet have its output truncated by the
+        # server (which then fails re-validation without advancing the ramp).
+        est_output_tokens = len(prompt_code) // 4
 
         for attempt in range(1, max_attempts + 1):
             self.logger.info("  Attempt %d/%d …", attempt, max_attempts)
@@ -1208,18 +1259,38 @@ class PoCRepairLLM(PipelineModule):
                     "  Attempt %d escalating to model '%s'", attempt, effective_model
                 )
 
-            # Call the LLM
-            raw_response, api_meta = self._call_llm(
-                api_endpoint=api_endpoint,
-                model=effective_model,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                timeout=api_timeout,
-                temperature=attempt_temperature,
-                num_ctx=num_ctx,
-                provider=provider,
-                openai_api_key=openai_api_key,
-            )
+            # Call the LLM. Start at this attempt's scheduled model and, on
+            # Ollama, fall through to the next (typically larger-context) model in
+            # the schedule when the current one cannot fit the prompt in its
+            # context window — so an oversized PoC ramps to a bigger model instead
+            # of being silently truncated. OpenAI never reports a context skip
+            # (its windows are large), so this is a no-op there. The model that
+            # actually handled the call is what we record for this attempt.
+            ramp = self._model_ramp_from(effective_model, models_by_attempt)
+            raw_response, api_meta = None, {"error": "no model attempted"}
+            for candidate in ramp:
+                effective_model = candidate
+                raw_response, api_meta = self._call_llm(
+                    api_endpoint=api_endpoint,
+                    model=candidate,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    timeout=api_timeout,
+                    temperature=attempt_temperature,
+                    num_ctx=num_ctx,
+                    provider=provider,
+                    openai_api_key=openai_api_key,
+                    est_output_tokens=est_output_tokens,
+                )
+                if (raw_response is None and api_meta.get("context_skip")
+                        and candidate != ramp[-1]):
+                    self.logger.warning(
+                        "  PoC repair: model '%s' cannot fit the prompt in its "
+                        "context window — falling back to the next model in the ramp.",
+                        candidate,
+                    )
+                    continue
+                break
 
             if raw_response is None:
                 self.logger.warning(
@@ -1346,13 +1417,16 @@ class PoCRepairLLM(PipelineModule):
         retry_delay: int = 5,
         provider: str = "ollama",
         openai_api_key: str = "",
+        est_output_tokens: int = 0,
     ) -> Tuple[Optional[str], Dict[str, Any]]:
         """Call the configured LLM backend (Ollama or OpenAI) with retry logic.
 
         Dispatches to the Ollama-compatible implementation or to the OpenAI
         client based on *provider*, using the single resolved *model* for either
         backend.  Mirrors ``call_llm_api`` in ``patch_generator.py`` (Phase 2 of
-        the master pipeline).
+        the master pipeline). *est_output_tokens* (the expected whole-file repair
+        size) lets the Ollama context-fit guard reserve room for the output; it
+        is ignored by OpenAI, whose windows are large.
         """
         if provider == "openai":
             return self._call_openai_api(
@@ -1375,7 +1449,72 @@ class PoCRepairLLM(PipelineModule):
             num_ctx=num_ctx,
             max_retries=max_retries,
             retry_delay=retry_delay,
+            est_output_tokens=est_output_tokens,
         )
+
+    # ------------------------------------------------------------------
+    # Context-window helpers (mirror Phase 2's family-ramp fallback)
+    # ------------------------------------------------------------------
+
+    def _model_max_ctx(self, api_endpoint: str, model: str, fallback_ctx: int) -> int:
+        """Best-effort max context window (tokens) for an Ollama *model*.
+
+        Read from the server's ``/api/show`` ``model_info`` (cached per model);
+        falls back to *fallback_ctx* when the server can't report it, so the
+        context-fit guard still catches oversized prompts even if /api/show is
+        unavailable. Mirrors ``patch_generator._model_max_ctx`` (Phase 2).
+        """
+        if model in _MODEL_MAX_CTX_CACHE:
+            return _MODEL_MAX_CTX_CACHE[model]
+        ctx = fallback_ctx
+        try:
+            from urllib.parse import urlparse, urlunparse
+            parsed = urlparse(api_endpoint)
+            show_url = urlunparse((parsed.scheme, parsed.netloc, "/api/show", "", "", ""))
+            resp = requests.post(
+                show_url, json={"model": model}, timeout=10,
+                auth=getattr(self, "_ollama_auth", None),
+            )
+            resp.raise_for_status()
+            info = resp.json().get("model_info", {}) or {}
+            # model_info keys are arch-prefixed, e.g. "qwen2.context_length".
+            for k, v in info.items():
+                if k.endswith(".context_length") and isinstance(v, (int, float)) and v > 0:
+                    ctx = int(v)
+                    break
+        except Exception as exc:
+            self.logger.debug(
+                "Could not read max context for '%s' via /api/show (%s); using %d.",
+                model, exc, ctx,
+            )
+        _MODEL_MAX_CTX_CACHE[model] = ctx
+        return ctx
+
+    @staticmethod
+    def _model_ramp_from(
+        start_model: str, models_by_attempt: Dict[str, str]
+    ) -> List[str]:
+        """Ordered model ramp (by attempt number) beginning at *start_model*.
+
+        Returns *start_model* followed by the rest of the per-attempt schedule so
+        a single repair attempt can fall through to the next (typically
+        larger-context) model when the current one cannot fit the prompt in its
+        context window. Deduplicates and preserves attempt order; falls back to
+        ``[start_model]`` when no schedule is configured. Mirrors
+        ``patch_generator._family_ramp_from`` (Phase 2).
+        """
+        if not models_by_attempt:
+            return [start_model]
+        ordered: List[str] = []
+        seen: set = set()
+        for k in sorted(models_by_attempt, key=lambda x: int(x)):
+            m = models_by_attempt[k]
+            if m and m not in seen:
+                seen.add(m)
+                ordered.append(m)
+        if start_model in ordered:
+            return ordered[ordered.index(start_model):]
+        return [start_model] + [m for m in ordered if m != start_model]
 
     def _call_ollama_api(
         self,
@@ -1389,55 +1528,93 @@ class PoCRepairLLM(PipelineModule):
         num_ctx: int = 0,
         max_retries: int = 2,
         retry_delay: int = 5,
+        est_output_tokens: int = 0,
     ) -> Tuple[Optional[str], Dict[str, Any]]:
-        """Call the Ollama-compatible local server API with retry logic."""
+        """Call the Ollama-compatible local server API with retry logic.
+
+        Before sending, verify the prompt PLUS the expected repaired-file output
+        fits the model's context window. If it does not, the model is SKIPPED
+        with a clearly logged reason (recorded as ``metadata['context_skip']``)
+        so the repair ramp advances to the next (larger-context) model instead of
+        the server silently truncating the prompt or the output. Mirrors
+        ``patch_generator._call_ollama_api`` (Phase 2).
+        """
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
+        # --- Context-fit guard ---------------------------------------------------
         # Always pin num_ctx: without it the Ollama server falls back to its tiny
         # default (2048 tokens), silently truncating the prompt even on a 32k-window
         # model. Fall back to 32768 (the qwen2.5 native window / LLM_NUM_CTX
         # convention) when unset — matching poc_analyzer.py and patch_generator.py.
-        effective_ctx = num_ctx if num_ctx else 32768
-        options: Dict[str, Any] = {
-            "temperature": temperature,
-            "num_ctx": effective_ctx,
+        # Never request more than the model actually supports (read from /api/show).
+        configured_ctx = num_ctx if num_ctx else 32768
+        model_max = self._model_max_ctx(api_endpoint, model, configured_ctx)
+        eff_ctx = min(configured_ctx, model_max)
+        total_chars = len(system_prompt) + len(user_prompt)
+        est_prompt_tokens = total_chars // 4   # ~4 chars/token for code
+
+        # Reserve room for the OUTPUT. PoC repair returns the whole file, so the
+        # output is roughly the size of the code we send — not a flat constant.
+        # Use the larger of a baseline headroom and the caller's estimate so a
+        # mid-size PoC can't pass the prompt-fit check only to have its output
+        # truncated by the server (which fails re-validation without ramping).
+        output_room = max(_MIN_OUTPUT_HEADROOM, est_output_tokens)
+
+        metadata: Dict[str, Any] = {
+            "model": model,
+            "provider": "ollama",
+            "timestamp_start": datetime.now().isoformat(),
+            "est_prompt_tokens": est_prompt_tokens,
+            "est_output_tokens": est_output_tokens,
+            "model_max_ctx": model_max,
+            "num_ctx": eff_ctx,
+            "retries": 0,
+            "success": False,
+            "error": None,
         }
 
+        if est_prompt_tokens > eff_ctx - output_room:
+            # Check against eff_ctx (what we actually allocate = min(num_ctx,
+            # model_max)), not model_max — otherwise a prompt could pass on the
+            # model's theoretical max yet still overflow the smaller window we
+            # send and be silently truncated. The reserved output_room ensures
+            # the whole repaired file fits too, not just the prompt.
+            reason = (
+                f"context_exceeds_model_window: prompt ~{est_prompt_tokens} tokens "
+                f"+ ~{output_room} output tokens exceeds the usable context window "
+                f"({eff_ctx} tokens; model '{model}' max {model_max})"
+            )
+            self.logger.error(
+                "  Model '%s' SKIPPED — prompt (~%d tokens) + output (~%d tokens) "
+                "exceeds its usable context window (%d tokens); advancing to the "
+                "next model in the ramp.",
+                model, est_prompt_tokens, output_room, eff_ctx,
+            )
+            metadata["error"] = reason
+            metadata["context_skip"] = True
+            metadata["timestamp_end"] = datetime.now().isoformat()
+            return None, metadata
+
+        # Pin the output budget to all the room left in the window (≥ output_room
+        # by the guard above), so the server's default num_predict can't truncate
+        # a long repaired PoC. The hallucination guard in _repair_loop rejects
+        # runaway expansion, so a generous ceiling is safe.
+        num_predict = max(256, eff_ctx - est_prompt_tokens)
+        options: Dict[str, Any] = {
+            "temperature": temperature,
+            "num_ctx": eff_ctx,
+            "num_predict": num_predict,
+        }
         payload = {
             "model": model,
             "messages": messages,
             "stream": False,
             "options": options,
         }
-
-        # Rough token estimate (~4 chars/token for code).
-        total_chars = len(system_prompt) + len(user_prompt)
-        est_prompt_tokens = total_chars // 4
-        if est_prompt_tokens > effective_ctx * 0.8:
-            self.logger.warning(
-                "  Prompt may exceed context window (~%d tokens vs num_ctx=%d). "
-                "Increase poc_repair.num_ctx or reduce prompt size.",
-                est_prompt_tokens, effective_ctx,
-            )
-        else:
-            self.logger.debug(
-                "  Prompt size: ~%d tokens (num_ctx=%d)",
-                est_prompt_tokens, effective_ctx,
-            )
-
-        metadata: Dict[str, Any] = {
-            "model": model,
-            "provider": "ollama",
-            "timestamp_start": datetime.now().isoformat(),
-            "payload_size": len(json.dumps(payload)),
-            "est_prompt_tokens": est_prompt_tokens,
-            "retries": 0,
-            "success": False,
-            "error": None,
-        }
+        metadata["payload_size"] = len(json.dumps(payload))
 
         for attempt in range(max_retries):
             try:

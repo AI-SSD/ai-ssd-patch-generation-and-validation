@@ -14,6 +14,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .file_utils import is_regression_test_path
+
 logger = logging.getLogger(__name__)
 
 
@@ -450,28 +452,68 @@ def _gather_matches(
     return [one] if one else []
 
 
-def _commit_touches_source(
-    repo_path: Path, commit_hash: str, source_exts: List[str], *, timeout: int = 20,
-) -> bool:
-    """True when the commit's diff modifies a file with one of *source_exts*.
-
-    Distinguishes the primary CODE fix from follow-up commits that only touch
-    ChangeLog / NEWS / tests but still reference the same bug.
-    """
+def _commit_changed_paths(
+    repo_path: Path, commit_hash: str, *, timeout: int = 20,
+) -> List[str]:
+    """Repo-relative paths the commit's diff modifies (empty list on failure)."""
     try:
         r = subprocess.run(
             ["git", "show", "--name-only", "--format=", "--no-renames", commit_hash],
             cwd=repo_path, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout,
         )
         if r.returncode != 0:
-            return False
-        for line in r.stdout.splitlines():
-            line = line.strip()
-            if line and any(line.endswith(ext) for ext in source_exts):
-                return True
+            return []
+        return [line.strip() for line in r.stdout.splitlines() if line.strip()]
     except Exception:
-        pass
-    return False
+        return []
+
+
+# Documentation / metadata files that, like tests, are NOT a code fix: a commit
+# touching only these (ChangeLog/NEWS follow-ups, release notes) must never
+# outrank the real fix. Generic, project-agnostic — basename or extension.
+_DOC_META_EXTS = (".md", ".rst", ".txt", ".po", ".pot", ".man", ".html", ".tex")
+_DOC_META_NAMES = (
+    "changelog", "news", "readme", "authors", "copying", "license", "licence",
+    "notice", "thanks", "todo", "install", "maintainers", "contributors",
+)
+
+
+def _is_doc_or_meta(path: str) -> bool:
+    """True for documentation/changelog/metadata files (never a code fix)."""
+    name = path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    stem = name.split(".", 1)[0]
+    return name.endswith(_DOC_META_EXTS) or stem in _DOC_META_NAMES
+
+
+def _commit_fix_tier(paths: List[str], source_exts: List[str]) -> int:
+    """Rank a commit as a primary-fix candidate by the files it changes.
+
+    Lower is better:
+      0 — touches a NON-TEST file with a *source* extension (the patchable code
+          fix, e.g. a ``.c``/``.h`` outside a test directory);
+      1 — touches a NON-TEST, non-doc file of another extension (a real fix the
+          C machinery may not be able to patch, e.g. OpenSSL's Perl-assembly
+          ``crypto/bn/asm/*.pl``) — still the right commit, just not C;
+      2 — touches ONLY test and/or documentation files (a regression-test or
+          ChangeLog follow-up committed separately from the actual fix).
+
+    This is what stops a test the project commits SEPARATELY from the fix (both
+    citing the same CVE) from winning primary-fix selection: the test commit is
+    tier 2, the real fix tier 0/1. Keys only off the generic test-path and
+    doc/meta conventions — never a per-project rule.
+    """
+    has_src = has_code = False
+    for f in paths:
+        if is_regression_test_path(f) or _is_doc_or_meta(f):
+            continue
+        has_code = True
+        if any(f.endswith(ext) for ext in source_exts):
+            has_src = True
+    if has_src:
+        return 0
+    if has_code:
+        return 1
+    return 2
 
 
 def _commit_timestamp(repo_path: Path, commit_hash: str, *, timeout: int = 20) -> Optional[int]:
@@ -493,11 +535,17 @@ def _pick_primary_fix(
 ) -> Optional[str]:
     """From commits that all reference the bug, pick the PRIMARY code fix.
 
-    Prefers the EARLIEST commit whose diff modifies a source file, so its parent
-    is genuinely the last vulnerable state. Without this, a later follow-up commit
-    (whose parent is already the real fix → a *patched* tree) could be chosen —
-    observed for CVE-2012-4412, where the recorded "vulnerable parent" was itself
-    the strcoll fix. Falls back to the earliest candidate, then the first.
+    Ranks candidates by :func:`_commit_fix_tier` (a non-test source fix beats a
+    non-test non-source fix beats a test-/doc-only commit), then by EARLIEST
+    timestamp within the best tier, so the recorded fix's PARENT is genuinely the
+    last vulnerable state. Two failure modes this prevents:
+      * a later follow-up commit whose parent is ALREADY the real fix (a patched
+        tree) — observed for CVE-2012-4412; the earliest source fix wins instead;
+      * a regression test the project commits SEPARATELY from the fix but with the
+        same CVE id in its message (e.g. OpenSSL CVE-2016-7055's ``test/bntest.c``)
+        — the test is tier 2 and never outranks the real
+        ``crypto/bn/asm/x86_64-mont.pl`` fix (tier 1).
+    Falls back to the earliest candidate, then the first.
     """
     # De-dup while preserving order; bound the work for pathological matches.
     seen: List[str] = []
@@ -510,14 +558,17 @@ def _pick_primary_fix(
         return seen[0]
     scored = []
     for c in seen[:25]:
+        paths = _commit_changed_paths(repo_path, c, timeout=timeout)
         scored.append((c, _commit_timestamp(repo_path, c, timeout=timeout),
-                       _commit_touches_source(repo_path, c, source_exts, timeout=timeout)))
-    source_commits = [s for s in scored if s[2]]
-    pool = source_commits if source_commits else scored
+                       _commit_fix_tier(paths, source_exts)))
+    best_tier = min(s[2] for s in scored)
+    pool = [s for s in scored if s[2] == best_tier]
     pool.sort(key=lambda s: (s[1] is None, s[1] if s[1] is not None else 0))
     chosen = pool[0][0]
-    if len(seen) > 1:
-        logger.debug("Primary-fix selection among %d candidates -> %s", len(seen), chosen[:12])
+    logger.debug(
+        "Primary-fix selection among %d candidates (tier %d) -> %s",
+        len(seen), best_tier, chosen[:12],
+    )
     return chosen
 
 
@@ -589,6 +640,33 @@ def _resolve_upstream_bug_ids_online(
     return upstream
 
 
+def find_cve_referencing_commits(
+    repo_path: Path,
+    cve_id: str,
+    *,
+    commit_index: Optional[List[Tuple[str, str]]] = None,
+    timeout: int = 60,
+) -> List[str]:
+    """All commits whose message contains *cve_id* (dashed or dash-less form).
+
+    Used by Option-A test harvesting to find a regression test the project
+    committed SEPARATELY from the code fix but referencing the same CVE in its
+    commit message — which a tree/content grep can't see (the test body need not
+    mention the CVE). Without this, fixing the primary-fix selection to record
+    the CODE commit (e.g. OpenSSL CVE-2016-7055's ``.pl`` fix) would LOSE the
+    in-tree reproducer that lives in the sibling ``test/bntest.c`` commit.
+    De-duplicated, order-preserving. Project-agnostic — matches only the CVE id.
+    """
+    if not repo_path.exists():
+        return []
+    out: List[str] = []
+    for term in (cve_id, cve_id.replace("-", "")):
+        for h in _gather_matches(repo_path, term, commit_index=commit_index, timeout=timeout):
+            if h and h not in out:
+                out.append(h)
+    return out
+
+
 def find_cve_fix_commit(
     repo_path: Path,
     cve_id: str,
@@ -615,10 +693,10 @@ def find_cve_fix_commit(
       3. Project-supplied *extra_grep_patterns*, scoped to the CVE.
 
     Strategies 1–3 gather ALL matching commits and pick the PRIMARY code fix via
-    :func:`_pick_primary_fix` (earliest commit that touches a source file), so the
-    recorded fix's PARENT is genuinely the vulnerable state — a later follow-up
-    commit would have the real fix as its parent (a *patched* tree). Candidates
-    from strategies 2–3 must also pass :func:`commit_relates_to_cve`. When nothing
+    :func:`_pick_primary_fix` (best :func:`_commit_fix_tier`, then earliest), so a
+    test/ChangeLog follow-up committed separately can't be mistaken for the fix and
+    the recorded fix's PARENT is genuinely the vulnerable state. Candidates from
+    strategies 2–3 must also pass :func:`commit_relates_to_cve`. When nothing
     validates, returns ``None`` so the CVE is routed to manual review.
 
     NOTE: the previous "BZ == CVE number" fallback was REMOVED — CVE ids and

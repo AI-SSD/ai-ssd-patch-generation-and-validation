@@ -718,12 +718,44 @@ class OutputGenerator(PipelineModule):
         )
 
         for fpath, units in _ordered_files:
-            if _is_test_file(fpath) and _prod_has_units:
+            is_test = _is_test_file(fpath)
+            if is_test and _prod_has_units:
                 self.logger.debug(
                     "%s: skipping test-file units from %s", cve_id, fpath
                 )
                 continue
             vuln_file_content = vuln_files.get(fpath, "")
+            if is_test:
+                # Safety net: the ONLY changed code is a regression test — the
+                # real production fix is not in this commit (it may live in a
+                # sibling commit or a non-source file). A test body is NOT a
+                # vulnerable function, so emit a SINGLE non-patchable row (blank
+                # F_NAME/V_FUNCTION). Phase 2 then reports it as "no patchable
+                # function" (out of scope) instead of generating a patch against
+                # the test that Phase 3 must later reject as a test-file target.
+                # The harvested test still serves as the Phase 1 reproducer.
+                self.logger.info(
+                    "%s: only test-file changes (%s) — no production fix to patch; "
+                    "recording as no-patchable-function", cve_id, fpath,
+                )
+                base_rows.append({
+                    "CVE": cve_id,
+                    "V_COMMIT": ps.vulnerable_commit_hash or "",
+                    "V_COMMIT_TIMESTAMP": v_commit_timestamp,
+                    "V_COMMIT_YEAR": v_commit_year,
+                    "FilePath": fpath,
+                    "F_NAME": "",
+                    "UNIT_TYPE": "",
+                    "V_FILE": vuln_file_content,
+                    "V_FUNCTION": "",
+                    "CVE_Description": meta.description or "",
+                    "CWE": ",".join(meta.cwe_ids or []),
+                    "CWE_Description": get_cwe_descriptions(meta.cwe_ids),
+                    "project_version": project_version,
+                    "project_version_normalized": project_version_normalized,
+                    "ubuntu_version": ubuntu_version,
+                })
+                continue
             # Within a file, prefer units that actually have a vulnerable
             # body (units new in the fix commit have an empty vuln_body and
             # are useless for patch generation).

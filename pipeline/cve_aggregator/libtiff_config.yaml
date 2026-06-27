@@ -134,6 +134,17 @@ poc_repair:
   model_load_timeout: 300
   num_ctx: 32768
   max_poc_chars: 0
+
+  # Estimated local generation speed (tokens/sec), used ONLY by the pre-flight
+  # "too slow to repair within api_timeout" skip (provider: ollama). The default
+  # 3 tok/s is a conservative CPU-only figure: at that rate any PoC larger than
+  # ~api_timeout*0.8*rate output tokens is routed to manual review BEFORE the
+  # repair loop — which also pre-empts the context-window ramp on large PoCs.
+  # Set this to your GPU's real throughput (e.g. 30-100) so the ramp can engage.
+  local_token_rate: 3
+  # Same estimate for the OpenAI provider; openai windows are large so the
+  # context ramp is a no-op there and only this time gate applies.
+  openai_token_rate: 150
   temperature: 0.4
   report_path: "results/libtiff_poc_repair_report.json"
   manual_review_queue_path: "results/libtiff_manual_review_queue.json"
@@ -363,22 +374,30 @@ phase1:
     echo "$USES" > /tmp/ssd_poc_uses_build; echo "poc_uses_build: $USES"
 
   # ---- Option A: in-tree regression test (poc_language: intree-test) ----
-  # STARTING POINT, UNTESTED. LibTIFF ships test/*.c the fix commits extend
-  # (harvested by is_regression_test_path). Many tests read a fixture from
-  # test/images/, so standalone runs may need that data present — partial yield.
-  # The pipeline overlays the test the fix ADDED on the VULNERABLE checkout;
-  # verdict: test FAILS on the vulnerable build = reproduced. Env: SOURCE_DIR,
-  # BUILD_DIR, INSTALL_PREFIX, TEST_SUBDIR, TEST_NAME, TEST_PATH, FIX_COMMIT.
+  # SHIPPED-TEST ORACLE — run the regression test the fix commit itself ships, through
+  # libtiff's own test harness. Empirically (validated on fax3 bug54, commit a566b83b)
+  # libtiff CVE fixes mostly add a golden-OUTPUT comparison test (test/<name>.sh +
+  # refs/o-<name>.tiff, wired via add_convert_test/add_reader_test as e.g.
+  # `tiffcp -c none img` then diff vs the reference), NOT a crash. So the primary oracle
+  # builds libtiff and runs `make check TESTS="<the .sh the fix added>"`: the shipped test
+  # FAILS on the VULNERABLE build (= reproduced) and PASSES on the PATCHED build (= fixed).
+  # The build is ASan-instrumented so the harness also catches memory-safety aborts for free.
+  # Fallbacks (when the fix ships no harness test): replay the crafted TIFF through the
+  # ASan tools (pure crash CVEs), then a built test binary / standalone test .c.
+  # Env: SOURCE_DIR, BUILD_DIR, INSTALL_PREFIX, TEST_SUBDIR, TEST_NAME, TEST_PATH, FIX_COMMIT.
   intree_test:
     build_script: |
       #!/bin/bash
+      # ASan build so a crafted TIFF deterministically aborts the vulnerable build.
       SRC="$SOURCE_DIR"; BD="$BUILD_DIR"; PFX="$INSTALL_PREFIX"
       cd "$SRC" || exit 1
       if [ ! -x "$SRC/configure" ]; then
         ( ./autogen.sh > /build/autogen.log 2>&1 || autoreconf -fi > /build/autogen.log 2>&1 ) || true
       fi
       cd "$BD" || exit 1; rm -rf ./*
-      "$SRC"/configure --prefix="$PFX" CFLAGS="-O2 -g -w" > /build/cfg.log 2>&1 && echo CONFIG_OK || { echo CONFIG_FAIL; tail -25 /build/cfg.log; }
+      export CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1 -w -U_FORTIFY_SOURCE"
+      export LDFLAGS="-fsanitize=address"
+      ( "$SRC"/configure --prefix="$PFX" 2>&1 && echo CONFIG_OK ) > /build/cfg.log 2>&1 || { echo CONFIG_FAIL; tail -25 /build/cfg.log; }
       make -j"$(nproc)" -k > /build/make.log 2>&1; echo "BUILD_RC=$?" >> /build/build_status
       make install -k >> /build/make.log 2>&1 || true
       tail -15 /build/make.log; echo "build complete"
@@ -390,9 +409,82 @@ phase1:
         echo "SSD_TEST_RESULT=NORESULT (no built libtiff to test against)"; exit 2
       fi
       export LD_LIBRARY_PATH="$PFX/lib"
-      # libtiff tests often need their image fixtures + to run from the test dir.
+      export ASAN_OPTIONS="abort_on_error=1:exitcode=99:detect_leaks=0:halt_on_error=1:allocator_may_return_null=1"
+      findtool() { for d in "$BUILD_DIR/tools" "$PFX/bin"; do [ -x "$d/$1" ] && { echo "$d/$1"; return 0; }; done; return 1; }
+      is_crash() { [ "$1" -eq 99 ] || [ "$1" -ge 128 ]; }
+
+      # PRIMARY: run the fix commit's OWN shipped regression test(s) through the project's
+      # test harness. libtiff's tests are mostly golden-output comparisons (the fix ships
+      # test/<name>.sh + refs/o-<name>.tiff and wires add_convert_test/add_reader_test that
+      # runs e.g. `tiffcp -c none img` then diffs the result), NOT crashes — so the harness,
+      # not a guessed tool+flags, resolves the exact invocation and reference. Fail-to-pass
+      # oracle: the shipped test FAILS on the vulnerable build and PASSES on the patched one.
+      TESTDIR="$BUILD_DIR/test"
+      if [ -d "$TESTDIR" ]; then
+        SHTESTS="$(cd "$SOURCE_DIR" && git diff-tree --no-commit-id --name-only -r "$FIX_COMMIT" 2>/dev/null \
+                  | grep -E '^test/.*\.sh$' | sed 's#^test/##')"
+        case "$TEST_NAME" in *.sh) SHTESTS="$SHTESTS $TEST_NAME" ;; esac
+        SHTESTS="$(printf '%s\n' $SHTESTS | awk 'NF&&!seen[$0]++' | tr '\n' ' ')"
+        if [ -n "$SHTESTS" ]; then
+          echo "--- running fix's shipped regression test(s) via harness: $SHTESTS ---"
+          ( cd "$TESTDIR" && make -j"$(nproc)" ) > /tmp/mkchk.log 2>&1 || true
+          ( cd "$TESTDIR" && ASAN_OPTIONS="detect_leaks=0:allocator_may_return_null=1" \
+              timeout "${INTREE_TEST_TIMEOUT:-600}" make check TESTS="$SHTESTS" ) > /tmp/it.log 2>&1; rc=$?
+          grep -E '^(PASS|FAIL|XFAIL|XPASS|ERROR|SKIP):' /tmp/it.log | head -20
+          # Only trust the verdict if the harness actually ran a PASS/FAIL test (an ERROR/
+          # SKIP-only result means a harness/codec setup problem, not a real fail-to-pass).
+          if grep -qE '^(PASS|FAIL):' /tmp/it.log; then
+            if [ "$rc" -eq 0 ]; then echo "SSD_TEST_RESULT=PASS"; exit 0; fi
+            grep -iE 'differ|^FAIL:|Aborted|AddressSanitizer' /tmp/it.log | head -8
+            echo "SSD_TEST_RESULT=FAIL"; exit 1
+          fi
+          echo "harness produced no PASS/FAIL line; falling back to crash-replay"; tail -12 /tmp/it.log
+        fi
+      fi
+
+      # FALLBACK 1 (crash oracle): replay the crafted TIFF the fix commit ADDED (plus
+      # TEST_PATH when it is itself an image) through the ASan-built CLI tools. Any abort =
+      # reproduced. Catches pure memory-safety CVEs whose fix ships no golden-output test.
+      IMGS=""
+      case "$TEST_PATH" in
+        *.tif|*.tiff|*.TIF|*.TIFF) [ -f "$SOURCE_DIR/$TEST_PATH" ] && IMGS="$SOURCE_DIR/$TEST_PATH" ;;
+      esac
+      for f in $(cd "$SOURCE_DIR" && git diff-tree --no-commit-id --name-only -r --diff-filter=A "$FIX_COMMIT" 2>/dev/null | grep -iE '\.(tif|tiff)$'); do
+        [ -f "$SOURCE_DIR/$f" ] && IMGS="$IMGS $SOURCE_DIR/$f"
+      done
+      IMGS="$(printf '%s\n' $IMGS | awk 'NF&&!seen[$0]++' | tr '\n' ' ')"
+      if [ -n "$IMGS" ]; then
+        ran=0; crashed=0; hit=""
+        for IMG in $IMGS; do
+          for tool in tiffinfo tiff2rgba tiffcp tiffcrop tiff2pdf tiffdump; do
+            TBIN="$(findtool "$tool")" || continue
+            case "$tool" in
+              tiffinfo)  set -- -D "$IMG" ;;
+              tiff2rgba) set -- "$IMG" /tmp/o.bin ;;
+              tiffcp)    set -- "$IMG" /tmp/o.tif ;;
+              tiffcrop)  set -- "$IMG" /tmp/o.tif ;;
+              tiff2pdf)  set -- -o /tmp/o.pdf "$IMG" ;;
+              tiffdump)  set -- "$IMG" ;;
+            esac
+            ran=1
+            timeout "${INTREE_TEST_TIMEOUT:-120}" "$TBIN" "$@" > /tmp/it.log 2>&1; rc=$?
+            if is_crash "$rc" || grep -qiE "AddressSanitizer|SUMMARY: .*Sanitizer" /tmp/it.log; then
+              crashed=1; hit="$tool (rc=$rc) on $(basename "$IMG")"; break
+            fi
+          done
+          [ "$crashed" -eq 1 ] && break
+        done
+        if [ "$ran" -eq 1 ]; then
+          if [ "$crashed" -eq 1 ]; then
+            echo "--- CRASH: $hit ---"; grep -iE "ERROR:|SUMMARY:|#0 |#1 |#2 " /tmp/it.log | head -12
+            echo "SSD_TEST_RESULT=FAIL"; exit 1
+          fi
+          echo "no tool crashed on the crafted image(s)"; echo "SSD_TEST_RESULT=PASS"; exit 0
+        fi
+      fi
+
+      # FALLBACK 2: a built test binary the fix added (now ASan-instrumented).
       RUNDIR="$BUILD_DIR/$TEST_SUBDIR"; [ -d "$RUNDIR" ] || RUNDIR="$SOURCE_DIR/$TEST_SUBDIR"
-      # Strategy 1: the built test binary.
       TBIN="$BUILD_DIR/$TEST_SUBDIR/$TEST_NAME"; [ -x "$TBIN" ] || TBIN="$BUILD_DIR/test/$TEST_NAME"
       if [ -x "$TBIN" ]; then
         echo "--- running built test: $TBIN ---"
@@ -400,17 +492,23 @@ phase1:
         tail -25 /tmp/it.log
         if [ "$rc" -eq 0 ]; then echo "SSD_TEST_RESULT=PASS"; exit 0; else echo "SSD_TEST_RESULT=FAIL"; exit 1; fi
       fi
-      # Strategy 2: standalone compile against the build lib (run from test dir so
-      # relative image fixtures resolve).
-      echo "--- built test not found; standalone compile of $TEST_PATH ---"
-      if gcc -O2 -g -w -D_GNU_SOURCE "$SOURCE_DIR/$TEST_PATH" -I"$PFX/include" -I"$SOURCE_DIR/libtiff" \
-            -L"$PFX/lib" -Wl,-rpath,"$PFX/lib" -ltiff -ljpeg -lz -llzma -lm -o /tmp/itest 2>/tmp/cc.log; then
-        ( cd "$RUNDIR" 2>/dev/null; timeout "${INTREE_TEST_TIMEOUT:-300}" /tmp/itest ) > /tmp/it.log 2>&1; rc=$?
-        tail -25 /tmp/it.log
-        if [ "$rc" -eq 0 ]; then echo "SSD_TEST_RESULT=PASS"; exit 0; else echo "SSD_TEST_RESULT=FAIL"; exit 1; fi
+
+      # FALLBACK 3: standalone-compile the harvested test .c against the ASan build.
+      if [ -n "$TEST_PATH" ] && [ -f "$SOURCE_DIR/$TEST_PATH" ]; then
+        case "$TEST_PATH" in
+          *.c)
+            echo "--- standalone compile of $TEST_PATH ---"
+            if gcc -fsanitize=address -O1 -g -w -D_GNU_SOURCE "$SOURCE_DIR/$TEST_PATH" \
+                  -I"$PFX/include" -I"$SOURCE_DIR/libtiff" -L"$PFX/lib" -Wl,-rpath,"$PFX/lib" \
+                  -ltiff -ljpeg -lz -llzma -lm -o /tmp/itest 2>/tmp/cc.log; then
+              ( cd "$RUNDIR" 2>/dev/null; timeout "${INTREE_TEST_TIMEOUT:-300}" /tmp/itest ) > /tmp/it.log 2>&1; rc=$?
+              tail -25 /tmp/it.log
+              if [ "$rc" -eq 0 ]; then echo "SSD_TEST_RESULT=PASS"; exit 0; else echo "SSD_TEST_RESULT=FAIL"; exit 1; fi
+            fi
+            echo "standalone compile failed:"; tail -10 /tmp/cc.log 2>/dev/null ;;
+        esac
       fi
-      echo "standalone compile failed:"; tail -10 /tmp/cc.log 2>/dev/null
-      echo "SSD_TEST_RESULT=NORESULT"; exit 2
+      echo "SSD_TEST_RESULT=NORESULT (no crafted image, test binary, or test source)"; exit 2
 
   build_system: "autotools"
   extra_configure_flags: []

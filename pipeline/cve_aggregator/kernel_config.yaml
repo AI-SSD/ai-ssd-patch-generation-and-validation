@@ -261,6 +261,17 @@ poc_repair:
   # 0 = no truncation.
   max_poc_chars: 0
 
+  # Estimated local generation speed (tokens/sec), used ONLY by the pre-flight
+  # "too slow to repair within api_timeout" skip (provider: ollama). The default
+  # 3 tok/s is a conservative CPU-only figure: at that rate any PoC larger than
+  # ~api_timeout*0.8*rate output tokens is routed to manual review BEFORE the
+  # repair loop — which also pre-empts the context-window ramp on large PoCs.
+  # Set this to your GPU's real throughput (e.g. 30-100) so the ramp can engage.
+  local_token_rate: 3
+  # Same estimate for the OpenAI provider; openai windows are large so the
+  # context ramp is a no-op there and only this time gate applies.
+  openai_token_rate: 150
+
   # Sampling temperature for the LLM.
   temperature: 0.4
 

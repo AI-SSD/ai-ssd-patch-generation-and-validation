@@ -4,6 +4,40 @@ All notable changes to the AI-SSD Patch Generation & Validation Pipeline will be
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project loosely adheres to Semantic Versioning principles.
 
+## [0.4.3] - 2026-06-27
+
+Host-global GPU serialization, context-fit guards, and per-cell execution controls for the results dashboard, enabling safe multi-cell parallel execution.
+
+### Added
+
+- **Host-Global GPU Mutex (`gpu_lock`).** Implemented cross-process POSIX `flock` serialization around GPU-bound inference (Phase 2 generation and the iterative feedback loop). When running multiple concurrent projects/cells on a host, this prevents weight thrashing and VRAM contention on the shared local Ollama instance. Enabled via `gpu_lock: true` under `llm` in `config.yaml`, with overrides for remote OpenAI backends.
+- **In-process Heartbeat Pulser.** Introduced a background thread `_HeartbeatPulser` in Phase 2 (`patch_generator.py`) to periodically refresh the live progress heartbeat during long-running LLM API calls, preventing the idle watchdog from false-killing healthy tasks.
+- **Context-Fit Guard for PoC Repair.** Added checks querying Ollama's `/api/show` to find actual model context windows. Automatically skips repair attempts and advances to the next model in the ramp schedule if the combined prompt and expected output size exceed the usable context.
+- **Separate-Commit Test Harvesting.** Added `find_cve_referencing_commits` to harvest regression tests from separate/sibling commits referencing the same CVE (e.g. OpenSSL CVE-2016-7055).
+- **Per-Cell Dashboard Control.** Added project-level controls (Pause/Resume, Stop, and "Resume run" to restart failed/aborted cells) on the dashboard page, backed by subtree PID signal management and persistent control event auditing (`control_audit.log`).
+- **Funnel Metrics Reconciliation.** Integrated new dashboard metrics (`task_cves`, `funnel_reproduced`, `skipped_distinct`) and detailed validation failure breakdowns (`failed_both`, `failed_poc_only`, `failed_sast_only`) to trace Phase 1 → Phase 2 → Phase 3 transitions accurately.
+
+### Changed
+
+- **Primary-Fix Selection Tier Scoring.** Introduced `_commit_fix_tier` in `git_utils.py` to scoring candidate commits so that test-only/doc-only commits do not outrank the actual code fix (preventing "patched tree parent" errors).
+- **Test-Only Commits Safety Net.** Updated `output_generator.py` to record test-only commits as "no-patchable-function" to bypass useless generation attempts while keeping the test as the Phase 1 reproducer.
+- **Run Script Default Cleanup.** Added the `--cleanup` flag by default in `pipeline/run_project.sh`.
+
+## [0.4.2] - 2026-06-26
+
+Runtime optimizations and a one-click run archiver, implemented after the first full-scale (0.4.1) run. The two concurrency controls are opt-in and default to the prior sequential behaviour, so a default-settings run is byte-for-byte identical to 0.4.1 — making that first run a clean pre-optimization runtime baseline (archived under `run-archives/2026-06-25_pre-optimization-baseline/`) for a before/after comparison.
+
+### Added
+
+- **Phase 1 concurrent baseline capture (`baseline_max_parallel`).** The repeated baseline PoC runs used to confirm a deterministic reproduction signature can now execute concurrently instead of one after another. This is decisive for the weakest, hang/timeout signal, which requires *unanimity* (every run must reach `run_timeout`): running them in parallel collapses `baseline_runs × run_timeout` of pure waiting into approximately one `run_timeout`. Implemented via new `_run_baseline_once` / `_finalize_baseline` helpers and a `ThreadPoolExecutor` path in `_capture_baseline` (`orchestrator.py`); each concurrent run gets a unique container suffix so they never collide. Defaults to `1` (sequential with early-stop — byte-for-byte the previous behaviour) when the setting is absent from `config.yaml`.
+- **Phase 3 concurrent patch validation (`--max-workers` / `max_workers`).** Independent candidate patches can now be validated in parallel, each an isolated Docker rebuild + PoC re-run + host-side SAST on image/container/build-dir names unique to `(cve, model)`, with results merged on the main thread (`patch_validator.py`). Defaults to `1` (sequential) — raise it on a multi-core host with enough RAM, since each validation is a full project rebuild.
+- **Dashboard "Download Results" archiver.** A new `GET /api/download?cell=<project>__<profile>` endpoint streams a single ZIP bundling everything needed to archive one pipeline execution — `results/`, `logs/`, `reports/`, metrics, `patches/`, `validation_results/` (+ `validation_builds/`), `exploits/`, `manual_supervision/` — plus the config that produced it (`config.yaml`, the project Phase-0 YAML, the profile `.env`) and a generated `MANIFEST.txt`. Backed by `dashboard_control.build_cell_archive()` (validates the cell name, refuses path traversal, compresses with `ZIP_DEFLATED`, builds to a temp file that the web layer streams and then deletes); the endpoint is localhost-only, consistent with the existing security model. A "⬇ zip" link is added to every grid row and a "⬇ download results (ZIP)" link to each cell page (`dashboard_server.py`, `dashboard_control.py`).
+
+### Changed
+
+- **libtiff in-tree reproduction recipe rewritten to a shipped-test oracle** (`cve_aggregator/libtiff_config.yaml`, `phase1.intree_test`). Empirically (validated on the fax3 *bug54* fix, commit `a566b83b`: shipped test `make check` **FAILs** on the vulnerable build and **PASSes** on the patched build) libtiff CVE fixes ship **golden-output comparison** tests (`test/<name>.sh` + `refs/o-<name>.tiff`, wired via `add_convert_test`/`add_reader_test` as e.g. `tiffcp -c none img` then diff vs the reference), **not** crashes. The previous recipe only replayed the crafted TIFF through the CLI tools under ASan and so reproduced **none** of libtiff's harness tests (golden-output mismatch is invisible to a crash oracle, and tools like `tiffcrop` abort on *both* builds from unrelated bugs, polluting the signal). The new primary path builds libtiff with ASan and runs `make check TESTS="<the .sh the fix added>"` as the fail-to-pass oracle; the crafted-TIFF ASan replay is retained as a fallback for pure memory-safety CVEs that ship no harness test, ahead of the built-binary / standalone-`.c` fallbacks. **Yield ceiling is structural, not recipe-bound:** across all libtiff history only ~23 fix commits ship a `test/*.sh` harness test and ~20 add a crafted `test/images/*.tif` fixture (31 test images total), versus tcpdump's 785 committed `.pcap` fixtures — libtiff CVEs are mostly validated via OSS-Fuzz reproducers stored *outside* the repo, so the in-tree path can only ever reach the small in-repo corpus.
+- **Clearer per-CVE and per-retry logging** in Phase 2 generation, the iterative feedback loop and the master-pipeline feedback driver (`patch_generator.py`, `master_pipeline/feedback.py`, `master_pipeline/orchestrator.py`): boxed/indented headers and ✓/✗ status markers. Formatting only — no behavioural change.
+
 ## [0.4.1]- 2026-06-25
 
 Consolidates all work since 0.3.7: the methodology v2/v3 deterministic-baseline reproduction model, multi-project expansion, configurable SAST, benchmarking/provider infrastructure, dashboard, notifications, and Phase 0 parallelization.

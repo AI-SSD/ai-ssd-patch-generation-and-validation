@@ -26,6 +26,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from poc_analyzer import PoCAnalyzer
 from master_pipeline.sast_config import load_sast_config
 from master_pipeline import sast_runner  # shared Phase 1/3 SAST run + classify
@@ -160,14 +161,19 @@ def _load_container_mem_limit() -> str:
 _CONTAINER_MEM_LIMIT = _load_container_mem_limit()
 
 
-def _load_baseline_policy() -> Tuple[int, int]:
-    """Read (baseline_runs, baseline_min_agree) from config.yaml.
+def _load_baseline_policy() -> Tuple[int, int, int]:
+    """Read (baseline_runs, baseline_min_agree, baseline_max_parallel) from config.yaml.
 
     Controls the Phase 1 determinism guard: run the baseline PoC up to
     ``baseline_runs`` times and accept it only once ``baseline_min_agree`` runs
-    agree on the exit-code signature. Defaults (3, 2) on any read failure.
+    agree on the exit-code signature. ``baseline_max_parallel`` is how many of
+    those runs execute CONCURRENTLY — the hang-confirm win: a timeout/hang
+    baseline requires unanimity (every run must hit ``run_timeout``), so running
+    them in parallel turns ``baseline_runs × run_timeout`` of pure waiting into
+    ~one ``run_timeout``. Defaults (3, 2, 1) on any read failure; 1 = sequential
+    (the original behavior, with early-stop on agreeing crash signatures).
     """
-    runs, agree = 3, 2
+    runs, agree, parallel = 3, 2, 1
     try:
         import yaml
         cfg_path = Path(__file__).parent / "config.yaml"
@@ -175,12 +181,15 @@ def _load_baseline_policy() -> Tuple[int, int]:
             cfg = yaml.safe_load(fh) or {}
         runs = int(cfg.get("baseline_runs", runs) or runs)
         agree = int(cfg.get("baseline_min_agree", agree) or agree)
+        parallel = int(cfg.get("baseline_max_parallel", parallel) or parallel)
     except Exception:
         pass
-    # Sanity: at least one run, and agreement never exceeds the run budget.
+    # Sanity: at least one run, agreement never exceeds the run budget, and
+    # concurrency is bounded by the run budget (and at least 1).
     runs = max(1, runs)
     agree = max(1, min(agree, runs))
-    return runs, agree
+    parallel = max(1, min(parallel, runs))
+    return runs, agree, parallel
 
 
 def _resolve_phase1_settings(cfg: dict, base_dir: Path) -> dict:
@@ -2505,14 +2514,20 @@ class DockerManager:
             pass
     
     def run_container_from_tag(self, vuln: VulnerabilityInfo, image_tag: str,
-                                run_timeout: int = 300) -> Tuple[int, str]:
+                                run_timeout: int = 300,
+                                container_suffix: str = "") -> Tuple[int, str]:
         """Run a container from an explicit image tag (used by Phase 0 CVE images).
 
         Returns (exit_code, logs). The image is NOT removed after execution —
         persisted for Phase 3. No verdict is computed here (methodology v2);
         the host decides reproduction via baseline matching + negative filter.
+
+        *container_suffix* makes the container name unique so several baseline
+        runs of the SAME CVE can execute concurrently without colliding on the
+        ``ai-ssd-<cve>-run`` name (and force-removing each other). Empty (the
+        default) preserves the original single-container name.
         """
-        container_name = f"ai-ssd-{vuln.cve.lower()}-run"
+        container_name = f"ai-ssd-{vuln.cve.lower()}-run{container_suffix}"
         return self._run_image(image_tag, container_name, vuln, run_timeout)
 
     def read_poc_uses_build(self, image_tag: str,
@@ -2844,7 +2859,9 @@ class PipelineOrchestrator:
         self._skip_sast = getattr(args, 'skip_sast', False) or not self._sast_config.enabled
         # Phase 1 determinism guard: run the baseline PoC multiple times and
         # require agreement before trusting the exit code (kills flaky baselines).
-        self._baseline_runs, self._baseline_min_agree = _load_baseline_policy()
+        # baseline_max_parallel runs them concurrently (hang-confirm speedup).
+        (self._baseline_runs, self._baseline_min_agree,
+         self._baseline_max_parallel) = _load_baseline_policy()
 
 
         # Populate the module-level era map so helper functions can access it
@@ -3275,6 +3292,48 @@ class PipelineOrchestrator:
             return entry
         return None
 
+    def _run_baseline_once(self, vuln: VulnerabilityInfo, cve_tag: str,
+                           i: int, max_runs: int, container_suffix: str = "") -> dict:
+        """Execute ONE baseline PoC run and return its run dict.
+
+        Pure w.r.t. shared state (only reads the image, runs a container, parses
+        its logs), so it is safe to call concurrently as long as each call gets a
+        distinct *container_suffix*. Returns the run's signature and outputs.
+        """
+        exit_code, run_logs = self.docker_mgr.run_container_from_tag(
+            vuln, cve_tag, self.run_timeout, container_suffix=container_suffix
+        )
+        record = self.docker_mgr._extract_result_record(run_logs)
+        marker_present = record.get("marker_present", False)
+        poc_exit = record.get("exit_code")
+        if poc_exit is None:
+            poc_exit = exit_code
+        is_timeout = (not marker_present) and ("TIMEOUT" in run_logs)
+        sig = (poc_exit, marker_present, is_timeout)
+        self.logger.info(
+            f"  Baseline run {i + 1}/{max_runs}: exit={poc_exit} "
+            f"marker={marker_present} timeout={is_timeout}"
+        )
+        return {
+            "poc_exit_code": poc_exit, "run_logs": run_logs, "record": record,
+            "marker_present": marker_present, "is_timeout": is_timeout, "sig": sig,
+        }
+
+    def _finalize_baseline(self, vuln: VulnerabilityInfo, runs: List[dict],
+                           sig_counts, max_runs: int):
+        """Acceptance for a completed run set with no early-accepted crash
+        signature: accept ONLY a UNANIMOUS timeout (every run hung), else None
+        (non-deterministic → routed to manual revision)."""
+        timeout_sig = (-1, False, True)
+        if sig_counts.get(timeout_sig, 0) == max_runs and max_runs >= 1:
+            chosen = next(r for r in runs if r["sig"] == timeout_sig)
+            self.logger.info(
+                f"  {vuln.cve}: baseline is a UNANIMOUS timeout "
+                f"({max_runs}/{max_runs} runs hung)"
+            )
+            return chosen, dict(sig_counts), runs
+        return None, dict(sig_counts), runs
+
     def _capture_baseline(self, vuln: VulnerabilityInfo, cve_tag: str):
         """Run the baseline PoC repeatedly until its exit-code signature is
         stable, so Phase 3 is never seeded with a flaky baseline.
@@ -3284,14 +3343,25 @@ class PipelineOrchestrator:
         signature-dependent:
 
         * **Crash / explicit exit codes** (non-timeout): accepted as soon as
-          ``self._baseline_min_agree`` runs share the signature (early-stop).
+          ``self._baseline_min_agree`` runs share the signature.
         * **Timeout / ``-1`` baselines**: the weakest, coarsest signal, so they
           require **unanimity** — *every* run must time out. A single non-hang
           run (e.g. the container dying, or a one-off slow run) demotes the CVE
-          to manual revision. (Never early-stops on a timeout.)
+          to manual revision.
 
-        With ``baseline_runs: 1`` both rules collapse to the original single-run
-        behaviour. General — no per-CVE logic.
+        ``self._baseline_max_parallel`` controls concurrency:
+
+        * **1 (default)**: sequential with early-stop — the original behavior,
+          unchanged. Stops as soon as a crash signature reaches ``min_agree``.
+        * **>1**: run up to that many runs CONCURRENTLY (each in its own
+          container). This is the hang-confirm speedup — a unanimous-timeout
+          baseline needs every run anyway, so overlapping them turns
+          ``baseline_runs × run_timeout`` of waiting into ~one ``run_timeout``.
+          No early-stop (all runs execute), but crash runs are fast so the extra
+          runs are cheap; acceptance is identical (evaluated after all complete).
+
+        With ``baseline_runs: 1`` everything collapses to a single run. General —
+        no per-CVE logic.
 
         Returns ``(chosen, sig_counts, runs)``: ``chosen`` is the agreed run
         dict, or ``None`` when no signature met its acceptance bar
@@ -3299,59 +3369,68 @@ class PipelineOrchestrator:
         reporting.
         """
         from collections import Counter
-        runs: List[dict] = []
-        sig_counts: Counter = Counter()
         max_runs = self._baseline_runs
         min_agree = self._baseline_min_agree
+        max_parallel = min(getattr(self, "_baseline_max_parallel", 1) or 1, max_runs)
 
-        for i in range(max_runs):
-            exit_code, run_logs = self.docker_mgr.run_container_from_tag(
-                vuln, cve_tag, self.run_timeout
-            )
-            record = self.docker_mgr._extract_result_record(run_logs)
-            marker_present = record.get("marker_present", False)
-            poc_exit = record.get("exit_code")
-            if poc_exit is None:
-                poc_exit = exit_code
-            is_timeout = (not marker_present) and ("TIMEOUT" in run_logs)
-            sig = (poc_exit, marker_present, is_timeout)
-            run = {
-                "poc_exit_code": poc_exit, "run_logs": run_logs, "record": record,
-                "marker_present": marker_present, "is_timeout": is_timeout, "sig": sig,
+        if max_parallel <= 1:
+            # ---- Sequential with early-stop (original behavior, unchanged) ----
+            runs: List[dict] = []
+            sig_counts: Counter = Counter()
+            for i in range(max_runs):
+                run = self._run_baseline_once(vuln, cve_tag, i, max_runs)
+                runs.append(run)
+                sig_counts[run["sig"]] += 1
+                # Early-accept ONLY a signature where the wrapper actually
+                # completed and reported a verdict (marker_present): a reproducible
+                # crash / explicit exit is trustworthy at min_agree. Timeouts /
+                # infra failures fall through to the stricter finalize step.
+                if run["marker_present"] and sig_counts[run["sig"]] >= min_agree:
+                    chosen = next(r for r in runs if r["sig"] == run["sig"])
+                    if max_runs > 1:
+                        self.logger.info(
+                            f"  {vuln.cve}: baseline stable after {i + 1} run(s) "
+                            f"(signature seen {sig_counts[run['sig']]}×)"
+                        )
+                    return chosen, dict(sig_counts), runs
+            return self._finalize_baseline(vuln, runs, sig_counts, max_runs)
+
+        # ---- Concurrent (hang-confirm speedup) ----
+        self.logger.info(
+            f"  {vuln.cve}: capturing baseline — {max_runs} runs, up to "
+            f"{max_parallel} concurrent (run_timeout={self.run_timeout}s)"
+        )
+        runs = [None] * max_runs
+        with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            futures = {
+                executor.submit(self._run_baseline_once, vuln, cve_tag, i, max_runs, f"-{i}"): i
+                for i in range(max_runs)
             }
-            runs.append(run)
-            sig_counts[sig] += 1
-            self.logger.info(
-                f"  Baseline run {i + 1}/{max_runs}: exit={poc_exit} "
-                f"marker={marker_present} timeout={is_timeout}"
-            )
-            # Early-accept ONLY a signature where the wrapper actually completed
-            # and reported a verdict (marker_present): a reproducible crash /
-            # explicit exit is trustworthy at min_agree. Timeouts (marker absent)
-            # need unanimity, and infra failures (marker absent, not a timeout —
-            # e.g. the container dying) are never a valid baseline on their own;
-            # both fall through to the stricter end-of-loop logic.
-            if marker_present and sig_counts[sig] >= min_agree:
-                chosen = next(r for r in runs if r["sig"] == sig)
-                if max_runs > 1:
-                    self.logger.info(
-                        f"  {vuln.cve}: baseline stable after {i + 1} run(s) "
-                        f"(signature seen {sig_counts[sig]}×)"
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    runs[i] = future.result()
+                except Exception as exc:
+                    # run_container_from_tag normally returns (-1, err) rather than
+                    # raising; on the rare hard failure record a non-acceptable
+                    # infra signature so the Counter never sees None and the CVE
+                    # falls through to manual revision.
+                    self.logger.error(
+                        f"  Baseline run {i + 1}/{max_runs} crashed for {vuln.cve}: {exc}"
                     )
-                return chosen, dict(sig_counts), runs
-
-        # Loop exhausted without an early-accepted crash signature. The only
-        # remaining way to accept is a UNANIMOUS timeout (every run hung).
-        timeout_sig = (-1, False, True)
-        if sig_counts.get(timeout_sig, 0) == max_runs and max_runs >= 1:
-            chosen = next(r for r in runs if r["sig"] == timeout_sig)
-            self.logger.info(
-                f"  {vuln.cve}: baseline is a UNANIMOUS timeout "
-                f"({max_runs}/{max_runs} runs hung)"
-            )
-            return chosen, dict(sig_counts), runs
-
-        return None, dict(sig_counts), runs
+                    runs[i] = {
+                        "poc_exit_code": None, "run_logs": f"baseline run error: {exc}",
+                        "record": {}, "marker_present": False, "is_timeout": False,
+                        "sig": (None, False, False),
+                    }
+        sig_counts = Counter(r["sig"] for r in runs)
+        # Same acceptance as the sequential path, evaluated after all runs: the
+        # first run (in order) whose completed crash/exit signature reached
+        # min_agree wins; otherwise a unanimous timeout; otherwise None.
+        for r in runs:
+            if r["marker_present"] and sig_counts[r["sig"]] >= min_agree:
+                return r, dict(sig_counts), runs
+        return self._finalize_baseline(vuln, runs, sig_counts, max_runs)
 
     def _process_intree_test(self, vuln: VulnerabilityInfo,
                              result: ExecutionResult, start_time) -> ExecutionResult:

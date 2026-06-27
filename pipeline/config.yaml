@@ -64,7 +64,9 @@ phase_timeouts:
 phase_idle_timeouts:
   0: 1800       # Phase 0: per-CVE NVD API + git ops; 30-min silence = stuck
   1: 2400       # Phase 1: cold build + 3×300s hang baseline between heartbeats
-  2: 1800       # Phase 2: per-CVE LLM call (request timeout 600s × retries)
+  2: 1800       # Phase 2: a mid-CVE pulser (llm.heartbeat_interval) refreshes the
+                # heartbeat every ~60s, so this only fires if a CVE is silent for
+                # 30 min despite the pulser — i.e. a truly wedged process
   3: 2400       # Phase 3: cold incremental rebuild + PoC run between heartbeats
   4: 600        # Phase 4: reporting is fast and steadily writes to stdout
 
@@ -83,6 +85,15 @@ run_timeout: 300        # Container run / PoC execution timeout
 baseline_runs: 3          # max baseline executions per CVE
 baseline_min_agree: 2     # identical crash runs required to trust the baseline
                           # (timeout baselines always require all baseline_runs)
+# How many of the baseline runs execute CONCURRENTLY. A timeout/hang baseline
+# requires unanimity (every run must hit run_timeout), so those runs otherwise
+# SUM: baseline_runs × run_timeout of pure waiting — the dominant Phase 1 cost.
+# Running them in parallel collapses that to ~one run_timeout. 1 = sequential
+# (default; keeps the early-stop on agreeing crash signatures, byte-for-byte the
+# prior behavior). Set to baseline_runs (e.g. 3) to fully parallelize — costs up
+# to that many concurrent 1-CPU/6 GB containers for one CVE at a time, so size it
+# to the host. (Baseline memoization already skips re-running unchanged images.)
+baseline_max_parallel: 1
 
 # Docker resource settings
 docker:
@@ -151,6 +162,18 @@ llm:
   # Ollama context window (avoids silent 4096 truncation)
   num_ctx: 32768
 
+  # Host-global GPU mutex. Serializes GPU-bound inference (Phase 2 generation +
+  # the feedback loop) across concurrently-running cells so the single shared
+  # Ollama GPU is never thrashed by two model families at once — a flock on a
+  # host-global lock file, auto-released if a cell dies. NO-OP for provider:
+  # openai (no local GPU; the limit there is API rate, and those cells already
+  # run in parallel) and effectively free when only one cell runs (uncontended).
+  # This is the safety primitive that makes raising run_all.sh's OLLAMA_PARALLEL
+  # (and overlapping Phase 2 with another cell's Phase 3) safe. Override per-host
+  # with SSD_GPU_LOCK=0/1; lock dir via SSD_GPU_LOCK_DIR (defaults to
+  # $SSD_PIPELINE_ROOT/.locks).
+  gpu_lock: true
+
   # Wait for GPU before generation (seconds, 0 = skip)
   gpu_wait_timeout: 120
 
@@ -175,9 +198,17 @@ llm:
   # -------------------------------------------------------------------------
   # Shared request settings (apply to both providers)
   # -------------------------------------------------------------------------
-  timeout: 600            # Per-request timeout (seconds)
+  timeout: 600            # Per-request HARD wall-clock cap (seconds). Phase 2
+                          # enforces this as a true total-time deadline (not just
+                          # requests' between-bytes inactivity timeout), so a
+                          # wedged/dribbling backend can't block one call past it.
   retry_attempts: 2       # Retry attempts on failure
   retry_delay: 5          # Delay between retries (seconds)
+  # While a CVE is being processed, Phase 2 refreshes the live-progress heartbeat
+  # every this-many seconds so the executor idle watchdog (phase_idle_timeouts[2])
+  # does not false-kill a healthy-but-slow CVE mid-LLM-call. Keep well below that
+  # idle timeout. 0 disables the pulser (revert to per-CVE-only heartbeats).
+  heartbeat_interval: 60
 
   # Generation parameters
   temperature: 0.2        # Lower = more deterministic
@@ -196,6 +227,15 @@ validation:
   validate_timeout: 600       # Per-patch validation timeout (seconds)
   build_timeout: 3600         # Validation Docker build timeout (seconds)
   poc_timeout: 300            # PoC execution timeout (seconds)
+
+  # How many patches Phase 3 validates concurrently. Each patch is an independent,
+  # CPU/IO-bound Docker rebuild + PoC re-run + host-side SAST on names unique to
+  # (cve, model) — NOT GPU work — so they parallelize cleanly; results are merged
+  # on the main thread. 1 = sequential (default; unchanged behavior). The patched
+  # rebuild is a full project recompile (the patch invalidates the cached build
+  # layer), so this is usually the largest Phase-3 cost — raise it on a multi-core
+  # host, but mind RAM: N concurrent compiles need ~N× the build memory.
+  max_workers: 1
 
   # SAST Configuration
   # The SAST tool list, severity gate (fail_on) and per-tool timeout are
