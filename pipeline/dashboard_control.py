@@ -365,10 +365,17 @@ def _cell_phases_from_state(parts: List[str]) -> str:
     log = parts[5] if len(parts) > 5 else ""
     try:
         if log and os.path.isfile(log):
-            txt = open(log, encoding="utf-8", errors="replace").read(20000)
-            m = re.search(r"Phases to Execute:\s*\[([0-9,\s]+)\]", txt)
-            if m:
-                ph = [c for c in re.split(r"[,\s]+", m.group(1).strip()) if c in PHASES]
+            with open(log, "rb") as f:
+                try:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - 20000))
+                except OSError:
+                    f.seek(0)
+                txt = f.read().decode("utf-8", "replace")
+            matches = re.findall(r"Phases to Execute:\s*\[([0-9,\s]+)\]", txt)
+            if matches:
+                ph = [c for c in re.split(r"[,\s]+", matches[-1].strip()) if c in PHASES]
                 if ph:
                     return " ".join(ph)
     except OSError:

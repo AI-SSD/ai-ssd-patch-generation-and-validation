@@ -6,8 +6,11 @@
 #   Stage 1  baselines once   : Phase 0+1 per project (heavy build, done 3× not 24×)
 #   Stage 2  OpenAI sweep      : Phase 2/3/4 for the OpenAI profiles, in parallel
 #                                (cloud inference → light VM load), capped
-#   Stage 3  Ollama sweep      : Phase 2/3/4 for the Ollama profiles, serialized
-#                                (they share ONE proxy GPU)
+#   Stage 3  Ollama sweep      : two-lane pipeline for the Ollama profiles:
+#                                Phase 2 generation feeds a Phase 3/4 validation
+#                                lane so validation can overlap the next cell's
+#                                generation. GPU-bound inference still serializes
+#                                safely via the host-global gpu_lock.
 #
 # Tracking: runs/<run_id>/ holds orchestrator.log (global), logs/<cell>.log (per
 # project×profile), cells/<cell>.state (machine-readable status for the dashboard).
@@ -24,7 +27,8 @@
 #   OLLAMA_PROFILES="ollama-proxy-qwen-coder ollama-proxy-deepseek ollama-proxy-devstral ollama-proxy-frontier-coder"
 #   BASELINE_PROFILE=openai-fast     # builds Phase 0/1 once; all profiles reuse it
 #   MAX_PARALLEL=3                   # OpenAI-sweep concurrency (VM cores/RAM)
-#   OLLAMA_PARALLEL=1                # keep 1 unless the proxy GPU has lots of VRAM
+#   OLLAMA_PARALLEL=1                # Phase-2 generation lane width (currently 1)
+#   OLLAMA_VALIDATE_PARALLEL=1       # Phase-3/4 validation lane width
 #   SWEEP_PHASES="2 3 4"  BASELINE_PHASES="0 1"
 #   NTFY_TOPIC / NTFY_SERVER / SLACK_WEBHOOK / DISCORD_WEBHOOK  (notifications)
 #     ntfy also auto-reads config.yaml's `notifications:` block (ntfy_url /
@@ -47,6 +51,7 @@ read -ra OLLAMA_PROFILES <<< "${OLLAMA_PROFILES:-ollama-proxy-qwen-coder ollama-
 BASELINE_PROFILE="${BASELINE_PROFILE:-openai-fast}"
 MAX_PARALLEL="${MAX_PARALLEL:-3}"
 OLLAMA_PARALLEL="${OLLAMA_PARALLEL:-1}"
+OLLAMA_VALIDATE_PARALLEL="${OLLAMA_VALIDATE_PARALLEL:-1}"
 SWEEP_PHASES="${SWEEP_PHASES:-2 3 4}"
 BASELINE_PHASES="${BASELINE_PHASES:-0 1}"
 
@@ -193,10 +198,12 @@ run_cell() {
   local proj="$1" prof="$2" phases="$3" stage="$4"
   local cell="${proj}__${prof}" clog="$RUN_DIR/logs/${proj}__${prof}.log"
   local started; started="$(date +%s)"
+  mkdir -p "$(dirname "$clog")"
   write_state "$cell" RUNNING "$stage" "$started" "" "" "$clog"
   log "START  $cell  [$stage]  phases='$phases'"
   notify_evt "$NOTIFY_CELL" "▶️ ${cell} started [${stage}] — phases '${phases}'"
-  RUN_INLINE=1 ./run_project.sh "$proj" --profile "$prof" --phases $phases >"$clog" 2>&1
+  printf '\n[%s] ===== %s [%s] phases=%s =====\n' "$(date '+%F %T')" "$cell" "$stage" "$phases" >>"$clog"
+  RUN_INLINE=1 ./run_project.sh "$proj" --profile "$prof" --phases $phases >>"$clog" 2>&1
   local rc=$? ended; ended="$(date +%s)"
   local st=DONE; (( rc != 0 )) && st=FAILED
   write_state "$cell" "$st" "$stage" "$started" "$ended" "$rc" "$clog"
@@ -209,6 +216,12 @@ run_cell() {
   return $rc
 }
 
+queue_cell_stage() {   # queue_cell_stage <project> <profile> <stage>
+  local proj="$1" prof="$2" stage="$3"
+  local cell="${proj}__${prof}" clog="$RUN_DIR/logs/${proj}__${prof}.log"
+  write_state "$cell" PENDING "$stage" "" "" "" "$clog"
+}
+
 # Run a list of "proj:prof" specs with at most $1 in flight.
 run_pool() {
   local maxp="$1" stage="$2" phases="$3"; shift 3
@@ -219,6 +232,75 @@ run_pool() {
     while (( $(jobs -rp | wc -l) >= maxp )); do sleep 2; done
   done
   wait
+}
+
+run_ollama_two_lane() {
+  local validate_parallel="$1"; shift
+  local specs=("$@")
+  local -a validate_queue=()
+  local -a validate_pids=()
+  local -a validate_specs=()
+  local spec proj prof
+
+  if (( OLLAMA_PARALLEL != 1 )); then
+    log "WARN: OLLAMA_PARALLEL=${OLLAMA_PARALLEL} requested, but the two-lane Ollama scheduler currently runs a single Phase-2 generation lane. Using 1 generation lane."
+  fi
+  if (( validate_parallel < 1 )); then
+    log "WARN: OLLAMA_VALIDATE_PARALLEL=${validate_parallel} is invalid; using 1."
+    validate_parallel=1
+  fi
+
+  _reap_validate_jobs() {
+    local -a keep_pids=()
+    local -a keep_specs=()
+    local idx vpid
+    for idx in "${!validate_pids[@]}"; do
+      vpid="${validate_pids[$idx]}"
+      [[ -n "$vpid" ]] || continue
+      if kill -0 "$vpid" 2>/dev/null; then
+        keep_pids+=("$vpid")
+        keep_specs+=("${validate_specs[$idx]}")
+      else
+        wait "$vpid" || true
+      fi
+    done
+    validate_pids=("${keep_pids[@]}")
+    validate_specs=("${keep_specs[@]}")
+  }
+
+  _start_validate_job() {
+    local vspec="$1" vproj vprof
+    vproj="${vspec%%:*}"; vprof="${vspec##*:}"
+    run_cell "$vproj" "$vprof" "3 4" "ollama-validate" &
+    validate_pids+=("$!")
+    validate_specs+=("$vspec")
+  }
+
+  _pump_validate_jobs() {
+    _reap_validate_jobs
+    while (( ${#validate_queue[@]} > 0 && ${#validate_pids[@]} < validate_parallel )); do
+      _start_validate_job "${validate_queue[0]}"
+      validate_queue=("${validate_queue[@]:1}")
+    done
+  }
+
+  for spec in "${specs[@]}"; do
+    proj="${spec%%:*}"; prof="${spec##*:}"
+    _pump_validate_jobs
+    if run_cell "$proj" "$prof" "2" "ollama-generate"; then
+      queue_cell_stage "$proj" "$prof" "ollama-validate-queued"
+      validate_queue+=("$spec")
+      _pump_validate_jobs
+    else
+      log "WARN: skipping validation for ${proj}__${prof} because Phase 2 failed."
+    fi
+  done
+
+  while (( ${#validate_queue[@]} > 0 || ${#validate_pids[@]} > 0 )); do
+    _pump_validate_jobs
+    (( ${#validate_queue[@]} == 0 && ${#validate_pids[@]} == 0 )) && break
+    sleep 2
+  done
 }
 
 summarize() {   # echo "DONE FAILED OTHER"
@@ -239,7 +321,7 @@ cleanup_running() {
   for f in "$RUN_DIR"/cells/*.state; do
     [[ -e "$f" ]] || continue
     IFS='|' read -r st stg started ended ex logf < "$f"
-    [[ "$st" == "RUNNING" ]] || continue
+    [[ "$st" == "RUNNING" || ( "$st" == "PENDING" && "$stg" == "ollama-validate-queued" ) ]] || continue
     cell="$(basename "$f" .state)"
     write_state "$cell" ABORTED "$stg" "$started" "$(date +%s)" 130 "$logf"
   done
@@ -248,7 +330,7 @@ trap 'trap - INT TERM; log "Interrupted — aborting."; cleanup_running; rm -f "
 
 # ---- preflight -----------------------------------------------------------
 log "RUN $RUN_ID  | projects: ${PROJECTS[*]}  | openai: ${OPENAI_PROFILES[*]}  | ollama: ${OLLAMA_PROFILES[*]}"
-log "baseline=$BASELINE_PROFILE  max_parallel=$MAX_PARALLEL  ollama_parallel=$OLLAMA_PARALLEL"
+log "baseline=$BASELINE_PROFILE  max_parallel=$MAX_PARALLEL  ollama_parallel=$OLLAMA_PARALLEL  ollama_validate_parallel=$OLLAMA_VALIDATE_PARALLEL"
 log "Dashboard:  ./dashboard.sh $RUN_DIR     Global log: $GLOBAL_LOG"
 check_distinct_attempt1 || log "NOTE: duplicate attempt-1 models above — keep MAX_PARALLEL low for affected cells."
 
@@ -326,15 +408,15 @@ notify_evt "$NOTIFY_STAGE" "🔧 Stage 2 starting: OpenAI sweep — ${#specs[@]}
 (( ${#specs[@]} )) && run_pool "$MAX_PARALLEL" openai-sweep "$SWEEP_PHASES" "${specs[@]}"
 notify_evt "$NOTIFY_STAGE" "✅ Stage 2 OpenAI sweep done (${#specs[@]} cell(s))"
 
-# ---- Stage 3: Ollama sweep (serialized — shared GPU) ---------------------
-log "===== STAGE 3: Ollama sweep (max_parallel=$OLLAMA_PARALLEL, phases='$SWEEP_PHASES') ====="
+# ---- Stage 3: Ollama sweep (two-lane: Phase 2 feeds Phase 3/4) ------------
+log "===== STAGE 3: Ollama sweep (gen_parallel=$OLLAMA_PARALLEL, validate_parallel=$OLLAMA_VALIDATE_PARALLEL, phases='$SWEEP_PHASES') ====="
 specs=()
 for proj in "${GOOD_PROJECTS[@]}"; do for prof in "${OLLAMA_PROFILES[@]}"; do
   [[ -n "${SEED_FAILED[${proj}__${prof}]:-}" ]] && continue
   specs+=("$proj:$prof")
 done; done
-notify_evt "$NOTIFY_STAGE" "🔧 Stage 3 starting: Ollama sweep — ${#specs[@]} cell(s) [max_parallel=$OLLAMA_PARALLEL, phases '$SWEEP_PHASES']"
-(( ${#specs[@]} )) && run_pool "$OLLAMA_PARALLEL" ollama-sweep "$SWEEP_PHASES" "${specs[@]}"
+notify_evt "$NOTIFY_STAGE" "🔧 Stage 3 starting: Ollama two-lane sweep — ${#specs[@]} cell(s) [gen_parallel=$OLLAMA_PARALLEL, validate_parallel=$OLLAMA_VALIDATE_PARALLEL, phases '$SWEEP_PHASES']"
+(( ${#specs[@]} )) && run_ollama_two_lane "$OLLAMA_VALIDATE_PARALLEL" "${specs[@]}"
 notify_evt "$NOTIFY_STAGE" "✅ Stage 3 Ollama sweep done (${#specs[@]} cell(s))"
 
 # ---- done ----------------------------------------------------------------
