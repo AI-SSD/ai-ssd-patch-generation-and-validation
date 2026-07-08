@@ -197,6 +197,12 @@ class VulnerabilityInfo:
         return (self.poc_language or "").lower() == "intree-test"
 
 
+def _docker_safe_name(s: str) -> str:
+    """Sanitize a string into a Docker-name-safe token (lowercase ``a-z0-9._-``)."""
+    s = re.sub(r"[^a-z0-9_.-]+", "-", str(s).lower()).strip("-._")
+    return s or "run"
+
+
 @dataclass
 class PatchInfo:
     """Data class to hold patch information"""
@@ -212,6 +218,14 @@ class PatchInfo:
     # feedback-loop identity stays in model_name (used for image tag/grouping);
     # this is for honest logging of which model produced the attempt.
     generation_model: str = ""
+    # Per-cell / per-repeat discriminator (the sanitized run base_dir basename,
+    # e.g. "glibc__openai-fast__rep2"). It makes the patched image + container
+    # names UNIQUE across concurrently-running cells AND repeats that share the
+    # same (cve, model) — the prerequisite for parallel sweeps / overlapping
+    # families / parallel repeats. Empty ⇒ the LEGACY name (cve+model only),
+    # byte-for-byte the prior behaviour, so any caller that doesn't set it is
+    # unchanged.
+    cell: str = ""
 
     @property
     def log_label(self) -> str:
@@ -223,15 +237,17 @@ class PatchInfo:
 
     @property
     def image_name(self) -> str:
-        """Generate Docker image name for this patch"""
+        """Generate Docker image name for this patch (unique per cell when set)."""
         safe_model = self.model_name.replace(":", "_").replace(".", "_")
-        return f"ai-ssd-patch/{self.cve_id.lower()}-{safe_model}:latest"
-    
+        suffix = f"-{self.cell}" if self.cell else ""
+        return f"ai-ssd-patch/{self.cve_id.lower()}-{safe_model}{suffix}:latest"
+
     @property
     def container_name(self) -> str:
-        """Generate container name for this patch"""
+        """Generate container name for this patch (unique per cell when set)."""
         safe_model = self.model_name.replace(":", "_").replace(".", "_")
-        return f"patch-test-{self.cve_id.lower()}-{safe_model}"
+        suffix = f"-{self.cell}" if self.cell else ""
+        return f"patch-test-{self.cve_id.lower()}-{safe_model}{suffix}"
 
 
 # SAST findings are plain dicts produced by master_pipeline.sast_runner
@@ -448,9 +464,13 @@ class CSVParser:
 class PatchDiscovery:
     """Discovers and loads patch files from the patches directory"""
     
-    def __init__(self, patches_dir: Path, logger: logging.Logger):
+    def __init__(self, patches_dir: Path, logger: logging.Logger, cell_disc: str = ""):
         self.patches_dir = patches_dir
         self.logger = logger
+        # Per-cell/per-repeat Docker-name discriminator threaded onto each
+        # discovered PatchInfo (see ValidationPipeline.cell_disc). Empty ⇒ legacy
+        # cve+model image/container names.
+        self.cell_disc = cell_disc
         # Patches that exist on disk but are deliberately NOT validated (test-file
         # targets, no usable patch produced). Recorded here so the Phase 3 summary
         # can report the Phase 2 → Phase 3 hand-off drop instead of silently
@@ -583,7 +603,8 @@ class PatchDiscovery:
                 function_only_file=function_only_file,
                 response_json=response_json,
                 is_valid=is_valid,
-                original_filepath=original_filepath
+                original_filepath=original_filepath,
+                cell=self.cell_disc,
             )
             self.logger.debug(f"Loaded patch: {cve_id}/{model_name} (valid={is_valid})")
             return patch_info
@@ -658,6 +679,12 @@ LABEL maintainer="AI-SSD Project"
 LABEL ai-ssd.type="validation"
 LABEL cve="{cve}"
 LABEL model="{model_name}"
+
+# Per-build compile-jobs cap (SSD_MAKE_JOBS): the rebuild script runs make -j
+# with this value when set, else nproc. Passed as a build-arg by the validator
+# so concurrent Phase-3 rebuilds don't oversubscribe the host cores. Declared
+# here so it is in scope for the rebuild RUN below.
+ARG SSD_MAKE_JOBS
 
 # Apply the patch over the vulnerable source file. `touch` guarantees the
 # file is newer than every existing build artifact (COPY may preserve an
@@ -775,6 +802,12 @@ LABEL ai-ssd.type="validation-intree"
 LABEL cve="{cve}"
 LABEL model="{model_name}"
 
+# Per-build compile-jobs cap (SSD_MAKE_JOBS): the in-tree build script runs
+# make -j with this value when set, else nproc. Declared here so the build-arg
+# passed by build_image is in scope for the rebuild RUN below (and so no
+# "unconsumed build-arg" warning is emitted when the cap is configured).
+ARG SSD_MAKE_JOBS
+
 # Apply the patch over the vulnerable source file (touch so the rebuild can't
 # skip it on a preserved mtime).
 COPY patched_source.c /build/{source_dir}/{vuln_file_path}
@@ -850,14 +883,21 @@ class ValidationDockerManager:
     ) -> Tuple[bool, Optional[str]]:
         """Build Docker image for patch validation"""
         self.logger.info(f"Building image for {patch_info.log_label}...")
-        
+
+        # Per-build compile-jobs cap (docker.make_jobs / SSD_MAKE_JOBS): when set,
+        # the rebuild script's `make -j"${SSD_MAKE_JOBS:-$(nproc)}"` uses it instead
+        # of all cores, so N concurrent Phase-3 rebuilds (validation.max_workers > 1)
+        # don't oversubscribe the host. Unset ⇒ no build-arg ⇒ $(nproc), unchanged.
+        _jobs = (_cfg.get("docker") or {}).get("make_jobs")
+        _buildargs = {"SSD_MAKE_JOBS": str(_jobs)} if _jobs else None
         try:
             image, build_logs = self.client.images.build(
                 path=str(build_context),
                 tag=patch_info.image_name,
                 rm=True,
                 forcerm=True,
-                timeout=self.timeout
+                timeout=self.timeout,
+                buildargs=_buildargs,
             )
             
             # Collect build logs
@@ -1459,6 +1499,12 @@ class ValidationPipeline:
     
     def __init__(self, args: argparse.Namespace):
         self.base_dir = Path(args.base_dir).resolve()
+        # Per-cell/per-repeat Docker-name discriminator (the base_dir basename, e.g.
+        # "glibc__openai-fast__rep2"). Threaded into every PatchInfo so the patched
+        # image + container names are unique per cell/repeat — letting cells,
+        # overlapping families and repeats run concurrently without colliding on
+        # Docker names (they previously shared cve+model-only names).
+        self.cell_disc = _docker_safe_name(self.base_dir.name)
         self.csv_path = Path(args.csv_file).resolve()
         self.patches_dir = Path(args.patches_dir).resolve()
         self.exploits_dir = Path(args.exploits_dir).resolve()
@@ -1510,7 +1556,7 @@ class ValidationPipeline:
 
         # Initialize components
         self.csv_parser = CSVParser(self.csv_path, self.logger)
-        self.patch_discovery = PatchDiscovery(self.patches_dir, self.logger)
+        self.patch_discovery = PatchDiscovery(self.patches_dir, self.logger, self.cell_disc)
         self.dockerfile_gen = PatchedDockerfileGenerator(self.logger, self.phase1_layout)
         self.docker_mgr = ValidationDockerManager(self.logger, self.build_timeout,
                                                   sast_config=self.sast_config)
@@ -2005,7 +2051,8 @@ class ValidationPipeline:
             response_json=None,
             is_valid=True,  # Assume valid since it passed syntax check in generator
             original_filepath=vuln_info.file_path,
-            generation_model=generation_model
+            generation_model=generation_model,
+            cell=self.cell_disc,
         )
         
         return self._validate_patch(

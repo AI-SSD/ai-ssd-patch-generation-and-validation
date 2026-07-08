@@ -132,6 +132,54 @@ def _safe_model(model: str) -> str:
     return model.replace(":", "_").replace(".", "_")
 
 
+def _safe_cell(s: str) -> str:
+    """Mirror patch_validator._docker_safe_name (per-cell tag discriminator)."""
+    return re.sub(r"[^a-z0-9_.-]+", "-", str(s).lower()).strip("-._") or "run"
+
+
+_REP_RE = re.compile(r"^rep(\d+)$")
+
+
+def _split_cell_name(cell: str) -> Tuple[str, str, str]:
+    """Split a cell name into ``(project, repeat_tag, profile)``.
+
+    Cell names are ``<proj>__<prof>`` or ``<proj>__<prof>__rep<K>`` (run_all.sh
+    repeat runs export ``RUN_TAG="rep<K>"``). Profiles never contain ``__``, so a
+    trailing ``rep<N>`` segment is the repeat tag and everything between the
+    project and it is the profile. A plain ``partition("__")`` would fold
+    ``__rep<K>`` into the profile — breaking the profile lookup AND the resume
+    base-dir (which must carry ``RUN_TAG`` to hit ``projects/…__rep<K>/``).
+    Untagged cells get repeat ``""``. Mirrors ``dashboard_server._split_cell_name``.
+    """
+    segs = str(cell).split("__")
+    proj = segs[0]
+    rest = segs[1:]
+    rep = ""
+    if rest and _REP_RE.match(rest[-1]):
+        rep = rest[-1]
+        rest = rest[:-1]
+    return proj, rep, "__".join(rest)
+
+
+def _phase3_attributed(safe_m: str, want_models: set, want_cells: set) -> bool:
+    """True if a patched-image tag tail belongs to a selected (project, profile).
+
+    ``safe_m`` is "<model>" (legacy) or "<model>-<cell>" (per-cell tag), where
+    <cell> = sanitized "<proj>__<prof>[__repN]". A legacy tag matches by model
+    alone (profile-agnostic, as before); a celled tag matches ONLY when its
+    <cell> is one of the selected cells — or a "<cell>__repN" repeat — so a
+    different profile that shares or dash-prefixes the model is NOT over-matched.
+    """
+    if safe_m in want_models:
+        return True
+    for w in want_models:
+        if safe_m.startswith(w + "-"):
+            cell = safe_m[len(w) + 1:]
+            if any(cell == c or cell.startswith(c + "__rep") for c in want_cells):
+                return True
+    return False
+
+
 def list_cells() -> List[Dict[str, str]]:
     """Existing ``projects/<project>__<profile>/`` working dirs."""
     out = []
@@ -141,7 +189,7 @@ def list_cells() -> List[Dict[str, str]]:
         full = os.path.join(PROJECTS_DIR, d)
         if not os.path.isdir(full) or "__" not in d:
             continue
-        proj, _, prof = d.partition("__")
+        proj, _rep, prof = _split_cell_name(d)
         out.append({"cell": d, "project": proj, "profile": prof,
                     "size_bytes": _dir_size(full)})
     return out
@@ -598,7 +646,7 @@ START=$(date +%s)
   echo " Previous cell state was FAILED/ABORTED — this run supersedes it."
   echo "================================================================"
 } | tee "$LOG"
-RUN_INLINE=1 bash "$ROOT/run_project.sh" @@PROJ@@ --profile @@PROF@@ --phases @@PHASES@@ >> "$LOG" 2>&1
+RUN_INLINE=1 RUN_TAG=@@RUNTAG@@ bash "$ROOT/run_project.sh" @@PROJ@@ --profile @@PROF@@ --phases @@PHASES@@ >> "$LOG" 2>&1
 RC=$?
 END=$(date +%s)
 ST=DONE; [ "$RC" -ne 0 ] && ST=FAILED
@@ -621,7 +669,7 @@ def resume_failed_cell(cell: str) -> Dict[str, Any]:
     if last not in ("FAILED", "ABORTED"):
         return {"ok": False, "error": f"resume-after-fail only applies to a "
                 f"FAILED/ABORTED cell (last state: {last or 'unknown'})"}
-    proj, _, prof = cell.partition("__")
+    proj, rep, prof = _split_cell_name(cell)
     if proj not in set(list_projects()):
         return {"ok": False, "error": f"unknown project {proj!r}"}
     if prof not in {p["name"] for p in list_profiles()}:
@@ -640,6 +688,7 @@ def resume_failed_cell(cell: str) -> Dict[str, Any]:
               .replace("@@AUDIT@@", shlex.quote(_cell_audit_path(cell)))
               .replace("@@PROJ@@", shlex.quote(proj))
               .replace("@@PROF@@", shlex.quote(prof))
+              .replace("@@RUNTAG@@", shlex.quote(rep))
               .replace("@@PHASES@@", phases)
               .replace("@@CELL@@", cell))
     try:
@@ -670,7 +719,11 @@ def resume_failed_cell(cell: str) -> Dict[str, Any]:
 def start_run(projects: List[str], profiles: List[str], baseline_profile: str,
               baseline_phases: List[str], sweep_phases: List[str],
               manual_phase0_hold: bool = False, manual_phase1_gate: bool = False,
-              manual_timeout: int = 1800) -> Dict[str, Any]:
+              manual_timeout: int = 1800,
+              repeats: int = 1, reuse_baseline: bool = False,
+              overlap_families: bool = False, repeat_parallel: bool = False,
+              validation_workers: int = 0, baseline_parallel: int = 0,
+              make_jobs: int = 0) -> Dict[str, Any]:
     """Launch run_all.sh detached with a validated, allowlisted selection.
 
     Per-phase manual review (transported as env so config.yaml is untouched):
@@ -698,6 +751,13 @@ def start_run(projects: List[str], profiles: List[str], baseline_profile: str,
     if not bphases and not sphases:
         return {"ok": False, "error": "no phases selected"}
 
+    # Repeat the SWEEP N times over the once-built baseline (run_all.sh REPEATS).
+    # Clamp to a sane range so a typo can't launch hundreds of sweeps.
+    try:
+        repeats = max(1, min(int(repeats), 50))
+    except (TypeError, ValueError):
+        repeats = 1
+
     openai = [p for p in profiles if known_profiles[p]["provider"] == "openai"]
     ollama = [p for p in profiles if known_profiles[p]["provider"] == "ollama"]
     run_id = time.strftime("%Y%m%d_%H%M%S")
@@ -713,12 +773,32 @@ def start_run(projects: List[str], profiles: List[str], baseline_profile: str,
         "BASELINE_PROFILE": baseline_profile,
         "BASELINE_PHASES": " ".join(bphases) or "0 1",
         "SWEEP_PHASES": " ".join(sphases) or "2 3 4",
+        # Repeat the sweep N times over one baseline; optionally reuse an existing
+        # baseline (skip Stage-1 rebuild). Defaults preserve single-run behavior.
+        "REPEATS": str(repeats),
+        "REUSE_BASELINE": "true" if reuse_baseline else "false",
+        # Runtime overlap: run the OpenAI + Ollama sweeps concurrently, and/or run
+        # the repeats concurrently. Default false = sequential (unchanged).
+        "OVERLAP_FAMILIES": "true" if overlap_families else "false",
+        "REPEAT_PARALLEL": "true" if repeat_parallel else "false",
         # Per-phase manual review (read by master_pipeline/config.py). Defaults =
         # historical behavior: Phase 0 auto-skips, Phase 1 gate off.
         "MANUAL_VERIFY_AUTO_SKIP": "false" if manual_phase0_hold else "true",
         "PHASE1_MANUAL_GATE": "true" if manual_phase1_gate else "false",
         "MANUAL_VERIFY_TIMEOUT": str(int(manual_timeout) if int(manual_timeout) > 0 else 1800),
     })
+    # Intra-phase concurrency + per-build make-j cap (env-overlaid onto config).
+    # Only set when > 0 so an untouched control keeps the config default
+    # (sequential validation / single baseline run / make -j$(nproc)).
+    for _k, _v in (("SSD_VALIDATION_WORKERS", validation_workers),
+                   ("SSD_BASELINE_PARALLEL", baseline_parallel),
+                   ("SSD_MAKE_JOBS", make_jobs)):
+        try:
+            _n = int(_v)
+        except (TypeError, ValueError):
+            continue
+        if _n > 0:
+            env[_k] = str(min(_n, 64))  # server-side sanity cap (HTML max= is client-only)
     launch_log = open(os.path.join(run_dir, "launch.log"), "ab")
     try:
         proc = subprocess.Popen(
@@ -734,7 +814,13 @@ def start_run(projects: List[str], profiles: List[str], baseline_profile: str,
             "baseline_phases": bphases, "sweep_phases": sphases,
             "manual_phase0_hold": bool(manual_phase0_hold),
             "manual_phase1_gate": bool(manual_phase1_gate),
-            "manual_timeout": int(manual_timeout)}
+            "manual_timeout": int(manual_timeout),
+            "repeats": repeats, "reuse_baseline": bool(reuse_baseline),
+            "overlap_families": bool(overlap_families),
+            "repeat_parallel": bool(repeat_parallel),
+            "validation_workers": int(validation_workers or 0),
+            "baseline_parallel": int(baseline_parallel or 0),
+            "make_jobs": int(make_jobs or 0)}
 
 
 # ---------------------------------------------------------------------------
@@ -843,7 +929,7 @@ def build_cell_archive(cell: str) -> Dict[str, Any]:
     cell_dir = os.path.join(PROJECTS_DIR, cell)
     if not _under(cell_dir, [PROJECTS_DIR]):   # defense in depth on the cell name
         raise ValueError("unknown cell")
-    project, _, profile = cell.partition("__")
+    project, _rep, profile = _split_cell_name(cell)
     ts = time.strftime("%Y%m%d_%H%M%S")
     arcroot = f"{cell}_{ts}"                    # top-level folder inside the ZIP
 
@@ -1679,6 +1765,12 @@ def plan_deletion(sel: Dict[str, Any]) -> Dict[str, Any]:
         explicit_profiles = bool(sel.get("profiles"))
         want_models = {_safe_model(m) for prof in profiles
                        for m in all_profiles[prof]["models"]}
+        # Cell tokens for the selected (project, profile) pairs. Per-cell patched
+        # tags are "<model>-<cell>" where cell = sanitized "<proj>__<prof>[__repN]"
+        # (see patch_validator._docker_safe_name). Matching the <cell> — not just
+        # the model — is what stops cleanup of profile A from deleting profile B's
+        # images when they share or prefix a model.
+        want_cells = {_safe_cell(f"{proj}__{prof}") for proj in projects for prof in profiles}
         # Project scoping for patched images (no project in the tag) needs a
         # CVE-set join from the manifests. FAIL SAFE: if the user explicitly
         # scoped to projects but we cannot resolve their CVE set, do NOT silently
@@ -1691,13 +1783,17 @@ def plan_deletion(sel: Dict[str, Any]) -> Dict[str, Any]:
                          "attributed to them (refusing to match all projects).")
         else:
             for img in _images_by_reference(f"{_PATCH_PREFIX}/*:latest"):
-                # tag: ai-ssd-patch/<cve_lower>-<safe_model>:latest
+                # tag: ai-ssd-patch/<cve_lower>-<safe_model>[-<cell>]:latest
+                # (the optional -<cell> suffix isolates concurrent cells/repeats;
+                # see patch_validator.PatchInfo.image_name).
                 tag = img["ref"].split("/", 1)[1].rsplit(":", 1)[0]
                 m = re.match(r"(cve-\d{4}-\d+)-(.+)$", tag)
                 if not m:
                     continue
                 cve_l, safe_m = m.group(1), m.group(2)
-                if explicit_profiles and safe_m not in want_models:
+                # Attribute by model AND cell so cleanup of one profile never
+                # deletes another profile's images (they share the Docker daemon).
+                if explicit_profiles and not _phase3_attributed(safe_m, want_models, want_cells):
                     continue
                 if explicit_projects and cve_l.upper() not in any_cves:
                     continue
@@ -2043,7 +2139,7 @@ def retry_phase1(cell: str, cve: str) -> Dict[str, Any]:
     cell_dir = _cell_dir(cell)
     if not cell_dir or not _valid_cve(cve):
         return {"ok": False, "error": "invalid cell/cve"}
-    proj, _, prof = cell.partition("__")
+    proj, rep, prof = _split_cell_name(cell)
     if proj not in set(list_projects()):
         return {"ok": False, "error": "unknown project"}
     if not os.path.isfile(os.path.join(PROFILES_DIR, f"{prof}.env")):
@@ -2051,7 +2147,7 @@ def retry_phase1(cell: str, cve: str) -> Dict[str, Any]:
     cve = cve.upper()
     env = dict(os.environ)
     env.update({"RUN_INLINE": "1", "PHASE1_MANUAL_GATE": "false",
-                "MANUAL_VERIFY_AUTO_SKIP": "true"})
+                "MANUAL_VERIFY_AUTO_SKIP": "true", "RUN_TAG": rep})
     logdir = os.path.join(cell_dir, "logs")
     try:
         os.makedirs(logdir, exist_ok=True)

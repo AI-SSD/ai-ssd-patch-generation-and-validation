@@ -312,7 +312,7 @@ phase1:
     cd "$BD" || exit 1; rm -rf ./*
     ( "$SRC"/configure --prefix="$PFX" $HOST CFLAGS="$ARCHFLAGS -O2 -g -w -U_FORTIFY_SOURCE" 2>&1 && echo CONFIGURE_OK ) \
       > /build/cfg.log 2>&1 || { echo "CONFIGURE_FAIL"; tail -25 /build/cfg.log; }
-    make -j"$(nproc)" -k > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
+    make -j"${SSD_MAKE_JOBS:-$(nproc)}" -k > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
     make install -k > /build/make_install.log 2>&1; echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status
     if ls "$PFX"/lib/libtiff.so* 2>/dev/null | grep -q .; then echo "PROJECT_BUILD_INSTALLED=yes" >> /build/build_status; else echo "PROJECT_BUILD_INSTALLED=no" >> /build/build_status; fi
     echo "build complete"
@@ -362,7 +362,7 @@ phase1:
   patch_rebuild_script: |
     #!/bin/bash
     cd "$BUILD_DIR" || { echo "no build dir" > /tmp/ssd_rebuild.log; }
-    make -j"$(nproc)" -k > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
+    make -j"${SSD_MAKE_JOBS:-$(nproc)}" -k > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
     make install -k > /tmp/ssd_install.log 2>&1; echo "install exit: $?"
     grep -B2 -A8 "error:" /tmp/ssd_rebuild.log 2>/dev/null | head -100 > /tmp/ssd_build_errors; true
     case "$VULN_FILE" in
@@ -398,7 +398,7 @@ phase1:
       export CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1 -w -U_FORTIFY_SOURCE"
       export LDFLAGS="-fsanitize=address"
       ( "$SRC"/configure --prefix="$PFX" 2>&1 && echo CONFIG_OK ) > /build/cfg.log 2>&1 || { echo CONFIG_FAIL; tail -25 /build/cfg.log; }
-      make -j"$(nproc)" -k > /build/make.log 2>&1; echo "BUILD_RC=$?" >> /build/build_status
+      make -j"${SSD_MAKE_JOBS:-$(nproc)}" -k > /build/make.log 2>&1; echo "BUILD_RC=$?" >> /build/build_status
       make install -k >> /build/make.log 2>&1 || true
       tail -15 /build/make.log; echo "build complete"
     run_script: |
@@ -427,7 +427,7 @@ phase1:
         SHTESTS="$(printf '%s\n' $SHTESTS | awk 'NF&&!seen[$0]++' | tr '\n' ' ')"
         if [ -n "$SHTESTS" ]; then
           echo "--- running fix's shipped regression test(s) via harness: $SHTESTS ---"
-          ( cd "$TESTDIR" && make -j"$(nproc)" ) > /tmp/mkchk.log 2>&1 || true
+          ( cd "$TESTDIR" && make -j"${SSD_MAKE_JOBS:-$(nproc)}" ) > /tmp/mkchk.log 2>&1 || true
           ( cd "$TESTDIR" && ASAN_OPTIONS="detect_leaks=0:allocator_may_return_null=1" \
               timeout "${INTREE_TEST_TIMEOUT:-600}" make check TESTS="$SHTESTS" ) > /tmp/it.log 2>&1; rc=$?
           grep -E '^(PASS|FAIL|XFAIL|XPASS|ERROR|SKIP):' /tmp/it.log | head -20

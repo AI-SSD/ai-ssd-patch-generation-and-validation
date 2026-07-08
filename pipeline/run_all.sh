@@ -54,6 +54,29 @@ OLLAMA_PARALLEL="${OLLAMA_PARALLEL:-1}"
 OLLAMA_VALIDATE_PARALLEL="${OLLAMA_VALIDATE_PARALLEL:-1}"
 SWEEP_PHASES="${SWEEP_PHASES:-2 3 4}"
 BASELINE_PHASES="${BASELINE_PHASES:-0 1}"
+# Repeat the SWEEP (Phase 2/3/4) this many times over the SAME once-built baseline
+# (Phase 0/1) — for run-to-run variance on the stochastic generation/feedback.
+# Each repeat writes to its own projects/<proj>__<prof>__rep<K>/ dir. 1 = today's
+# single sweep, byte-identical (no RUN_TAG, no repeat loop overhead).
+REPEATS="${REPEATS:-1}"
+[[ "$REPEATS" =~ ^[0-9]+$ ]] && (( REPEATS >= 1 )) || REPEATS=1
+# When "true", skip the Stage-1 baseline BUILD for any project that already has a
+# usable baseline (image manifest + Phase-0 CSV) in its baseline dir, and just run
+# the sweep(s). Lets repeated campaigns reuse a baseline instead of rebuilding it.
+REUSE_BASELINE="${REUSE_BASELINE:-false}"
+# OVERLAP_FAMILIES=true runs the OpenAI sweep (Stage 2) and the Ollama sweep
+# (Stage 3) CONCURRENTLY instead of one after the other, so the remote Ollama GPU
+# is kept busy during the (CPU/API-bound) OpenAI sweep. Safe: OpenAI cells use no
+# GPU, the Python-side gpu_lock serialises Ollama inference, and patched
+# image/container names are now per-cell-unique. CAVEAT: builds are make -j$(nproc);
+# concurrent Stage-2 + Stage-3 builds share the CPU, so keep MAX_PARALLEL and
+# OLLAMA_VALIDATE_PARALLEL modest when overlapping. Default false = sequential.
+OVERLAP_FAMILIES="${OVERLAP_FAMILIES:-false}"
+# REPEAT_PARALLEL=true runs the REPEATS concurrently (each repeat is independent;
+# generation is network-bound, only compiles queue on CPU). Relies on the
+# per-repeat-unique patched image tags. Same make -j$(nproc) CPU caveat as above.
+# Default false = repeats run sequentially.
+REPEAT_PARALLEL="${REPEAT_PARALLEL:-false}"
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 RUN_DIR="$PIPELINE_ROOT/runs/$RUN_ID"
@@ -165,9 +188,13 @@ stat_size() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo -
 # to verify, so the sweep runs and honestly reports no baseline.
 seed_cell() {
   local proj="$1" prof="$2" d
-  [[ "$prof" == "$BASELINE_PROFILE" ]] && return 0   # baseline dir already has it
+  local tag="${RUN_TAG:+__${RUN_TAG}}"
+  # An UNTAGGED sweep of the baseline profile reuses the baseline dir in place
+  # (today's behavior); a TAGGED repeat sweep always needs its own dir seeded
+  # from the once-built baseline dir.
+  [[ "$prof" == "$BASELINE_PROFILE" && -z "$tag" ]] && return 0
   local src="$PIPELINE_ROOT/projects/${proj}__${BASELINE_PROFILE}"
-  local dst="$PIPELINE_ROOT/projects/${proj}__${prof}"
+  local dst="$PIPELINE_ROOT/projects/${proj}__${prof}${tag}"
   [[ -d "$src" ]] || { log "WARN: no baseline dir to seed from: $src"; return 1; }
   mkdir -p "$dst"
   for d in results exploits documentation manual_supervision; do
@@ -193,10 +220,23 @@ seed_cell() {
   return 0
 }
 
+# True when a project already has a usable Phase 0/1 baseline (image manifest +
+# Phase-0 CSV) in its baseline dir — so REUSE_BASELINE can skip the rebuild.
+baseline_exists() {
+  local proj="$1" d="$PIPELINE_ROOT/projects/${proj}__${BASELINE_PROFILE}/results"
+  [[ -d "$d" ]] || return 1
+  compgen -G "$d"/*image_manifest*.json >/dev/null 2>&1 || return 1
+  compgen -G "$d"/*_cve_poc_complete.csv >/dev/null 2>&1 || return 1
+  return 0
+}
+
 # Run ONE (project, profile) cell in the foreground (inline) and record state.
+# RUN_TAG (exported per repeat) suffixes the cell name + the run_project.sh base
+# dir; empty ⇒ the historical untagged cell.
 run_cell() {
   local proj="$1" prof="$2" phases="$3" stage="$4"
-  local cell="${proj}__${prof}" clog="$RUN_DIR/logs/${proj}__${prof}.log"
+  local tag="${RUN_TAG:+__${RUN_TAG}}"
+  local cell="${proj}__${prof}${tag}" clog="$RUN_DIR/logs/${proj}__${prof}${tag}.log"
   local started; started="$(date +%s)"
   mkdir -p "$(dirname "$clog")"
   write_state "$cell" RUNNING "$stage" "$started" "" "" "$clog"
@@ -218,7 +258,8 @@ run_cell() {
 
 queue_cell_stage() {   # queue_cell_stage <project> <profile> <stage>
   local proj="$1" prof="$2" stage="$3"
-  local cell="${proj}__${prof}" clog="$RUN_DIR/logs/${proj}__${prof}.log"
+  local tag="${RUN_TAG:+__${RUN_TAG}}"
+  local cell="${proj}__${prof}${tag}" clog="$RUN_DIR/logs/${proj}__${prof}${tag}.log"
   write_state "$cell" PENDING "$stage" "" "" "" "$clog"
 }
 
@@ -356,7 +397,17 @@ ensure_venv
 declare -A _all_profiles=()
 for p in "${OPENAI_PROFILES[@]}" "${OLLAMA_PROFILES[@]}"; do _all_profiles["$p"]=1; done
 for proj in "${PROJECTS[@]}"; do
-  for prof in "${!_all_profiles[@]}"; do write_state "${proj}__${prof}" PENDING "" "" "" "" ""; done
+  # The untagged baseline cell (Stage 1) always shows.
+  write_state "${proj}__${BASELINE_PROFILE}" PENDING "" "" "" "" ""
+  for prof in "${!_all_profiles[@]}"; do
+    if (( REPEATS > 1 )); then
+      for (( rep=1; rep<=REPEATS; rep++ )); do
+        write_state "${proj}__${prof}__rep${rep}" PENDING "" "" "" "" ""
+      done
+    else
+      write_state "${proj}__${prof}" PENDING "" "" "" "" ""
+    fi
+  done
 done
 
 notify_evt "$NOTIFY_RUN" "▶️ Benchmark ${RUN_ID} started: ${#PROJECTS[@]} projects × ${#_all_profiles[@]} profiles"
@@ -365,7 +416,15 @@ notify_evt "$NOTIFY_RUN" "▶️ Benchmark ${RUN_ID} started: ${#PROJECTS[@]} pr
 log "===== STAGE 1: baselines (profile=$BASELINE_PROFILE, phases='$BASELINE_PHASES') ====="
 notify_evt "$NOTIFY_STAGE" "🔧 Stage 1 starting: baselines for ${#PROJECTS[@]} project(s) [profile=$BASELINE_PROFILE, phases '$BASELINE_PHASES']"
 GOOD_PROJECTS=()
+export RUN_TAG=""   # baseline is ALWAYS untagged; only the sweep loop sets RUN_TAG
 for proj in "${PROJECTS[@]}"; do
+  if [[ "$REUSE_BASELINE" == "true" ]] && baseline_exists "$proj"; then
+    log "REUSE: existing baseline found for $proj — skipping Phase '$BASELINE_PHASES' build."
+    write_state "${proj}__${BASELINE_PROFILE}" DONE baseline-reused "" "$(date +%s)" 0 ""
+    GOOD_PROJECTS+=("$proj")
+    notify_evt "$NOTIFY_PROJECT" "♻️ Project '${proj}': reusing existing baseline"
+    continue
+  fi
   notify_evt "$NOTIFY_PROJECT" "📦 Project '${proj}': building baseline (phases '$BASELINE_PHASES')"
   if run_cell "$proj" "$BASELINE_PROFILE" "$BASELINE_PHASES" baseline; then
     GOOD_PROJECTS+=("$proj")
@@ -380,44 +439,98 @@ for proj in "${PROJECTS[@]}"; do
 done
 notify_evt "$NOTIFY_STAGE" "✅ Stage 1 baselines done (${#GOOD_PROJECTS[@]}/${#PROJECTS[@]} ok)"
 
-# Seed sweep dirs from the (now static) baseline dirs BEFORE any sweep starts.
-# A failed/incomplete seed marks the cell SKIPPED so it does NOT run and report a
-# bogus all-"No Phase 1 Baseline" result.
-declare -A SEED_FAILED=()
-log "Seeding baseline artifacts into sweep profile dirs ..."
-for proj in "${GOOD_PROJECTS[@]}"; do
-  for prof in "${!_all_profiles[@]}"; do
-    [[ "$prof" == "$BASELINE_PROFILE" ]] && continue
-    if ! seed_cell "$proj" "$prof"; then
-      SEED_FAILED["${proj}__${prof}"]=1
-      write_state "${proj}__${prof}" SKIPPED "seed-failed" "" "" "" ""
-      log "WARN: seeding failed/incomplete for ${proj}__${prof} — skipping its sweep."
-      notify "⚠️ ${RUN_ID}: seeding failed for ${proj}__${prof} (sweep skipped)" high
-    fi
+# Sweep — optionally repeated REPEATS times over the SAME (static) baseline, each
+# repeat isolated in its own RUN_TAG dir, for run-to-run variance on the stochastic
+# generation/feedback. REPEATS=1 ⇒ exactly one untagged sweep (today's behavior).
+# OVERLAP_FAMILIES overlaps Stage 2 & 3; REPEAT_PARALLEL runs repeats concurrently.
+
+# Run ONE repeat (index $1): set its own RUN_TAG, seed its sweep dirs, then run the
+# OpenAI (Stage 2) and Ollama (Stage 3) sweeps — sequentially, or overlapped when
+# OVERLAP_FAMILIES=true. Safe to background (REPEAT_PARALLEL): RUN_TAG is exported
+# inside this function, so a backgrounded subshell gets its OWN tag; SEED_FAILED
+# and the spec arrays are local; per-repeat dirs + per-cell image tags isolate it.
+run_one_repeat() {
+  local rep="$1"
+  if (( REPEATS > 1 )); then
+    export RUN_TAG="rep${rep}"
+    log "########## SWEEP REPEAT ${rep}/${REPEATS}  (tag=${RUN_TAG}) ##########"
+    notify_evt "$NOTIFY_STAGE" "🔁 Sweep repeat ${rep}/${REPEATS} starting"
+  else
+    export RUN_TAG=""
+  fi
+  local TAG_SUFFIX="${RUN_TAG:+__${RUN_TAG}}"
+
+  # Seed each sweep dir from the (now static) baseline dir BEFORE the sweep starts.
+  # A failed/incomplete seed marks the cell SKIPPED so it does NOT run and report a
+  # bogus all-"No Phase 1 Baseline" result.
+  local -A SEED_FAILED=()
+  local proj prof
+  log "Seeding baseline artifacts into sweep dirs${TAG_SUFFIX:+ ($RUN_TAG)} ..."
+  for proj in "${GOOD_PROJECTS[@]}"; do
+    for prof in "${!_all_profiles[@]}"; do
+      [[ "$prof" == "$BASELINE_PROFILE" && -z "$TAG_SUFFIX" ]] && continue
+      if ! seed_cell "$proj" "$prof"; then
+        SEED_FAILED["${proj}__${prof}${TAG_SUFFIX}"]=1
+        write_state "${proj}__${prof}${TAG_SUFFIX}" SKIPPED "seed-failed" "" "" "" ""
+        log "WARN: seeding failed/incomplete for ${proj}__${prof}${TAG_SUFFIX} — skipping its sweep."
+        notify "⚠️ ${RUN_ID}: seeding failed for ${proj}__${prof}${TAG_SUFFIX} (sweep skipped)" high
+      fi
+    done
   done
+
+  # Build BOTH spec lists up front (separate arrays so an overlapped run never
+  # clobbers the other stage's specs).
+  local -a openai_specs=() ollama_specs=()
+  for proj in "${GOOD_PROJECTS[@]}"; do for prof in "${OPENAI_PROFILES[@]}"; do
+    [[ -n "${SEED_FAILED[${proj}__${prof}${TAG_SUFFIX}]:-}" ]] && continue
+    openai_specs+=("$proj:$prof")
+  done; done
+  for proj in "${GOOD_PROJECTS[@]}"; do for prof in "${OLLAMA_PROFILES[@]}"; do
+    [[ -n "${SEED_FAILED[${proj}__${prof}${TAG_SUFFIX}]:-}" ]] && continue
+    ollama_specs+=("$proj:$prof")
+  done; done
+
+  # Stage runners (read the locals above via bash dynamic scope; safe when
+  # backgrounded — the subshell forks with the current scope).
+  _stage2_openai() {
+    log "===== STAGE 2: OpenAI sweep${TAG_SUFFIX:+ ($RUN_TAG)} (max_parallel=$MAX_PARALLEL, phases='$SWEEP_PHASES') ====="
+    notify_evt "$NOTIFY_STAGE" "🔧 Stage 2${TAG_SUFFIX:+ ($RUN_TAG)}: OpenAI sweep — ${#openai_specs[@]} cell(s) [max_parallel=$MAX_PARALLEL, phases '$SWEEP_PHASES']"
+    (( ${#openai_specs[@]} )) && run_pool "$MAX_PARALLEL" openai-sweep "$SWEEP_PHASES" "${openai_specs[@]}"
+    notify_evt "$NOTIFY_STAGE" "✅ Stage 2${TAG_SUFFIX:+ ($RUN_TAG)} OpenAI sweep done (${#openai_specs[@]} cell(s))"
+  }
+  _stage3_ollama() {
+    log "===== STAGE 3: Ollama sweep${TAG_SUFFIX:+ ($RUN_TAG)} (gen_parallel=$OLLAMA_PARALLEL, validate_parallel=$OLLAMA_VALIDATE_PARALLEL, phases='$SWEEP_PHASES') ====="
+    notify_evt "$NOTIFY_STAGE" "🔧 Stage 3${TAG_SUFFIX:+ ($RUN_TAG)}: Ollama two-lane sweep — ${#ollama_specs[@]} cell(s) [gen_parallel=$OLLAMA_PARALLEL, validate_parallel=$OLLAMA_VALIDATE_PARALLEL, phases '$SWEEP_PHASES']"
+    (( ${#ollama_specs[@]} )) && run_ollama_two_lane "$OLLAMA_VALIDATE_PARALLEL" "${ollama_specs[@]}"
+    notify_evt "$NOTIFY_STAGE" "✅ Stage 3${TAG_SUFFIX:+ ($RUN_TAG)} Ollama sweep done (${#ollama_specs[@]} cell(s))"
+  }
+
+  if [[ "$OVERLAP_FAMILIES" == "true" ]]; then
+    log "OVERLAP_FAMILIES${TAG_SUFFIX:+ ($RUN_TAG)}: OpenAI (Stage 2) & Ollama (Stage 3) sweeps run concurrently."
+    _stage2_openai &
+    local _s2pid=$!
+    _stage3_ollama
+    wait "$_s2pid"
+  else
+    _stage2_openai
+    _stage3_ollama
+  fi
+}
+
+_repeat_pids=()
+for (( rep=1; rep<=REPEATS; rep++ )); do
+  if [[ "$REPEAT_PARALLEL" == "true" ]] && (( REPEATS > 1 )); then
+    run_one_repeat "$rep" &
+    _repeat_pids+=("$!")
+  else
+    run_one_repeat "$rep"
+  fi
 done
-
-# ---- Stage 2: OpenAI sweep (parallel) ------------------------------------
-log "===== STAGE 2: OpenAI sweep (max_parallel=$MAX_PARALLEL, phases='$SWEEP_PHASES') ====="
-specs=()
-for proj in "${GOOD_PROJECTS[@]}"; do for prof in "${OPENAI_PROFILES[@]}"; do
-  [[ -n "${SEED_FAILED[${proj}__${prof}]:-}" ]] && continue
-  specs+=("$proj:$prof")
-done; done
-notify_evt "$NOTIFY_STAGE" "🔧 Stage 2 starting: OpenAI sweep — ${#specs[@]} cell(s) [max_parallel=$MAX_PARALLEL, phases '$SWEEP_PHASES']"
-(( ${#specs[@]} )) && run_pool "$MAX_PARALLEL" openai-sweep "$SWEEP_PHASES" "${specs[@]}"
-notify_evt "$NOTIFY_STAGE" "✅ Stage 2 OpenAI sweep done (${#specs[@]} cell(s))"
-
-# ---- Stage 3: Ollama sweep (two-lane: Phase 2 feeds Phase 3/4) ------------
-log "===== STAGE 3: Ollama sweep (gen_parallel=$OLLAMA_PARALLEL, validate_parallel=$OLLAMA_VALIDATE_PARALLEL, phases='$SWEEP_PHASES') ====="
-specs=()
-for proj in "${GOOD_PROJECTS[@]}"; do for prof in "${OLLAMA_PROFILES[@]}"; do
-  [[ -n "${SEED_FAILED[${proj}__${prof}]:-}" ]] && continue
-  specs+=("$proj:$prof")
-done; done
-notify_evt "$NOTIFY_STAGE" "🔧 Stage 3 starting: Ollama two-lane sweep — ${#specs[@]} cell(s) [gen_parallel=$OLLAMA_PARALLEL, validate_parallel=$OLLAMA_VALIDATE_PARALLEL, phases '$SWEEP_PHASES']"
-(( ${#specs[@]} )) && run_ollama_two_lane "$OLLAMA_VALIDATE_PARALLEL" "${specs[@]}"
-notify_evt "$NOTIFY_STAGE" "✅ Stage 3 Ollama sweep done (${#specs[@]} cell(s))"
+# Wait for any backgrounded repeats before the run is marked COMPLETE.
+if (( ${#_repeat_pids[@]} )); then
+  for _p in "${_repeat_pids[@]}"; do wait "$_p" 2>/dev/null || true; done
+fi
+export RUN_TAG=""
 
 # ---- done ----------------------------------------------------------------
 read -r DONE FAILED OTHER < <(summarize)

@@ -1,0 +1,58 @@
+# =============================================================================
+# Ablation variants for the patch-generation improvements.
+#
+# Each variant is ONE pipeline run over the same frozen reproducible subset
+# (Phase 0/1 reused from a base run), distinguished only by the SSD_* env it
+# exports. The config loader overlays SSD_* onto config.yaml, so no YAML editing
+# is needed. `baseline` (empty env) reproduces the current system exactly.
+#
+# Run:  python3 run_ablation.py --base-run <completed_run_dir> --project glibc
+# =============================================================================
+variants:
+  - name: baseline
+    description: "Full prompt, single greedy candidate (current system)"
+    env: {}
+
+  # ── Prompt-component ablation (#5): isolate each component's contribution ──
+  - name: no_poc
+    description: "Drop the PoC exploit source from the prompt"
+    env: {SSD_PROMPT_INCLUDE_POC: "0"}
+  - name: no_cwe
+    description: "Drop the CWE class + description"
+    env: {SSD_PROMPT_INCLUDE_CWE: "0"}
+  - name: no_description
+    description: "Drop the CVE description"
+    env: {SSD_PROMPT_INCLUDE_DESCRIPTION: "0"}
+  - name: generic_priming
+    description: "Generic system preamble instead of the per-project one"
+    env: {SSD_PROMPT_PROJECT_PRIMING: "0"}
+  - name: minimal_prompt
+    description: "All optional components off (PoC + CWE + description + priming)"
+    env:
+      SSD_PROMPT_INCLUDE_POC: "0"
+      SSD_PROMPT_INCLUDE_CWE: "0"
+      SSD_PROMPT_INCLUDE_DESCRIPTION: "0"
+      SSD_PROMPT_PROJECT_PRIMING: "0"
+
+  # ── Prototype evaluations (#1 best-of-N, #2 CoT, #4 multi-granularity, #6) ──
+  - name: bestof4
+    description: "Best-of-N: 4 candidates over a temperature ladder"
+    env: {SSD_NUM_CANDIDATES: "4", SSD_CANDIDATE_TEMPERATURES: "0.2,0.5,0.8,1.0"}
+  - name: cot
+    description: "Best-of-N with chain-of-thought diversity candidates"
+    env:
+      SSD_NUM_CANDIDATES: "3"
+      SSD_CANDIDATE_TEMPERATURES: "0.2,0.6,0.9"
+      SSD_CHAIN_OF_THOUGHT: "1"
+  - name: multigran
+    description: "Best-of-N across granularities (minimal + guard)"
+    env:
+      SSD_NUM_CANDIDATES: "4"
+      SSD_GRANULARITIES: "minimal,guard"
+      SSD_CANDIDATE_TEMPERATURES: "0.2,0.7"
+  - name: richer_feedback
+    description: "Reflexion feedback: applied diff + attempt history + diagnosis"
+    env:
+      SSD_FEEDBACK_APPLIED_DIFF: "1"
+      SSD_FEEDBACK_ATTEMPT_HISTORY: "1"
+      SSD_FEEDBACK_REFLEXION: "1"

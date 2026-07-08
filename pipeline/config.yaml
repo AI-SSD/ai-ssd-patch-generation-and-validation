@@ -93,10 +93,16 @@ baseline_min_agree: 2     # identical crash runs required to trust the baseline
 # prior behavior). Set to baseline_runs (e.g. 3) to fully parallelize — costs up
 # to that many concurrent 1-CPU/6 GB containers for one CVE at a time, so size it
 # to the host. (Baseline memoization already skips re-running unchanged images.)
-baseline_max_parallel: 1
+baseline_max_parallel: 1   # per-run override: env SSD_BASELINE_PARALLEL
 
 # Docker resource settings
 docker:
+  # Per-build compile-jobs cap for the Phase-3 patched rebuild (the project YAML's
+  # patch_rebuild_script runs `make -j"${SSD_MAKE_JOBS:-$(nproc)}"`). Empty/unset
+  # ⇒ $(nproc) — all cores, unchanged. Set this (or env SSD_MAKE_JOBS) when raising
+  # validation.max_workers so N concurrent rebuilds don't oversubscribe the host
+  # (target N × make_jobs ≈ cores). Threaded into the build as a build-arg.
+  make_jobs: ""
   # Per-container memory ceiling for PoC execution (Phase 1 baseline + Phase 3
   # validation). Memory-amplifying overflow PoCs (e.g. CVE-2012-4412 feeds a
   # ~410 MB string into strcoll, whose internal buffers push past 2 GB) get
@@ -219,6 +225,68 @@ llm:
   max_tokens: 16384       # Maximum tokens in response
 
 # =============================================================================
+# Phase 2: Candidate generation (over-generate-and-validate)
+# =============================================================================
+# Richer generation: instead of one greedy patch per (CVE, model), generate a
+# SET of candidates spanning diversity dimensions and let the Phase 3 oracle
+# (PoC diff + SAST) pick the winner. The mechanism lives in
+# master_pipeline/candidates.py; it is fully project-agnostic (every knob is a
+# global setting, nothing per-CVE).
+#
+# ACTIVE CONFIG = validated best-of-N (ablation 2026-07). n=4 @ base llm.temperature
+# (0.2), minimal granularity, CoT off, richer-feedback off: over-generate 4 low-temp
+# candidates and keep the first that validates. This was the ONE lever that reliably
+# lifted the fix rate (+~5 patches / +3.8pp on tcpdump/openai-mix, clean 3x3 variance
+# separation); the diversity elaborations (multi-granularity/CoT/reflexion) were
+# non-additive-to-slightly-negative and are deliberately left off. Cost ~1.5x runtime.
+# To revert to legacy single-shot generation, set num_candidates: 1.
+generation:
+  # How many candidates to generate per (CVE, model) generation step.
+  # 1 = legacy single greedy patch. >1 enables best-of-N over-generation.
+  num_candidates: 4
+
+  # Sampling temperatures used to diversify candidates. Empty -> every candidate
+  # uses llm.temperature (so num_candidates>1 with an empty ladder is pure
+  # stochastic best-of-N at the base temperature). Example ladder: [0.2, 0.6, 0.9]
+  candidate_temperatures: []
+
+  # Patch granularities to diversify across (multi-granularity generation).
+  # Supported: "minimal" (smallest anchored edit; today's behaviour),
+  # "guard" (bias toward a single early bounds/validation check), and
+  # "whole_function" (allow a larger rewrite, same signature). Order matters:
+  # the greedy candidate always uses "minimal" first regardless of this list.
+  granularities: ["minimal"]
+
+  # Chain-of-thought prompting on the DIVERSITY candidates: ask the model to emit
+  # a short 'ANALYSIS:' preamble before the SEARCH/REPLACE blocks. The parser
+  # ignores leading prose, so this never corrupts the patch. The greedy candidate
+  # stays CoT-off so a lazy run always has an exact-today candidate to try first.
+  chain_of_thought: false
+
+  # Reserved: inject a retrieved CWE-keyed repair-pattern exemplar (RAG). Not yet
+  # implemented; leave false.
+  exemplars: false
+
+  # Cost controls (applied before the Docker-bound oracle runs):
+  dedupe: true                # drop candidates whose patched file is identical
+  syntactic_prefilter: true   # skip candidates that fail the gcc syntax check
+  # Lazy allocation: try the greedy candidate first and only generate/validate
+  # the remaining candidates if it fails. Keeps cost at today's level for the
+  # CVEs a single greedy patch already fixes. false = generate all up front.
+  lazy: true
+
+  # Prompt-component ablation toggles. Each component is part of today's prompt;
+  # setting one false DROPS it, so the ablation harness can measure its
+  # contribution to patch success. All true ⇒ today's prompt, unchanged. The
+  # ablation runner flips these per variant via SSD_PROMPT_* env vars.
+  prompt_components:
+    include_poc: true          # inject the PoC exploit source (the exact attack)
+    include_cwe: true          # inject the CWE class + description
+    include_description: true  # inject the CVE description
+    project_priming: true      # use the project's tailored system prompt;
+                               # false ⇒ a generic security-engineer preamble
+
+# =============================================================================
 # Phase 3: Validation Settings
 # =============================================================================
 
@@ -235,6 +303,9 @@ validation:
   # rebuild is a full project recompile (the patch invalidates the cached build
   # layer), so this is usually the largest Phase-3 cost — raise it on a multi-core
   # host, but mind RAM: N concurrent compiles need ~N× the build memory.
+  # Per-run override: env SSD_VALIDATION_WORKERS. NOTE: each rebuild runs
+  # `make -j$(nproc)`, so raising this WITHOUT capping docker.make_jobs (above)
+  # oversubscribes the cores — target (max_workers × make_jobs) ≈ host cores.
   max_workers: 1
 
   # SAST Configuration
@@ -264,6 +335,22 @@ feedback_loop:
   enabled: true
   max_retries: 3
   timeout: 7200               # Total feedback-loop timeout (seconds)
+
+  # -------------------------------------------------------------------------
+  # Richer feedback memory (Reflexion-style). Each flag enriches the RETRY
+  # prompt; all default false so the retry prompt is byte-identical to the
+  # legacy behaviour (and the run stays deterministic) until you opt in.
+  # -------------------------------------------------------------------------
+  richer_context:
+    # Show a unified diff (original function → the failed patch) so the model
+    # sees EXACTLY what it changed last time, not just the patched function.
+    applied_diff: false
+    # Summarise ALL earlier failed attempts (capped, most-recent first) so the
+    # model stops re-proposing edits that were already rejected (anti-oscillation).
+    attempt_history: false
+    # Require a 'DIAGNOSIS:' preamble before the edits — the model must first
+    # reason about why the previous attempt failed, then fix (parser ignores it).
+    reflexion: false
 
   # -------------------------------------------------------------------------
   # Per-attempt model escalation (optional).

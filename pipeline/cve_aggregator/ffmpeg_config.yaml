@@ -318,7 +318,7 @@ phase1:
     ( ./configure $CFGFLAGS 2>&1 && echo CONFIGURE_OK ) > /build/cfg.log 2>&1 \
       || ( echo "=== retry: --disable-x86asm ==="; ./configure $CFGFLAGS --disable-x86asm --disable-asm 2>&1 && echo CONFIGURE_OK ) > /build/cfg.log 2>&1 \
       || { echo "CONFIGURE_FAIL"; tail -30 /build/cfg.log; }
-    make -j"$(nproc)" -k > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
+    make -j"${SSD_MAKE_JOBS:-$(nproc)}" -k > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
     make install -k > /build/make_install.log 2>&1; echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status
     if [ -x "$PFX/bin/ffmpeg" ] && ls "$PFX"/lib/libavcodec.so* >/dev/null 2>&1; then echo "PROJECT_BUILD_INSTALLED=yes" >> /build/build_status; else echo "PROJECT_BUILD_INSTALLED=no" >> /build/build_status; fi
     echo "build complete"
@@ -373,7 +373,7 @@ phase1:
   patch_rebuild_script: |
     #!/bin/bash
     cd "$SOURCE_DIR" || { echo "no source dir" > /tmp/ssd_rebuild.log; }
-    make -j"$(nproc)" -k > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
+    make -j"${SSD_MAKE_JOBS:-$(nproc)}" -k > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
     make install -k > /tmp/ssd_install.log 2>&1; echo "install exit: $?"
     grep -B2 -A8 "error:" /tmp/ssd_rebuild.log 2>/dev/null | head -100 > /tmp/ssd_build_errors; true
     case "$VULN_FILE" in
@@ -403,7 +403,7 @@ phase1:
       ( ./configure --prefix="$INSTALL_PREFIX" --enable-shared --disable-static --disable-doc --enable-gpl --disable-stripping 2>&1 && echo CONFIGURE_OK ) > /build/cfg.log 2>&1 \
         || ( ./configure --prefix="$INSTALL_PREFIX" --enable-shared --disable-static --disable-doc --disable-x86asm --disable-asm 2>&1 && echo CONFIGURE_OK ) > /build/cfg.log 2>&1 \
         || { echo CONFIGURE_FAIL; tail -25 /build/cfg.log; }
-      make -j"$(nproc)" > /build/make.log 2>&1; echo "BUILD_RC=$?" >> /build/build_status
+      make -j"${SSD_MAKE_JOBS:-$(nproc)}" > /build/make.log 2>&1; echo "BUILD_RC=$?" >> /build/build_status
       tail -15 /build/make.log; echo "build complete"
     run_script: |
       #!/bin/bash

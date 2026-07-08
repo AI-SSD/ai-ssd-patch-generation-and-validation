@@ -118,10 +118,119 @@ def _apply_llm_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+def _env_bool_opt(name: str) -> Optional[bool]:
+    """Tri-state env bool: True/False when set, None when unset (no override)."""
+    v = _env(name)
+    if v is None:
+        return None
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _apply_generation_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Overlay ablation/generation knobs from the environment onto *cfg*.
+
+    Mirrors :func:`_apply_llm_env_overrides` so the ablation harness can sweep
+    generation, prompt-component and richer-feedback settings per variant via
+    ``SSD_*`` env vars — the same profile/env-transport pattern — WITHOUT editing
+    config.yaml. No ``SSD_*`` vars set ⇒ a complete no-op (YAML behaves as before).
+    """
+    if not isinstance(cfg, dict):
+        return cfg
+    gen = cfg.get("generation")
+    if not isinstance(gen, dict):
+        gen = {}
+        cfg["generation"] = gen
+    pc = gen.get("prompt_components")
+    if not isinstance(pc, dict):
+        pc = {}
+        gen["prompt_components"] = pc
+
+    raw = _env("SSD_NUM_CANDIDATES")
+    if raw is not None:
+        try:
+            gen["num_candidates"] = int(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid SSD_NUM_CANDIDATES=%r", raw)
+    raw = _env("SSD_CANDIDATE_TEMPERATURES")
+    if raw is not None:
+        temps: List[float] = []
+        for t in raw.split(","):
+            t = t.strip()
+            if not t:
+                continue
+            try:
+                temps.append(float(t))
+            except ValueError:
+                logger.warning("Ignoring invalid temperature %r in SSD_CANDIDATE_TEMPERATURES", t)
+        gen["candidate_temperatures"] = temps
+    raw = _env("SSD_GRANULARITIES")
+    if raw is not None:
+        gen["granularities"] = [g.strip() for g in raw.split(",") if g.strip()]
+    b = _env_bool_opt("SSD_CHAIN_OF_THOUGHT")
+    if b is not None:
+        gen["chain_of_thought"] = b
+
+    # Prompt-component ablation toggles.
+    for env_name, key in (
+        ("SSD_PROMPT_INCLUDE_POC", "include_poc"),
+        ("SSD_PROMPT_INCLUDE_CWE", "include_cwe"),
+        ("SSD_PROMPT_INCLUDE_DESCRIPTION", "include_description"),
+        ("SSD_PROMPT_PROJECT_PRIMING", "project_priming"),
+    ):
+        b = _env_bool_opt(env_name)
+        if b is not None:
+            pc[key] = b
+
+    # Richer feedback memory toggles.
+    fb = cfg.get("feedback_loop")
+    if not isinstance(fb, dict):
+        fb = {}
+        cfg["feedback_loop"] = fb
+    rc = fb.get("richer_context")
+    if not isinstance(rc, dict):
+        rc = {}
+        fb["richer_context"] = rc
+    for env_name, key in (
+        ("SSD_FEEDBACK_APPLIED_DIFF", "applied_diff"),
+        ("SSD_FEEDBACK_ATTEMPT_HISTORY", "attempt_history"),
+        ("SSD_FEEDBACK_REFLEXION", "reflexion"),
+    ):
+        b = _env_bool_opt(env_name)
+        if b is not None:
+            rc[key] = b
+
+    # Phase-3 patch-validation concurrency (validation.max_workers) and the
+    # per-build make-j cap (docker.make_jobs) — settable per run/campaign so the
+    # intra-phase concurrency can be tuned against the host's cores without
+    # oversubscribing (builds are make -j$(nproc)). Unset ⇒ unchanged.
+    val = cfg.get("validation")
+    if not isinstance(val, dict):
+        val = {}
+        cfg["validation"] = val
+    raw = _env("SSD_VALIDATION_WORKERS")
+    if raw is not None:
+        try:
+            val["max_workers"] = max(1, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid SSD_VALIDATION_WORKERS=%r", raw)
+    dock = cfg.get("docker")
+    if not isinstance(dock, dict):
+        dock = {}
+        cfg["docker"] = dock
+    raw = _env("SSD_MAKE_JOBS")
+    if raw is not None:
+        try:
+            dock["make_jobs"] = max(1, int(raw))
+        except ValueError:
+            logger.warning("Ignoring invalid SSD_MAKE_JOBS=%r", raw)
+    return cfg
+
+
 def load_pipeline_config(base_dir: Optional[Path] = None) -> Dict[str, Any]:
     """Load ``config.yaml`` from the pipeline root, with profile env overrides."""
     base = base_dir or BASE_DIR
-    return _apply_llm_env_overrides(_load_yaml(base / "config.yaml"))
+    return _apply_generation_env_overrides(
+        _apply_llm_env_overrides(_load_yaml(base / "config.yaml")))
 
 
 # ---------------------------------------------------------------------------

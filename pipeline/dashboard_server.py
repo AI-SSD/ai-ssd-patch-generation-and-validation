@@ -15,7 +15,7 @@ scrolling up to read is never interrupted; Pause freezes updates entirely.
 Usage:
   python3 dashboard_server.py [run_dir] [--port 8080] [--bind 0.0.0.0]
 """
-import os, sys, glob, time, re, html, json
+import os, sys, glob, time, re, html, json, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
 
@@ -30,7 +30,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 HCOL = {"DONE": "#1b5e20", "FAILED": "#b71c1c", "RUNNING": "#f9a825", "PENDING": "#424242",
         "SKIPPED": "#6a1b9a", "STALE": "#8d6e63", "ABORTED": "#9e2a2b",
-        "RESUMED": "#1565c0", "PAUSED": "#455a64"}
+        "RESUMED": "#1565c0", "PAUSED": "#455a64", "HOLD": "#0d47a1"}
+
+# Stages run_all.sh assigns ONLY to a project's once-built Stage-1 baseline cell
+# (BASELINE_PROFILE, phases 0-1) — never to a sweep cell (Stage 2/3, phases 2-4),
+# even when both are untagged (REPEATS==1). Used to keep the "Baseline (built
+# once)" grid section from swallowing untagged sweep cells too.
+_BASELINE_STAGES = ("baseline", "baseline-reused")
 RUN_DIR = None        # initial arg from main(); may be None if not yet available
 _RUN_DIR_ARG = None   # raw arg passed at startup (path string or None)
 
@@ -102,6 +108,35 @@ def fmt_dur(s):
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
+_REP_RE = re.compile(r"^rep(\d+)$")
+
+
+def _split_cell_name(name):
+    """Split a cell name into (project, repeat_tag, profile).
+
+    Cell names are "<proj>__<prof>" or "<proj>__<prof>__rep<K>" (run_all.sh repeat
+    runs). Profiles never contain "__", so a trailing "rep<N>" segment is the
+    repeat tag and everything between the project and it is the profile. Untagged
+    cells (normal/baseline runs) get repeat "".
+    """
+    segs = name.split("__")
+    proj = segs[0]
+    rest = segs[1:]
+    rep = ""
+    if rest and _REP_RE.match(rest[-1]):
+        rep = rest[-1]
+        rest = rest[:-1]
+    return proj, rep, "__".join(rest)
+
+
+def _rep_sort_key(rep):
+    """Order repeat groups: untagged ("") first, then rep1, rep2, … numerically."""
+    if not rep:
+        return (0, 0)
+    m = _REP_RE.match(rep)
+    return (1, int(m.group(1)) if m else 0)
+
+
 def load_cells(run_dir):
     cells = []
     for f in sorted(glob.glob(os.path.join(run_dir, "cells", "*.state"))):
@@ -109,10 +144,11 @@ def load_cells(run_dir):
             parts = (open(f).read().strip().split("|") + [""] * 6)[:6]
         except Exception:
             continue
-        name = os.path.basename(f)[:-6]; proj, _, prof = name.partition("__")
-        cells.append(dict(name=name, proj=proj, prof=prof, state=parts[0], stage=parts[1],
+        name = os.path.basename(f)[:-6]
+        proj, rep, prof = _split_cell_name(name)
+        cells.append(dict(name=name, proj=proj, prof=prof, rep=rep, state=parts[0], stage=parts[1],
                           started=parts[2], ended=parts[3], exitc=parts[4], logf=parts[5]))
-    return sorted(cells, key=lambda c: (c["proj"], c["prof"]))
+    return sorted(cells, key=lambda c: (_rep_sort_key(c["rep"]), c["proj"], c["prof"]))
 
 
 def disp_state(c, complete, live=None):
@@ -159,7 +195,31 @@ def safe_under(path, roots):
 
 
 # ---- grid ----------------------------------------------------------------
+# get_progress()/live_cells() re-scan every cell's on-disk artifacts (CSV/JSON/
+# heartbeats) from the ground up and can legitimately take several seconds on a
+# run with many cells. The grid auto-polls every 5s (fragment_js), so without a
+# cache each poll re-triggers the full scan; if a scan runs longer than the
+# poll interval, requests overlap and pile up (observed: 12s -> 20s -> 53s and
+# still climbing). Cache the rendered grid for a few seconds — just under the
+# poll interval — so overlapping polls share one computation instead of each
+# repeating it.
+_GRID_CACHE_TTL = 4.0
+_grid_cache_lock = threading.Lock()
+_grid_cache = {"run_dir": None, "ts": 0.0, "html": None}
+
+
 def grid_content(run_dir):
+    with _grid_cache_lock:
+        now = time.time()
+        if (_grid_cache["run_dir"] == run_dir and _grid_cache["html"] is not None
+                and now - _grid_cache["ts"] < _GRID_CACHE_TTL):
+            return _grid_cache["html"]
+        html_out = _grid_content_uncached(run_dir)
+        _grid_cache.update(run_dir=run_dir, ts=time.time(), html=html_out)
+        return html_out
+
+
+def _grid_content_uncached(run_dir):
     if not run_dir or not os.path.isdir(run_dir):
         return "<p style='color:#aaa'>No active run directory — start a run via <a href='/control'>Run Control</a>.</p>"
     cells = load_cells(run_dir); now = int(time.time())
@@ -174,22 +234,111 @@ def grid_content(run_dir):
         live = ctl.live_cells() if ctl else {}
     except Exception:
         live = {}
-    counts, rows = {}, ""
+    # A cell sitting at a manual-review gate (Phase 0 hold / Phase 1 gate) is
+    # alive and RUNNING per its .state file, but is doing nothing — no phase
+    # heartbeat is active — while it waits on a human decision at /manual. That
+    # is a real, distinct condition, not "still working" and DEFINITELY not
+    # finished; surface it as its own HOLD state instead of leaving it looking
+    # like ordinary RUNNING (or, once the wait times out and the gate auto-
+    # resolves, DONE) with no indication anything is waiting.
+    #
+    # Reuse the manual_pending/manual_revision counts get_progress() already
+    # computed above — NOT a second ctl.list_manual_items() scan. That call
+    # re-reads every cell's (often tens-of-MB) Phase-0 CSV and Phase-1 JSON
+    # from scratch on every grid refresh; on this run it alone added ~6.5s per
+    # request on top of get_progress()'s own ~7s, and since the grid polls
+    # every 5s the requests piled up faster than they could finish (12s, 20s,
+    # 53s and climbing in one measurement). The per-cell counts below come from
+    # the same cached-by-mtime artifacts get_progress() already parsed.
+    hold_info = {}
+    for name, s in prog.get("phase0", {}).get("by_cell", {}).items():
+        if s.get("manual_pending"):
+            hold_info[name] = ("Phase 1", "awaiting Phase 0 review")
+    for name, s in prog.get("phase1", {}).get("by_cell", {}).items():
+        if name not in hold_info and s.get("manual_revision"):
+            hold_info[name] = ("Phase 2", "awaiting Phase 1 review")
+
+    # The Ollama two-lane scheduler (run_all.sh's run_ollama_two_lane) caps how
+    # many Phase-3 Docker validations run at once (OLLAMA_VALIDATE_PARALLEL);
+    # a cell whose Phase-2 generation finished but whose Phase 3 hasn't started
+    # yet is just waiting for a free slot in that in-process queue — nothing
+    # else will happen to it until then. That queue lives in a bash array, not
+    # a file, so there is no live heartbeat for it; "generation done, still
+    # marked ollama-generate/ollama-validate-queued, run not COMPLETE yet" is
+    # the only observable signature of it.
+    _OLLAMA_QUEUE_STAGES = ("ollama-validate-queued", "ollama-generate")
+
+    def _hold_reason(c, ds, ph):
+        if ds in ("RUNNING", "RESUMED") and not ph:
+            h = hold_info.get(c["name"])
+            if h:
+                return h
+        if not complete and c["stage"] in _OLLAMA_QUEUE_STAGES and ds in ("PENDING", "DONE"):
+            return ("Phase 3", "queued for a validation slot")
+        return None
+
+    counts = {}
+    TABLE_HEAD = ("<table><tr><th>project</th><th>profile</th><th>stage</th><th>phase</th>"
+                  "<th>state</th><th>elapsed</th><th></th></tr>")
+
+    def _render_rows(cell_list):
+        out = ""
+        for c in cell_list:
+            ds = disp_state(c, complete, live)
+            # The pipeline phase running right now (incl. the feedback loop as its
+            # own phase), distinct from the run_all.sh sweep "stage" column.
+            ph = running_phase.get(c["name"], "") if ds in ("RUNNING", "RESUMED") else ""
+            hold = _hold_reason(c, ds, ph)
+            if hold:
+                ds = "HOLD"
+            counts[ds] = counts.get(ds, 0) + 1
+            link = "/cell/" + quote(c["name"])
+            dlink = "/api/download?cell=" + quote(c["name"])
+            if hold:
+                nxt_phase, reason = hold
+                ph_cell = (f"<span style='color:#42a5f5;font-weight:700'>{html.escape(nxt_phase)}</span> "
+                           f"<small style='color:#6ca8d8'>({html.escape(reason)})</small>")
+            elif ph:
+                ph_cell = f"<span style='color:#f9a825;font-weight:700'>{html.escape(ph)}</span>"
+            else:
+                ph_cell = "<span style='color:#555'>—</span>"
+            out += (f"<tr><td>{c['proj']}</td><td><a href='{link}'>{c['prof']}</a></td>"
+                    f"<td>{c['stage']}</td>"
+                    f"<td>{ph_cell}</td>"
+                    f"<td><span class=b style='background:{HCOL.get(ds, '#333')}'>{ds}</span></td>"
+                    f"<td>{elapsed_of(c, now)}</td><td><a href='{link}'>logs &rsaquo;</a> &nbsp; "
+                    f"<a href='{dlink}' title='Download all artifacts for this cell as a ZIP'>&#8681; zip</a></td></tr>")
+        return out
+
+    def _section(label, cell_list):
+        return (f"<h3 style='margin:1.1rem 0 .3rem;color:#9cf;border-bottom:1px solid #333;"
+                f"padding-bottom:.2rem'>{html.escape(label)} "
+                f"<small style='color:#777;font-weight:400'>({len(cell_list)} cells)</small></h3>"
+                + TABLE_HEAD + _render_rows(cell_list) + "</table>")
+
+    # Group cells by repeat tag so the grid SEPARATES each repeat's sweep matrix
+    # (run_all.sh REPEATS>1 names cells <proj>__<prof>__repK). Untagged cells
+    # (REPEATS==1, the common case) still mix the once-built Stage-1 baseline
+    # cell in with the untagged Stage-2/3 sweep cells under the SAME (empty)
+    # repeat tag — split those apart by stage so "Baseline (built once)" only
+    # ever holds the actual baseline profile, never the sweep.
+    groups = {}
     for c in cells:
-        ds = disp_state(c, complete, live); counts[ds] = counts.get(ds, 0) + 1
-        link = "/cell/" + quote(c["name"])
-        dlink = "/api/download?cell=" + quote(c["name"])
-        # The pipeline phase running right now (incl. the feedback loop as its
-        # own phase), distinct from the run_all.sh sweep "stage" column.
-        ph = running_phase.get(c["name"], "") if ds in ("RUNNING", "RESUMED") else ""
-        ph_cell = (f"<span style='color:#f9a825;font-weight:700'>{html.escape(ph)}</span>"
-                   if ph else "<span style='color:#555'>—</span>")
-        rows += (f"<tr><td>{c['proj']}</td><td><a href='{link}'>{c['prof']}</a></td>"
-                 f"<td>{c['stage']}</td>"
-                 f"<td>{ph_cell}</td>"
-                 f"<td><span class=b style='background:{HCOL.get(ds, '#333')}'>{ds}</span></td>"
-                 f"<td>{elapsed_of(c, now)}</td><td><a href='{link}'>logs &rsaquo;</a> &nbsp; "
-                 f"<a href='{dlink}' title='Download all artifacts for this cell as a ZIP'>&#8681; zip</a></td></tr>")
+        groups.setdefault(c["rep"], []).append(c)
+    untagged = groups.pop("", [])
+    baseline_cells = [c for c in untagged if c["stage"] in _BASELINE_STAGES]
+    sweep_cells = [c for c in untagged if c["stage"] not in _BASELINE_STAGES]
+    reps = sorted((r for r in groups), key=_rep_sort_key)
+
+    secs = []
+    if baseline_cells:
+        secs.append(_section("Baseline (built once)", baseline_cells))
+    if sweep_cells:
+        secs.append(_section("Sweep", sweep_cells))
+    for r in reps:      # rep1, rep2, … each its own project×profile matrix
+        secs.append(_section("Repeat " + (r[3:] or r), groups[r]))
+    body = "".join(secs) if secs else "<p style='color:#666'>no cells yet</p>"
+
     summ = " &nbsp; ".join(f"{k}: <b>{v}</b>" for k, v in sorted(counts.items()))
     # Run-wide sum-up: unique CVEs fixed end-to-end across every cell that has
     # produced validation results (PoC blocked + SAST passed).
@@ -200,8 +349,7 @@ def grid_content(run_dir):
                  f"end-to-end fixed: {fixed_total}/{psum.get('validated', 0)} CVEs</span>")
     head = (f"<p>{time.strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp; {summ}{sumup}"
             + ("  <b style=color:#6c6>COMPLETE</b>" if complete else "") + "</p>")
-    return (head + "<table><tr><th>project</th><th>profile</th><th>stage</th><th>phase</th>"
-            "<th>state</th><th>elapsed</th><th></th></tr>" + rows + "</table>")
+    return head + body
 
 
 def cell_progress_html(cell: str) -> str:
@@ -625,6 +773,28 @@ def control_content():
         "<a href='/manual'>/manual</a> decisions, then auto-continue on timeout. "
         "Defaults = unattended (Phase&nbsp;0 skip, Phase&nbsp;1 drop).</small></div>")
 
+    # Repeat the sweep N times over one baseline (run-to-run variance), and/or
+    # reuse an existing baseline instead of rebuilding Phase 0/1.
+    repeat_grp = (
+        "<div class=grp><b>Repeats</b> &nbsp; "
+        "<input type=number id=s_repeats value='1' min=1 max=50 step=1 style='width:5rem'> &times; sweep "
+        "<small>(repeat Phase&nbsp;2–4 over the SAME baseline for run-to-run variance; "
+        "each repeat in its own dir <code>…__repN</code>)</small> &nbsp; "
+        "<label class=ck><input type=checkbox id=s_reuse> Reuse existing baseline "
+        "<small>(skip the Phase&nbsp;0–1 build when a baseline already exists)</small></label>"
+        "<br><b>Runtime</b> &nbsp; "
+        "<label class=ck><input type=checkbox id=s_overlap> Overlap OpenAI + Ollama sweeps "
+        "<small>(keeps the remote GPU busy during the OpenAI sweep)</small></label> &nbsp; "
+        "<label class=ck><input type=checkbox id=s_reppar> Run repeats in parallel "
+        "<small>(independent repeats concurrently)</small></label> "
+        "<small>— with either on, keep <code>MAX_PARALLEL</code> / <code>OLLAMA_VALIDATE_PARALLEL</code> "
+        "modest (builds are <code>make -j$(nproc)</code>).</small>"
+        "<br><b>Intra-phase concurrency</b> &nbsp; "
+        "Phase-3 workers <input type=number id=s_vworkers value='0' min=0 max=16 step=1 style='width:4rem'> &nbsp; "
+        "Phase-1 baseline parallel <input type=number id=s_bparallel value='0' min=0 max=8 step=1 style='width:4rem'> &nbsp; "
+        "make&nbsp;-j cap <input type=number id=s_mjobs value='0' min=0 max=64 step=1 style='width:4rem'> "
+        "<small>(0 = config default; set the make-j cap so workers × cap &asymp; cores)</small></div>")
+
     start_fs = (
         "<fieldset><legend>Start a run</legend>"
         "<div class=grp><b>Projects</b>" + (s_proj or "<i>none</i>") + "</div>"
@@ -632,7 +802,7 @@ def control_content():
         "<div class=grp><b>Phases</b>" + s_phase +
         " &nbsp; <small>0–1 build baselines (once, via the baseline profile); 2–4 sweep every profile</small></div>"
         "<div class=grp><b>Baseline profile</b> <select id=s_baseline>" + base_opts + "</select></div>"
-        + manual_grp +
+        + repeat_grp + manual_grp +
         "<button class='act start' onclick='doStart()'>&#9654; Start run</button>"
         "<span id=startres></span></fieldset>")
 
@@ -692,7 +862,14 @@ function doStart(){
     baseline_profile:document.getElementById('s_baseline').value,phases:vals('s_phases'),
     manual_phase0_hold:document.getElementById('s_m0').checked,
     manual_phase1_gate:document.getElementById('s_m1').checked,
-    manual_timeout:parseInt(document.getElementById('s_mtimeout').value||'1800',10)};
+    manual_timeout:parseInt(document.getElementById('s_mtimeout').value||'1800',10),
+    repeats:parseInt(document.getElementById('s_repeats').value||'1',10),
+    reuse_baseline:document.getElementById('s_reuse').checked,
+    overlap_families:document.getElementById('s_overlap').checked,
+    repeat_parallel:document.getElementById('s_reppar').checked,
+    validation_workers:parseInt(document.getElementById('s_vworkers').value||'0',10),
+    baseline_parallel:parseInt(document.getElementById('s_bparallel').value||'0',10),
+    make_jobs:parseInt(document.getElementById('s_mjobs').value||'0',10)};
   document.getElementById('startres').innerHTML=' …starting…';
   post('/api/control',b).then(function(r){
     document.getElementById('startres').innerHTML = r.ok
@@ -1048,6 +1225,10 @@ class H(BaseHTTPRequestHandler):
                 mtimeout = int(body.get("manual_timeout") or 1800)
             except (TypeError, ValueError):
                 mtimeout = 1800
+            try:
+                repeats = int(body.get("repeats") or 1)
+            except (TypeError, ValueError):
+                repeats = 1
             return ctl.start_run(
                 projects=list(body.get("projects", [])),
                 profiles=list(body.get("profiles", [])),
@@ -1055,7 +1236,13 @@ class H(BaseHTTPRequestHandler):
                 baseline_phases=bphases, sweep_phases=sphases,
                 manual_phase0_hold=bool(body.get("manual_phase0_hold")),
                 manual_phase1_gate=bool(body.get("manual_phase1_gate")),
-                manual_timeout=mtimeout)
+                manual_timeout=mtimeout,
+                repeats=repeats, reuse_baseline=bool(body.get("reuse_baseline")),
+                overlap_families=bool(body.get("overlap_families")),
+                repeat_parallel=bool(body.get("repeat_parallel")),
+                validation_workers=int(body.get("validation_workers") or 0),
+                baseline_parallel=int(body.get("baseline_parallel") or 0),
+                make_jobs=int(body.get("make_jobs") or 0))
         if action == "stop":
             return ctl.stop_run()
         if action == "pause":

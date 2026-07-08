@@ -107,7 +107,10 @@ fi
 PHASE0_CONFIG="${PIPELINE_ROOT}/${CONFIG_MAP[$PROJECT]}"
 # Isolate every (project, profile) run so AI families never overwrite each
 # other's results/patches/manifest.
-PROJECT_DIR="${PIPELINE_ROOT}/projects/${PROJECT}__${PROFILE}"
+# RUN_TAG (set by run_all.sh for repeat runs) further isolates each repeat's
+# Phase 2-4 outputs, e.g. projects/glibc__openai-fast__rep2. Unset ⇒ the
+# historical single-dir layout, so a normal run is unchanged.
+PROJECT_DIR="${PIPELINE_ROOT}/projects/${PROJECT}__${PROFILE}${RUN_TAG:+__${RUN_TAG}}"
 
 # Default to Phase 0 if no --phases flag is given
 EXTRA_ARGS=("$@")

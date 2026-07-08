@@ -15,6 +15,7 @@ import re
 import sys
 import json
 import time
+import difflib
 import logging
 import tempfile
 import threading
@@ -38,6 +39,9 @@ sys.path.insert(0, str(BASE_DIR))
 from master_pipeline.config import (  # noqa: E402
     load_pipeline_config, cfg_section, project_section, _load_yaml,
 )
+# Candidate fan-out framework (over-generate-and-validate). Pure/stdlib-only, no
+# circular import: candidates.py imports nothing from patch_generator.
+from master_pipeline.candidates import Recipe, Candidate  # noqa: E402
 
 # Structural-analysis view: blanks comment interiors and non-first
 # preprocessor branches while preserving offsets, so brace matching is not
@@ -56,6 +60,16 @@ except Exception:  # pragma: no cover
 _cfg = load_pipeline_config(BASE_DIR)
 _llm = _cfg.get("llm", {}) if isinstance(_cfg.get("llm"), dict) else {}
 _paths = _cfg.get("paths", {}) if isinstance(_cfg.get("paths"), dict) else {}
+_gen = _cfg.get("generation", {}) if isinstance(_cfg.get("generation"), dict) else {}
+
+# Prompt-component ablation toggles (generation.prompt_components). All default
+# ON ⇒ today's prompt verbatim; the ablation harness flips these (via SSD_PROMPT_*
+# env, overlaid by the config loader) to measure each component's contribution.
+_pc = _gen.get("prompt_components", {}) if isinstance(_gen.get("prompt_components"), dict) else {}
+PROMPT_INCLUDE_POC = bool(_pc.get("include_poc", True))
+PROMPT_INCLUDE_CWE = bool(_pc.get("include_cwe", True))
+PROMPT_INCLUDE_DESCRIPTION = bool(_pc.get("include_description", True))
+PROMPT_PROJECT_PRIMING = bool(_pc.get("project_priming", True))
 
 # ---------------------------------------------------------------------------
 # Provider selection: "ollama" (local GPU server) or "openai" (OpenAI API)
@@ -121,6 +135,15 @@ LLM_HEARTBEAT_INTERVAL = int(_llm.get("heartbeat_interval", 60))
 
 # LLM Parameters
 LLM_TEMPERATURE = float(_llm.get("temperature", 0.2))
+# Ollama model warm-up: keep the model resident in (the remote proxy's) VRAM
+# between requests so a slow/spaced Phase-2 burst doesn't pay a cold multi-GiB
+# reload. keep_alive is sent on every Ollama request; preload warms the model
+# once before each model's CVE loop (mirrors Phase-0's PoCRepairLLM._preload_model).
+# Both are NO-OPS for the OpenAI provider. Set keep_alive: "" to send nothing
+# (exact legacy behaviour).
+LLM_KEEP_ALIVE = str(_llm.get("keep_alive", "15m"))
+LLM_PRELOAD = bool(_llm.get("preload", True))
+LLM_PRELOAD_TIMEOUT = int(_llm.get("preload_timeout", 300))
 LLM_MAX_TOKENS = int(_llm.get("max_tokens", 8192))
 
 # Paths
@@ -246,8 +269,10 @@ def _apply_phase2(cfg2: Dict[str, Any]) -> None:
     global SYSTEM_PROMPT, FEEDBACK_SYSTEM_PROMPT, PATCH_LANGUAGE, INTERNAL_HEADERS
     cfg2 = cfg2 or {}
     PATCH_LANGUAGE = str(cfg2.get("language", "c")).lower()
-    sys_pre = cfg2.get("system_prompt") or _DEFAULT_SYSTEM_PREAMBLE
-    fb_pre = cfg2.get("feedback_system_prompt") or _DEFAULT_FEEDBACK_PREAMBLE
+    # project_priming=False (ablation) drops the project's tailored system prompt
+    # in favour of the generic preamble, isolating the effect of domain priming.
+    sys_pre = (cfg2.get("system_prompt") if PROMPT_PROJECT_PRIMING else None) or _DEFAULT_SYSTEM_PREAMBLE
+    fb_pre = (cfg2.get("feedback_system_prompt") if PROMPT_PROJECT_PRIMING else None) or _DEFAULT_FEEDBACK_PREAMBLE
     SYSTEM_PROMPT = sys_pre + "\n\n" + _SEARCH_REPLACE_FORMAT
     FEEDBACK_SYSTEM_PROMPT = fb_pre + "\n\n" + _SEARCH_REPLACE_FORMAT + _FEEDBACK_TAIL
     INTERNAL_HEADERS = set(cfg2.get("internal_headers") or [])
@@ -296,7 +321,7 @@ def _build_vulnerability_context(
     sections = []
 
     desc = (description or "").strip()
-    if desc and desc.lower() not in ("nan", "none"):
+    if PROMPT_INCLUDE_DESCRIPTION and desc and desc.lower() not in ("nan", "none"):
         if len(desc) > 900:
             desc = desc[:900] + " ..."
         sections.append(f"VULNERABILITY DESCRIPTION:\n{desc}")
@@ -305,22 +330,24 @@ def _build_vulnerability_context(
         s.strip() for s in (cwe, cwe_description)
         if s and str(s).strip().lower() not in ("nan", "none")
     )
-    if cwe_line:
+    if PROMPT_INCLUDE_CWE and cwe_line:
         sections.append(f"WEAKNESS CLASS: {cwe_line}")
 
-    poc_src = _find_poc_source(cve_id)
-    if poc_src:
-        sections.append(
-            "PROOF-OF-CONCEPT EXPLOIT (this is the exact attack your patch "
-            "must stop — after patching, this program must no longer trigger "
-            "the vulnerability):\n" + poc_src
-        )
+    if PROMPT_INCLUDE_POC:
+        poc_src = _find_poc_source(cve_id)
+        if poc_src:
+            sections.append(
+                "PROOF-OF-CONCEPT EXPLOIT (this is the exact attack your patch "
+                "must stop — after patching, this program must no longer trigger "
+                "the vulnerability):\n" + poc_src
+            )
 
     return "\n\n".join(sections)
 
 
 def create_patch_prompt(cve_id: str, function_name: str, vulnerable_code: str,
-                        file_context: str, vuln_context: str = "") -> str:
+                        file_context: str, vuln_context: str = "",
+                        extra_instructions: str = "") -> str:
     """
     Create a detailed prompt for patch generation.
 
@@ -330,6 +357,10 @@ def create_patch_prompt(cve_id: str, function_name: str, vulnerable_code: str,
         vulnerable_code: The vulnerable function code
         file_context: Full file content for context (truncated if too long)
         vuln_context: CVE description / CWE / PoC source section (optional)
+        extra_instructions: Trailing instructions contributed by a candidate
+            recipe (granularity / chain-of-thought). Appended verbatim AFTER the
+            base instructions so a recipe can override them (e.g. CoT relaxes the
+            "output only" rule). Empty string ⇒ today's prompt, unchanged.
 
     Returns:
         Formatted user prompt string
@@ -357,7 +388,31 @@ REMEMBER:
 - Make the smallest edit that fixes the vulnerability; do not rewrite the whole function or touch its signature
 - Output ONLY SEARCH/REPLACE block(s) — no markdown, no explanations"""
 
+    if extra_instructions:
+        prompt += extra_instructions
+
     return prompt
+
+
+def _unified_diff(original: str, patched: str,
+                  fromname: str = "original", toname: str = "patched",
+                  max_lines: int = 60) -> str:
+    """Compact unified diff between two function texts (for feedback memory).
+
+    Returns "" when either side is empty or there is no difference. Truncated to
+    *max_lines* so a large rewrite cannot blow up the prompt.
+    """
+    if not original or not patched:
+        return ""
+    lines = list(difflib.unified_diff(
+        original.splitlines(), patched.splitlines(),
+        fromfile=fromname, tofile=toname, lineterm=""))
+    if not lines:
+        return ""
+    if len(lines) > max_lines:
+        omitted = len(lines) - max_lines
+        lines = lines[:max_lines] + [f"... (diff truncated, {omitted} more line(s))"]
+    return "\n".join(lines)
 
 
 def create_feedback_prompt(
@@ -368,7 +423,11 @@ def create_feedback_prompt(
     previous_patch: str,
     failure_context: Dict[str, Any],
     attempt_number: int,
-    vuln_context: str = ""
+    vuln_context: str = "",
+    prior_attempts: Optional[List[Dict[str, Any]]] = None,
+    include_diff: bool = False,
+    include_history: bool = False,
+    reflexion: bool = False
 ) -> str:
     """
     Create a prompt for retry patch generation with failure feedback context.
@@ -446,7 +505,47 @@ REMEMBER:
 - Make the smallest edit that fixes the vulnerability
 - Output ONLY SEARCH/REPLACE block(s) — no markdown, no explanations"""
 
-    return prompt
+    # ── Richer feedback memory (gated; all default off → prompt unchanged) ──────
+    diff_section = ""
+    if include_diff:
+        d = _unified_diff(vulnerable_code, previous_patch,
+                          fromname="original", toname="your_failed_patch")
+        if d:
+            diff_section = (
+                "\n\n═══════════════════════════════════════════════════════════════════\n"
+                "WHAT YOU CHANGED LAST TIME (unified diff: original → your FAILED patch):\n"
+                "═══════════════════════════════════════════════════════════════════\n" + d
+            )
+
+    history_section = ""
+    if include_history and prior_attempts and len(prior_attempts) > 1:
+        # Attempts BEFORE the immediately-previous one (already shown in full),
+        # most-recent first, capped — so the model stops re-proposing failed edits.
+        earlier = prior_attempts[:-1][-3:]
+        blocks = []
+        for rec in reversed(earlier):
+            n = rec.get("attempt_number", "?")
+            outcome = rec.get("outcome", "failed")
+            d = _unified_diff(vulnerable_code, rec.get("patched_function", ""),
+                              fromname="original", toname=f"attempt{n}", max_lines=24)
+            blocks.append(f"--- Attempt {n} → {outcome} ---\n{d or '(no diff captured)'}")
+        if blocks:
+            history_section = (
+                "\n\n═══════════════════════════════════════════════════════════════════\n"
+                "EARLIER FAILED ATTEMPTS — do NOT repeat these edits; each was rejected:\n"
+                "═══════════════════════════════════════════════════════════════════\n"
+                + "\n\n".join(blocks)
+            )
+
+    reflexion_tail = ""
+    if reflexion:
+        reflexion_tail = (
+            "\n\nFIRST, on lines beginning 'DIAGNOSIS:', state in 2-3 sentences WHY the "
+            "previous attempt(s) failed and what you will do DIFFERENTLY (this overrides "
+            "the 'output only' rule above). THEN output the SEARCH/REPLACE block(s)."
+        )
+
+    return prompt + diff_section + history_section + reflexion_tail
 
 
 def _build_failure_analysis(failure_context: Dict[str, Any]) -> str:
@@ -713,6 +812,62 @@ def wait_for_gpu(model: Optional[str] = None, timeout: Optional[int] = None,
         time.sleep(poll_interval)
 
 
+def _preload_ollama_model(model: str, timeout: Optional[int] = None,
+                          poll_interval: int = 10) -> bool:
+    """Warm *model* into the (remote) Ollama proxy's VRAM before the per-CVE burst.
+
+    Mirrors ``PoCRepairLLM._preload_model``: fire a zero-token ``/api/generate``
+    with ``keep_alive`` in a daemon thread, then poll ``/api/ps`` until the
+    model's ``size_vram`` is non-zero (or *timeout*). Best-effort — returns
+    False on timeout/unreachable and the caller proceeds (the first real request
+    then pays the load, exactly as today). No-op for the OpenAI provider.
+    """
+    if LLM_PROVIDER == "openai":
+        return True
+    if timeout is None:
+        timeout = LLM_PRELOAD_TIMEOUT
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(API_ENDPOINT)
+    ps_url = urlunparse((parsed.scheme, parsed.netloc, "/api/ps", "", "", ""))
+    gen_url = urlunparse((parsed.scheme, parsed.netloc, "/api/generate", "", "", ""))
+    logger.info("Pre-loading Ollama model '%s' into VRAM …", model)
+
+    def _trigger():
+        try:
+            requests.post(gen_url,
+                          json={"model": model, "keep_alive": LLM_KEEP_ALIVE or "15m"},
+                          timeout=timeout, auth=OLLAMA_AUTH)
+        except Exception:
+            pass  # large-model load can exceed the request timeout; we poll /api/ps
+
+    threading.Thread(target=_trigger, daemon=True, name="ollama-preload").start()
+
+    model_base = model.split(":")[0].lower()
+    start = time.time()
+    while True:
+        try:
+            resp = requests.get(ps_url, timeout=5, auth=OLLAMA_AUTH)
+            resp.raise_for_status()
+            for entry in resp.json().get("models", []):
+                # Warm once the model is loaded — size_vram>0 (GPU-resident) OR
+                # size>0 (loaded in RAM on a CPU-only / non-VRAM-reporting backend).
+                # Requiring size_vram>0 alone would wait the full timeout PER model
+                # on such backends even though the model is ready.
+                if model_base in entry.get("name", "").lower() and (
+                        entry.get("size_vram", 0) > 0 or entry.get("size", 0) > 0):
+                    vram = entry.get("size_vram", 0)
+                    where = f"{vram / 1024 ** 3:.1f} GiB VRAM" if vram > 0 else "RAM (CPU)"
+                    logger.info("✓ Ollama model '%s' warm (%s).", model, where)
+                    return True
+        except Exception:
+            pass
+        if time.time() - start >= timeout:
+            logger.warning("Ollama model '%s' not confirmed warm after %ds — proceeding.",
+                           model, timeout)
+            return False
+        time.sleep(poll_interval)
+
+
 # Minimum output room (tokens) a model must have AFTER the prompt to be usable.
 # If the prompt leaves less than this within the model's window, the prompt is
 # treated as too large for that model and the ramp advances to the next one.
@@ -824,13 +979,17 @@ class _HeartbeatPulser:
         return False
 
 
-def _call_ollama_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[Optional[str], Dict[str, Any]]:
+def _call_ollama_api(model: str, user_prompt: str, system_prompt: str,
+                     temperature: Optional[float] = None) -> Tuple[Optional[str], Dict[str, Any]]:
     """Call the Ollama-compatible local server API with retry logic.
 
     Before sending, verify the prompt fits the model's context window. If it does
     not, the model is SKIPPED with a clearly logged reason (also recorded in
     ``metadata['error']``) so the feedback-loop ramp advances to the next model
     instead of the Ollama server silently truncating the prompt.
+
+    *temperature* (when set) overrides ``LLM_TEMPERATURE`` for this call (used by
+    the candidate fan-out); ``None`` keeps the configured default.
     """
     messages = [
         {"role": "system", "content": system_prompt},
@@ -875,13 +1034,17 @@ def _call_ollama_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[
         "messages": messages,
         "stream": False,
         "options": {
-            "temperature": LLM_TEMPERATURE,
+            "temperature": LLM_TEMPERATURE if temperature is None else float(temperature),
             # num_ctx capped at the model's window; output budget pinned so a long
             # patch is not truncated by the server's default num_predict.
             "num_ctx": eff_ctx,
             "num_predict": num_predict,
         }
     }
+    # Keep the model warm in the (remote proxy) VRAM so the next request in this
+    # burst doesn't trigger a cold reload. Empty ⇒ omit (Ollama's 5m default).
+    if LLM_KEEP_ALIVE:
+        payload["keep_alive"] = LLM_KEEP_ALIVE
     metadata["payload_size"] = len(json.dumps(payload))
     for attempt in range(MAX_RETRIES):
         try:
@@ -937,18 +1100,31 @@ def _is_openai_reasoning_model(model: str) -> bool:
     return _shared_is_openai_reasoning_model(model)
 
 
-def _openai_sampling_kwargs(model: str) -> Dict[str, Any]:
-    """Return model-appropriate token/temperature kwargs for the chat call."""
+def _openai_sampling_kwargs(model: str, temperature: Optional[float] = None) -> Dict[str, Any]:
+    """Return model-appropriate token/temperature kwargs for the chat call.
+
+    *temperature* overrides the configured ``LLM_TEMPERATURE`` for this single
+    call (used by the candidate fan-out to sample diverse candidates at different
+    temperatures); ``None`` keeps the configured default — so existing callers
+    are unchanged.
+    """
     if _is_openai_reasoning_model(model):
         # Reasoning models bill reasoning tokens against the completion budget,
         # so give them headroom (8k can be fully consumed by reasoning, leaving
-        # empty content). Temperature is omitted (only the default is allowed).
+        # empty content). Temperature is omitted (only the default is allowed),
+        # so a per-candidate override does not apply to these models.
         return {"max_completion_tokens": max(LLM_MAX_TOKENS, 16384)}
-    return {"max_tokens": LLM_MAX_TOKENS, "temperature": LLM_TEMPERATURE}
+    temp = LLM_TEMPERATURE if temperature is None else float(temperature)
+    return {"max_tokens": LLM_MAX_TOKENS, "temperature": temp}
 
 
-def _call_openai_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    """Call the OpenAI API with retry logic."""
+def _call_openai_api(model: str, user_prompt: str, system_prompt: str,
+                     temperature: Optional[float] = None) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Call the OpenAI API with retry logic.
+
+    *temperature* (when set) overrides ``LLM_TEMPERATURE`` for this call; ``None``
+    keeps the configured default.
+    """
     try:
         from openai import OpenAI, APIError, APIConnectionError, APITimeoutError, RateLimitError
     except ImportError:
@@ -978,7 +1154,7 @@ def _call_openai_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[
 
     # Token/temperature contract differs between classic and reasoning models.
     # Start from the name-based guess; the loop below adapts if the API rejects it.
-    sampling = _openai_sampling_kwargs(model)
+    sampling = _openai_sampling_kwargs(model, temperature)
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -1037,7 +1213,8 @@ def _call_openai_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[
                 logger.info(
                     f"Model {model} requires max_tokens — switching parameter contract."
                 )
-                sampling = {"max_tokens": LLM_MAX_TOKENS, "temperature": LLM_TEMPERATURE}
+                sampling = {"max_tokens": LLM_MAX_TOKENS,
+                            "temperature": LLM_TEMPERATURE if temperature is None else float(temperature)}
                 continue
         if attempt < MAX_RETRIES - 1:
             logger.info(f"Retrying in {RETRY_DELAY} seconds...")
@@ -1049,7 +1226,8 @@ def _call_openai_api(model: str, user_prompt: str, system_prompt: str) -> Tuple[
 
 
 def call_llm_api(model: str, user_prompt: str, system_prompt: Optional[str] = None,
-                 model_override: Optional[str] = None) -> Tuple[Optional[str], Dict[str, Any]]:
+                 model_override: Optional[str] = None,
+                 temperature: Optional[float] = None) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Call the configured LLM backend (Ollama or OpenAI) with retry logic.
 
@@ -1068,6 +1246,8 @@ def call_llm_api(model: str, user_prompt: str, system_prompt: Optional[str] = No
         user_prompt: The user's prompt
         system_prompt: System prompt for context
         model_override: Explicit model id to use, overriding the provider default
+        temperature: Optional per-call sampling-temperature override (candidate
+            fan-out); None keeps the configured llm.temperature
 
     Returns:
         Tuple of (response_content, metadata_dict)
@@ -1085,8 +1265,10 @@ def call_llm_api(model: str, user_prompt: str, system_prompt: Optional[str] = No
     with gpu_lock(LLM_PROVIDER, enabled=GPU_LOCK_ENABLED, endpoint=API_ENDPOINT,
                   logger=logger, label=f"phase2:{_used_model}"):
         if LLM_PROVIDER == "openai":
-            return _call_openai_api(model_override or OPENAI_MODEL, user_prompt, system_prompt)
-        return _call_ollama_api(model_override or model, user_prompt, system_prompt)
+            return _call_openai_api(model_override or OPENAI_MODEL, user_prompt,
+                                    system_prompt, temperature=temperature)
+        return _call_ollama_api(model_override or model, user_prompt,
+                                system_prompt, temperature=temperature)
 
 # =============================================================================
 # Code Extraction & Cleaning
@@ -2158,8 +2340,100 @@ def process_single_vulnerability(
     result["total_duration_ns"] = metadata.get("total_duration")
     result["timestamp_start"] = metadata.get("timestamp_start")
     result["timestamp_end"] = metadata.get("timestamp_end")
-    
+
     return result
+
+
+def generate_one_candidate(row: Any, model: str, recipe: Recipe) -> Candidate:
+    """Generate ONE patch candidate for *row* under the diversity knobs in *recipe*.
+
+    This is the binding between the project-agnostic candidate fan-out framework
+    (``master_pipeline.candidates``) and the existing Phase 2 generation
+    primitives. It builds the same vulnerability-context + prompt as
+    :func:`process_single_vulnerability`, then applies the recipe's diversity
+    dimensions (sampling temperature, granularity / chain-of-thought prompt
+    suffix, per-recipe model), parses the response into a patched file, and
+    syntax-checks it — WITHOUT writing artifacts to disk (the caller persists
+    only the selected winner). The returned :class:`Candidate` is what the
+    framework dedupes, pre-filters and hands to the oracle.
+
+    With the greedy recipe (index 0, minimal granularity, CoT off, base
+    temperature) this reproduces today's single-shot generation exactly.
+
+    Args:
+        row: vulnerability row (pandas Series or dict) with the Phase 0 fields
+            ``CVE``, ``F_NAME``, ``V_FUNCTION``, ``V_FILE`` and optionally
+            ``CVE_Description`` / ``CWE`` / ``CWE_Description``.
+        model: the cell's base model id (recipe.model overrides it when set).
+        recipe: the diversity point to generate.
+
+    Returns:
+        A :class:`Candidate` (``error`` set when the LLM returned nothing).
+    """
+    def _get(key: str, default: str = "") -> str:
+        try:
+            val = row.get(key, default)
+        except AttributeError:
+            val = row[key] if key in row else default
+        return "" if val is None else str(val)
+
+    cve_id = _get("CVE")
+    function_name = _get("F_NAME")
+    vulnerable_code = _get("V_FUNCTION")
+    file_context = _get("V_FILE")
+
+    vuln_context = _build_vulnerability_context(
+        cve_id,
+        description=_get("CVE_Description"),
+        cwe=_get("CWE"),
+        cwe_description=_get("CWE_Description"),
+    )
+    prompt = create_patch_prompt(
+        cve_id, function_name, vulnerable_code, file_context, vuln_context,
+        extra_instructions=recipe.prompt_suffix(),
+    )
+
+    raw_response, metadata = call_llm_api(
+        model, prompt,
+        model_override=recipe.model,
+        temperature=recipe.temperature,
+    )
+    metadata["recipe"] = recipe.label()
+
+    if raw_response is None:
+        return Candidate(
+            recipe=recipe,
+            full_patched_file=file_context,   # unchanged original
+            patched_function="",
+            syntax_valid=False,
+            raw_response="",
+            metadata=metadata,
+            error=metadata.get("error", "no LLM response"),
+        )
+
+    patch = build_patched_file_from_response(raw_response, function_name, file_context)
+    metadata["patch_mode"] = patch["mode"]
+    metadata["sr_blocks"] = patch["sr_blocks"]
+    metadata["sr_applied"] = patch["sr_applied"]
+
+    if patch["apply_error"]:
+        is_valid, validation_error = False, patch["apply_error"]
+    else:
+        is_valid, validation_error = validate_syntax(
+            patch["full_patched_file"], function_name, patch["patched_function"]
+        )
+    metadata["validation_error"] = validation_error if not is_valid else None
+
+    return Candidate(
+        recipe=recipe,
+        full_patched_file=patch["full_patched_file"],
+        patched_function=patch["patched_function"],
+        syntax_valid=is_valid,
+        raw_response=raw_response,
+        changes=int(patch.get("sr_applied") or 0),
+        metadata=metadata,
+        error=None,
+    )
 
 
 def generate_patch_with_feedback(
@@ -2173,7 +2447,11 @@ def generate_patch_with_feedback(
     failure_context: Dict[str, Any],
     attempt_number: int,
     output_dir: Optional[Path] = None,
-    generation_model: Optional[str] = None
+    generation_model: Optional[str] = None,
+    prior_attempts: Optional[List[Dict[str, Any]]] = None,
+    include_diff: bool = False,
+    include_history: bool = False,
+    reflexion: bool = False
 ) -> Dict[str, Any]:
     """
     Generate a new patch using failure feedback from Phase 3 validation.
@@ -2245,7 +2523,11 @@ def generate_patch_with_feedback(
         previous_patch=previous_patch,
         failure_context=failure_context,
         attempt_number=attempt_number,
-        vuln_context=vuln_context
+        vuln_context=vuln_context,
+        prior_attempts=prior_attempts,
+        include_diff=include_diff,
+        include_history=include_history,
+        reflexion=reflexion
     )
     
     # Call LLM API with feedback system prompt (escalated model when configured)
@@ -2505,7 +2787,15 @@ def run_pipeline(
         logger.info(f"\n{'='*40}")
         logger.info(f"Processing with model: {model}")
         logger.info(f"{'='*40}")
-        
+
+        # Warm this model into VRAM before its CVE burst (Ollama only); the
+        # keep_alive on each request then holds it resident. Best-effort.
+        if LLM_PRELOAD and LLM_PROVIDER != "openai":
+            try:
+                _preload_ollama_model(model)
+            except Exception as exc:  # preload must never break the phase
+                logger.warning("Ollama preload skipped for %s: %s", model, exc)
+
         for idx, row in df.iterrows():
             current_task += 1
             task_start = datetime.now()

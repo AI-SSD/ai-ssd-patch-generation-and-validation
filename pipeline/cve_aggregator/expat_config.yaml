@@ -291,7 +291,7 @@ phase1:
     fi
     ( ./configure --prefix="$PFX" --without-docbook $HOST CFLAGS="$ARCHFLAGS -O2 -g -w -U_FORTIFY_SOURCE" 2>&1 && echo CONFIGURE_OK ) \
       > /build/cfg.log 2>&1 || { echo "CONFIGURE_FAIL"; tail -25 /build/cfg.log; }
-    make -j"$(nproc)" -k > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
+    make -j"${SSD_MAKE_JOBS:-$(nproc)}" -k > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
     make install -k > /build/make_install.log 2>&1; echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status
     if ls "$PFX"/lib/libexpat.so* "$PFX"/lib64/libexpat.so* 2>/dev/null | grep -q .; then echo "PROJECT_BUILD_INSTALLED=yes" >> /build/build_status; else echo "PROJECT_BUILD_INSTALLED=no" >> /build/build_status; fi
     echo "build complete"
@@ -333,7 +333,7 @@ phase1:
     #!/bin/bash
     SRC="$SOURCE_DIR"; [ -d "$SOURCE_DIR/expat" ] && SRC="$SOURCE_DIR/expat"
     cd "$SRC" || { echo "no source dir" > /tmp/ssd_rebuild.log; }
-    make -j"$(nproc)" -k > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
+    make -j"${SSD_MAKE_JOBS:-$(nproc)}" -k > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
     make install -k > /tmp/ssd_install.log 2>&1; echo "install exit: $?"
     grep -B2 -A8 "error:" /tmp/ssd_rebuild.log 2>/dev/null | head -100 > /tmp/ssd_build_errors; true
     case "$VULN_FILE" in
@@ -362,7 +362,7 @@ phase1:
       done
       if [ ! -x "$SRC/configure" ]; then ( ./buildconf.sh >/build/bootstrap.log 2>&1 || autoreconf -fi >/build/bootstrap.log 2>&1 ) || true; fi
       ./configure --prefix="$PFX" --without-docbook CFLAGS="-O2 -g -w" > /build/cfg.log 2>&1 && echo CONFIG_OK || { echo CONFIG_FAIL; tail -25 /build/cfg.log; }
-      make -j"$(nproc)" -k > /build/make.log 2>&1; echo "BUILD_RC=$?" >> /build/build_status
+      make -j"${SSD_MAKE_JOBS:-$(nproc)}" -k > /build/make.log 2>&1; echo "BUILD_RC=$?" >> /build/build_status
       make install -k >> /build/make.log 2>&1 || true
       tail -15 /build/make.log; echo "build complete"
     run_script: |

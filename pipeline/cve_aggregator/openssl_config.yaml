@@ -333,7 +333,7 @@ phase1:
     # the whole `make` even though libssl/libcrypto are fine (this is what failed
     # CVE-2017-3730). `build_sw` (1.1.x/3.x) builds exactly what install_sw needs;
     # older trees (no build_sw target) fall back to a tolerant `make -k`.
-    ( make -j"$(nproc)" build_sw 2>/dev/null || make -j"$(nproc)" -k ) > /build/make.log 2>&1
+    ( make -j"${SSD_MAKE_JOBS:-$(nproc)}" build_sw 2>/dev/null || make -j"${SSD_MAKE_JOBS:-$(nproc)}" -k ) > /build/make.log 2>&1
     echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
     # install_sw = libs + headers + openssl binary, no docs (much faster than install).
     ( make install_sw -k || make install -k ) > /build/make_install.log 2>&1; echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status
@@ -398,7 +398,7 @@ phase1:
     #!/bin/bash
     cd "$SOURCE_DIR" || { echo "no source dir" > /tmp/ssd_rebuild.log; }
     # Libs-only incremental rebuild (mirror build_script: skip the test suite).
-    ( make -j"$(nproc)" build_sw 2>/dev/null || make -j"$(nproc)" -k ) > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
+    ( make -j"${SSD_MAKE_JOBS:-$(nproc)}" build_sw 2>/dev/null || make -j"${SSD_MAKE_JOBS:-$(nproc)}" -k ) > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
     ( make install_sw -k || make install -k ) > /tmp/ssd_install.log 2>&1; echo "install exit: $?"
     grep -B2 -A8 "error:" /tmp/ssd_rebuild.log 2>/dev/null | head -100 > /tmp/ssd_build_errors; true
     case "$VULN_FILE" in
@@ -438,8 +438,8 @@ phase1:
       make depend > /build/depend.log 2>&1 || true
       # Build the libs (build_sw skips the full test suite), then the specific test
       # binary if the target exists; tolerate failures of unrelated targets.
-      ( make -j"$(nproc)" build_sw 2>/dev/null || make -j"$(nproc)" -k ) > /build/make.log 2>&1
-      make -j"$(nproc)" "test/$TEST_NAME" >> /build/make.log 2>&1 || true
+      ( make -j"${SSD_MAKE_JOBS:-$(nproc)}" build_sw 2>/dev/null || make -j"${SSD_MAKE_JOBS:-$(nproc)}" -k ) > /build/make.log 2>&1
+      make -j"${SSD_MAKE_JOBS:-$(nproc)}" "test/$TEST_NAME" >> /build/make.log 2>&1 || true
       echo "BUILD_RC=$?" >> /build/build_status
       tail -15 /build/make.log; echo "build complete"
     run_script: |

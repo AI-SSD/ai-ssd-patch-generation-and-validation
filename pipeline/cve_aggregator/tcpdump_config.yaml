@@ -335,7 +335,7 @@ phase1:
     if [ ! -x ./configure ]; then ./autogen.sh > /build/autogen.log 2>&1 || autoreconf -fi > /build/autogen.log 2>&1 || true; fi
     ( ./configure --prefix="$PFX" 2>&1 && echo CONFIGURE_OK ) > /build/cfg.log 2>&1 \
       || { echo "CONFIGURE_FAIL"; tail -30 /build/cfg.log; }
-    ( make -j"$(nproc)" 2>&1 || make -k ) > /build/make.log 2>&1
+    ( make -j"${SSD_MAKE_JOBS:-$(nproc)}" 2>&1 || make -k ) > /build/make.log 2>&1
     echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status; tail -20 /build/make.log
     ( make install -k ) > /build/make_install.log 2>&1; echo "PROJECT_INSTALL_EXIT_CODE=$?" >> /build/build_status
     # Marker = presence of the built tcpdump binary (the real project artifact),
@@ -396,7 +396,7 @@ phase1:
     cd "$SOURCE_DIR" || { echo "no source dir" > /tmp/ssd_rebuild.log; }
     export CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O0 -w"
     export LDFLAGS="-fsanitize=address"
-    ( make -j"$(nproc)" 2>&1 || make -k ) > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
+    ( make -j"${SSD_MAKE_JOBS:-$(nproc)}" 2>&1 || make -k ) > /tmp/ssd_rebuild.log 2>&1; echo "rebuild exit: $?"; tail -30 /tmp/ssd_rebuild.log
     ( make install -k ) > /tmp/ssd_install.log 2>&1; echo "install exit: $?"
     grep -B2 -A8 "error:" /tmp/ssd_rebuild.log 2>/dev/null | head -100 > /tmp/ssd_build_errors; true
     case "$VULN_FILE" in
@@ -436,7 +436,7 @@ phase1:
       if [ ! -x ./configure ]; then ./autogen.sh > /build/autogen.log 2>&1 || autoreconf -fi > /build/autogen.log 2>&1 || true; fi
       ( ./configure --prefix="$INSTALL_PREFIX" 2>&1 && echo CONFIGURE_OK ) > /build/cfg.log 2>&1 \
         || { echo CONFIGURE_FAIL; tail -25 /build/cfg.log; }
-      ( make -j"$(nproc)" 2>&1 || make -k ) > /build/make.log 2>&1
+      ( make -j"${SSD_MAKE_JOBS:-$(nproc)}" 2>&1 || make -k ) > /build/make.log 2>&1
       echo "BUILD_RC=$?" >> /build/build_status
       tail -15 /build/make.log; echo "build complete"
     run_script: |

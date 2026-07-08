@@ -184,6 +184,15 @@ def _load_baseline_policy() -> Tuple[int, int, int]:
         parallel = int(cfg.get("baseline_max_parallel", parallel) or parallel)
     except Exception:
         pass
+    # Per-run override (run_all.sh / dashboard): this knob is read straight from
+    # config.yaml above (not the env-overlaid config), so honour SSD_BASELINE_PARALLEL
+    # here too — lets a campaign raise Phase-1 baseline concurrency without edits.
+    try:
+        _envp = os.environ.get("SSD_BASELINE_PARALLEL")
+        if _envp:
+            parallel = int(_envp)
+    except (TypeError, ValueError):
+        pass
     # Sanity: at least one run, agreement never exceeds the run budget, and
     # concurrency is bounded by the run budget (and at least 1).
     runs = max(1, runs)

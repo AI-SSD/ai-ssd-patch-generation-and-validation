@@ -481,7 +481,7 @@ phase1:
     #!/bin/bash
     cd "$SOURCE_DIR" || exit 1
     make O="$BUILD_DIR" defconfig > /build/cfg.log 2>&1 && echo CONFIG_OK || { echo CONFIG_FAIL; tail -20 /build/cfg.log; }
-    make O="$BUILD_DIR" -j"$(nproc)" > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status
+    make O="$BUILD_DIR" -j"${SSD_MAKE_JOBS:-$(nproc)}" > /build/make.log 2>&1; echo "PROJECT_BUILD_EXIT_CODE=$?" >> /build/build_status
     tail -20 /build/make.log
     echo "PROJECT_INSTALL_EXIT_CODE=0" >> /build/build_status
     if ls "$BUILD_DIR"/vmlinux >/dev/null 2>&1 || ls "$BUILD_DIR"/arch/*/boot/bzImage >/dev/null 2>&1; then echo "PROJECT_BUILD_INSTALLED=yes" >> /build/build_status; else echo "PROJECT_BUILD_INSTALLED=no" >> /build/build_status; fi
