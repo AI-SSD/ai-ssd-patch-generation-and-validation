@@ -54,6 +54,9 @@ from master_pipeline.sast_config import (  # noqa: E402
     load_sast_config, SastConfig,
 )
 from master_pipeline import sast_runner  # noqa: E402  (shared Phase 1/3 SAST run + classify)
+from master_pipeline.intree import (  # noqa: E402  (shared Phase 1/3 in-tree timeout policy)
+    intree_container_timeout, load_intree_timeout_policy,
+)
 from poc_analyzer import PoCAnalyzer  # noqa: E402  (same negative filter Phase 1 uses)
 try:  # best-effort live-progress heartbeat for the dashboard (never fatal)
     from cve_aggregator.utils import live_progress  # noqa: E402
@@ -134,6 +137,12 @@ def _resolve_phase1_layout(base_dir: Path,
         # with the SOURCE_DIR/BUILD_DIR/INSTALL_PREFIX env inherited from the Phase 1
         # image + VULN_FILE; must write the /tmp/ssd_* markers the validator reads.
         "patch_rebuild_script": p1.get("patch_rebuild_script") or None,
+        # The in-tree run recipe — not executed here (the Phase 1 image's CMD is
+        # inherited) but READ, so Phase 3 can derive the same container ceiling
+        # Phase 1 used. A shorter ceiling here would kill the patched run before
+        # the recipe reports, marking a genuinely fixed CVE as an environment
+        # failure; a longer one would let a hang the baseline caught slip through.
+        "intree_run_script": (p1.get("intree_test", {}) or {}).get("run_script") or None,
     }
 
 
@@ -164,6 +173,29 @@ class ValidationStatus(Enum):
     TIMEOUT = "Timeout"                          # Execution timed out
     NO_BASELINE = "No Phase 1 Baseline"          # CVE has no reproduction baseline
     UNKNOWN_ERROR = "Unknown Error"              # Unexpected error occurred
+
+
+# In-tree (Option A) validation markers that mean the harness could not produce a
+# verdict. NORESULT ⇒ the patched build/test ran but emitted no PASS/FAIL: since
+# Phase 1 (unpatched, SAME era/image) reproduced this CVE with this very test, the
+# only changed variable is the patch, so a no-verdict is a PATCH-INDUCED build
+# failure (a broken compile, or a core build that no longer yields a runtime). That
+# is retryable — the build log is ideal feedback — so it maps to BUILD_ERROR
+# (retryable via feedback_loop.retry_on.build_error), NOT the non-retryable
+# EXECUTION_ERROR. TIMEOUT/ERROR are genuine environment failures and stay
+# non-retryable.
+_INTREE_ENV_MARKERS = ("TIMEOUT", "ERROR")
+
+
+def _intree_error_status(marker: str) -> str:
+    """Map a non-verdict in-tree marker to a validation status.
+
+    NORESULT → BUILD_ERROR (retryable, patch-induced); TIMEOUT/ERROR →
+    EXECUTION_ERROR (non-retryable environment failure). See _INTREE_ENV_MARKERS.
+    """
+    if marker in _INTREE_ENV_MARKERS:
+        return ValidationStatus.EXECUTION_ERROR.value
+    return ValidationStatus.BUILD_ERROR.value
 
 
 class SASTSeverity(Enum):
@@ -504,12 +536,16 @@ class PatchDiscovery:
                 if not model_dir.is_dir():
                     continue
 
-                # Skip feedback-loop retry artifacts (e.g. "gpt-4.1-mini_retry2").
-                # These are produced and validated IN-PROCESS by the feedback
-                # loop, not Phase 2 outputs. Discovering them makes a standalone
-                # Phase 3 re-run validate N× the real patch count (one per retry).
-                if re.search(r'_retry\d+$', model_dir.name):
-                    self.logger.debug(f"Skipping feedback retry dir: {model_dir.name}")
+                # Skip feedback-loop artifacts: retry patches ("gpt-4.1-mini_retry2")
+                # AND best-of-N fan-out candidates ("gpt-4.1-mini_fanout1", and the
+                # compounded "..._fanout1_fanout2"). These are produced and validated
+                # IN-PROCESS by the feedback loop, not Phase 2 outputs. Discovering
+                # them makes a standalone Phase 3 re-run validate many× the real patch
+                # count (one per retry/candidate) — and, worse, treat a fan-out dir as
+                # a base "model" so the loop fans out AGAIN on top of it. No real model
+                # name contains "_retryN"/"_fanoutN", so this match is unambiguous.
+                if re.search(r'_(?:retry|fanout)\d+', model_dir.name):
+                    self.logger.debug(f"Skipping feedback artifact dir: {model_dir.name}")
                     continue
 
                 patch_info = self._load_patch_info(cve_id, model_dir)
@@ -890,15 +926,21 @@ class ValidationDockerManager:
         # don't oversubscribe the host. Unset ⇒ no build-arg ⇒ $(nproc), unchanged.
         _jobs = (_cfg.get("docker") or {}).get("make_jobs")
         _buildargs = {"SSD_MAKE_JOBS": str(_jobs)} if _jobs else None
+        # Host-global build semaphore (no-op unless SSD_BUILD_SLOTS>=1): serialize the
+        # CPU-bound patched rebuild against other cells' builds so scheduler overlap
+        # doesn't thrash the cores. Imported OUTSIDE the try so an import error is not
+        # masked as a build failure by the except below. Released when the build returns.
+        from cve_aggregator.utils.build_lock import build_slot
         try:
-            image, build_logs = self.client.images.build(
-                path=str(build_context),
-                tag=patch_info.image_name,
-                rm=True,
-                forcerm=True,
-                timeout=self.timeout,
-                buildargs=_buildargs,
-            )
+            with build_slot(label=patch_info.log_label, logger=self.logger):
+                image, build_logs = self.client.images.build(
+                    path=str(build_context),
+                    tag=patch_info.image_name,
+                    rm=True,
+                    forcerm=True,
+                    timeout=self.timeout,
+                    buildargs=_buildargs,
+                )
             
             # Collect build logs
             log_output = []
@@ -1213,7 +1255,10 @@ class ValidationDockerManager:
 
         Verdict (Option A): the test FAILED on the vulnerable build (Phase 1),
         so the patch is validated iff it now PASSES. Returns
-        (validated, marker, logs, error) where marker is PASS|FAIL|NORESULT.
+        (validated, marker, logs, error) where marker is one of
+        PASS | FAIL | NORESULT | TIMEOUT | ERROR. NORESULT means the patched
+        build/test ran but emitted no PASS/FAIL (patch-induced build failure);
+        TIMEOUT/ERROR are genuine environment failures (see _intree_error_status).
         """
         self.logger.info(f"Running in-tree test for {patch_info.log_label}...")
         container = None
@@ -1245,7 +1290,10 @@ class ValidationDockerManager:
                 if "SSD_TEST_RESULT=" in line:
                     marker = line.split("SSD_TEST_RESULT=", 1)[1].strip().split()[0]
             if timed_out:
-                return False, "NORESULT", logs, f"In-tree test timed out after {run_timeout}s"
+                # A hang is a genuine execution/environment condition (not a
+                # patch-vs-build verdict) — mark it distinctly so the caller keeps
+                # it non-retryable rather than treating it as a build failure.
+                return False, "TIMEOUT", logs, f"In-tree test timed out after {run_timeout}s"
             if marker == "PASS":
                 self.logger.info(f"✓ {patch_info.log_label}: in-tree test PASSES — patch validated")
                 return True, marker, logs, None
@@ -1262,7 +1310,9 @@ class ValidationDockerManager:
                     container.remove(force=True)
                 except Exception:
                     pass
-            return False, "NORESULT", str(e), f"Exception during in-tree test: {e}"
+            # A Docker/harness exception is an infrastructure failure, not a
+            # verdict on the patch — mark it distinctly (kept non-retryable).
+            return False, "ERROR", str(e), f"Exception during in-tree test: {e}"
 
     def run_sast(
         self,
@@ -1554,6 +1604,14 @@ class ValidationPipeline:
         # Phase 1 image layout + manifest (methodology v2)
         self.phase1_layout = _resolve_phase1_layout(self.base_dir, self.phase0_config_path)
 
+        # Same derivation Phase 1 uses, from the same recipe — the fail-to-pass
+        # oracle only holds if the vulnerable and patched runs are given the same
+        # wall-clock budget. This replaces a flat max(run_timeout, 600), which was
+        # both arbitrary and out of step with Phase 1's flat 300.
+        self.intree_run_timeout = intree_container_timeout(
+            self.phase1_layout.get("intree_run_script"), *load_intree_timeout_policy()
+        )
+
         # Initialize components
         self.csv_parser = CSVParser(self.csv_path, self.logger)
         self.patch_discovery = PatchDiscovery(self.patches_dir, self.logger, self.cell_disc)
@@ -1842,16 +1900,27 @@ class ValidationPipeline:
                     return result
                 result.build_success = True
                 validated, marker, test_logs, test_err = self.docker_mgr.run_intree_test(
-                    patch_info, max(self.run_timeout, 600)
+                    patch_info, self.intree_run_timeout
                 )
                 result.poc_blocked = validated
                 result.poc_exit_code = 0 if validated else 1
                 result.poc_output = test_logs
                 if test_err:
-                    result.status = ValidationStatus.EXECUTION_ERROR.value
+                    result.status = _intree_error_status(marker)
                     result.error_message = test_err
                     result.poc_blocked = False
-                    self.logger.error(f"✗ in-tree test error for {patch_info.log_label}: {test_err}")
+                    if result.status == ValidationStatus.BUILD_ERROR.value:
+                        # Patch-induced no-verdict: surface the build/test log as
+                        # build feedback so the loop regenerates against the errors
+                        # (mirrors the ExploitDB BUILD_ERROR path's feedback fields).
+                        result.build_success = False
+                        result.build_logs = test_logs
+                        self.logger.warning(
+                            f"✗ in-tree no-verdict for {patch_info.log_label}: "
+                            f"BUILD_ERROR (patch-induced, retryable) — {test_err}")
+                    else:
+                        self.logger.error(
+                            f"✗ in-tree test error for {patch_info.log_label}: {test_err}")
                 elif not validated:
                     result.status = ValidationStatus.POC_STILL_WORKS.value
                     result.error_message = "In-tree regression test still FAILS on the patched build"

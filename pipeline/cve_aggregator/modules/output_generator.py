@@ -281,7 +281,7 @@ class OutputGenerator(PipelineModule):
         default_fields = [
             "CVE", "V_COMMIT", "V_COMMIT_TIMESTAMP", "V_COMMIT_YEAR", "FilePath", "F_NAME", "UNIT_TYPE",
             "V_FILE", "V_FUNCTION",
-            "CVE_Description", "CWE", "CWE_Description",
+            "CVE_Description", "CVE_Published", "CWE", "CWE_Description",
             "project_version", "project_version_normalized", "ubuntu_version",
             "poc_index", "poc_path", "poc_language",
             "FIX_COMMIT", "TEST_PATH", "TEST_SUBDIR",
@@ -293,6 +293,10 @@ class OutputGenerator(PipelineModule):
         for f in ["V_COMMIT_TIMESTAMP", "V_COMMIT_YEAR"]:
             if f not in fieldnames:
                 fieldnames.insert(2, f)  # Insert after V_COMMIT
+        # NVD publication date — required by the Phase 2 contamination filter
+        # (post-training-cutoff CVE selection); appended for custom csv_fields.
+        if "CVE_Published" not in fieldnames:
+            fieldnames.append("CVE_Published")
 
         rows: List[Dict[str, Any]] = []
         total = 0
@@ -749,6 +753,7 @@ class OutputGenerator(PipelineModule):
                     "V_FILE": vuln_file_content,
                     "V_FUNCTION": "",
                     "CVE_Description": meta.description or "",
+                    "CVE_Published": meta.published_date or "",
                     "CWE": ",".join(meta.cwe_ids or []),
                     "CWE_Description": get_cwe_descriptions(meta.cwe_ids),
                     "project_version": project_version,
@@ -772,6 +777,7 @@ class OutputGenerator(PipelineModule):
                     "V_FILE": vuln_file_content,
                     "V_FUNCTION": unit["vuln_body"],
                     "CVE_Description": meta.description or "",
+                    "CVE_Published": meta.published_date or "",
                     "CWE": ",".join(meta.cwe_ids or []),
                     "CWE_Description": get_cwe_descriptions(meta.cwe_ids),
                     "project_version": project_version,
@@ -798,6 +804,7 @@ class OutputGenerator(PipelineModule):
                     "V_FILE": vuln_file_content,
                     "V_FUNCTION": "",
                     "CVE_Description": meta.description or "",
+                    "CVE_Published": meta.published_date or "",
                     "CWE": ",".join(meta.cwe_ids or []),
                     "CWE_Description": get_cwe_descriptions(meta.cwe_ids),
                     "project_version": project_version,
@@ -821,6 +828,7 @@ class OutputGenerator(PipelineModule):
                 "V_FILE": "",
                 "V_FUNCTION": "",
                 "CVE_Description": meta.description or "",
+                "CVE_Published": meta.published_date or "",
                 "CWE": ",".join(meta.cwe_ids or []),
                 "CWE_Description": get_cwe_descriptions(meta.cwe_ids),
                 "project_version": project_version,

@@ -1,0 +1,99 @@
+
+================ tcpdump ================
+  attempted (universe): 142
+  reproduced by pipeline: 127
+  TP=122  FP=3 (nondiscrim=0, V+fail/inconclusive=3)  FN=0  TN=4
+  UNCONFIRMABLE: 2 (of reproduced) + 11 (of manual) = 13
+  reproduction PRECISION strict   = TP/(TP+FP)            = 0.976
+  reproduction PRECISION lenient  = TP/(TP+FP_nondiscrim) = 1.000   (V+fail treated as inconclusive, not a pipeline error)
+  reproduction RECALL             = TP/(TP+FN)            = 1.000
+  --- FP (pipeline reproduced, oracle REFUTED) — hand-audit ---
+     [vplus_fail] CVE-2017-12894     V-=FAIL V+=FAIL fix=730fc35968
+     [vplus_fail] CVE-2017-13006     V-=FAIL V+=FAIL fix=cc4a7391c6
+     [vplus_fail] CVE-2017-13007     V-=FAIL V+=FAIL fix=ca336198e8
+
+================ openssl ================
+  attempted (universe): 35
+  reproduced by pipeline: 15
+  TP=3  FP=8 (nondiscrim=2, V+fail/inconclusive=6)  FN=2  TN=5
+  UNCONFIRMABLE: 4 (of reproduced) + 13 (of manual) = 17
+  reproduction PRECISION strict   = TP/(TP+FP)            = 0.273
+  reproduction PRECISION lenient  = TP/(TP+FP_nondiscrim) = 0.600   (V+fail treated as inconclusive, not a pipeline error)
+  reproduction RECALL             = TP/(TP+FN)            = 0.600
+  --- FP (pipeline reproduced, oracle REFUTED) — hand-audit ---
+     [nondiscrim] CVE-2016-7053      V-=PASS V+=PASS fix=f962541d0b
+     [vplus_fail] CVE-2022-4450      V-=FAIL V+=FAIL fix=63bcf189be
+     [vplus_fail] CVE-2024-2511      V-=FAIL V+=FAIL fix=7e4d731b1c
+     [vplus_fail] CVE-2024-5535      V-=FAIL V+=FAIL fix=4ada436a19
+     [vplus_fail] CVE-2026-2673      V-=FAIL V+=FAIL fix=2157c9d81f
+     [vplus_fail] CVE-2026-45445     V-=FAIL V+=FAIL fix=323f0b6e7d
+     [vplus_fail] CVE-2026-45446     V-=FAIL V+=FAIL fix=25b32cd9d4
+     [nondiscrim] CVE-2026-9076      V-=PASS V+=PASS fix=05b0663668
+  --- FN (pipeline manual, oracle CONFIRMED) — missed reproductions ---
+     CVE-2021-3711      :: test fails on vulnerable tree, passes on upstream-fixed tree
+     CVE-2023-0217      :: test fails on vulnerable tree, passes on upstream-fixed tree
+
+================ glibc ================
+  attempted (universe): 61
+  reproduced by pipeline: 27
+  TP=13  FP=11 (nondiscrim=1, V+fail/inconclusive=10)  FN=1  TN=5
+  UNCONFIRMABLE: 3 (of reproduced) + 28 (of manual) = 31
+  reproduction PRECISION strict   = TP/(TP+FP)            = 0.542
+  reproduction PRECISION lenient  = TP/(TP+FP_nondiscrim) = 0.929   (V+fail treated as inconclusive, not a pipeline error)
+  reproduction RECALL             = TP/(TP+FN)            = 0.929
+  --- FP (pipeline reproduced, oracle REFUTED) — hand-audit ---
+     [vplus_fail] CVE-2012-4412      V-=FAIL V+=FAIL fix=a243b1a079
+     [vplus_fail] CVE-2014-0475      V-=FAIL V+=FAIL fix=dcf0cce30d
+     [vplus_fail] CVE-2014-4043      V-=FAIL V+=FAIL fix=89e435f355
+     [nondiscrim] CVE-2016-1234      V-=PASS V+=FAIL fix=5171f3079f
+     [vplus_fail] CVE-2019-14271     V-=FAIL V+=FAIL fix=3e880d7337
+     [vplus_fail] CVE-2019-25013     V-=FAIL V+=FAIL fix=ee7a3144c9
+     [vplus_fail] CVE-2021-3999      V-=FAIL V+=FAIL fix=23e0e8f5f1
+     [vplus_fail] CVE-2023-4806      V-=FAIL V+=FAIL fix=e09ee267c0
+     [vplus_fail] CVE-2023-5156      V-=FAIL V+=FAIL fix=ec6b95c330
+     [vplus_fail] CVE-2023-6246      V-=FAIL V+=FAIL fix=d1a83b6767
+     [vplus_fail] CVE-2024-2961      V-=FAIL V+=FAIL fix=3703c32a8d
+  --- FN (pipeline manual, oracle CONFIRMED) — missed reproductions ---
+     CVE-2012-3480      :: test fails on vulnerable tree, passes on upstream-fixed tree
+
+================ POOLED (all projects) ================
+  attempted (universe): 238
+  reproduced by pipeline: 169
+  TP=138  FP=22 (nondiscrim=3, V+fail/inconclusive=19)  FN=3  TN=14
+  UNCONFIRMABLE: 9 (of reproduced) + 52 (of manual) = 61
+  reproduction PRECISION strict   = TP/(TP+FP)            = 0.863
+  reproduction PRECISION lenient  = TP/(TP+FP_nondiscrim) = 0.979   (V+fail treated as inconclusive, not a pipeline error)
+  reproduction RECALL             = TP/(TP+FN)            = 0.979
+  --- FP (pipeline reproduced, oracle REFUTED) — hand-audit ---
+     [vplus_fail] CVE-2017-12894     V-=FAIL V+=FAIL fix=730fc35968
+     [vplus_fail] CVE-2017-13006     V-=FAIL V+=FAIL fix=cc4a7391c6
+     [vplus_fail] CVE-2017-13007     V-=FAIL V+=FAIL fix=ca336198e8
+     [nondiscrim] CVE-2016-7053      V-=PASS V+=PASS fix=f962541d0b
+     [vplus_fail] CVE-2022-4450      V-=FAIL V+=FAIL fix=63bcf189be
+     [vplus_fail] CVE-2024-2511      V-=FAIL V+=FAIL fix=7e4d731b1c
+     [vplus_fail] CVE-2024-5535      V-=FAIL V+=FAIL fix=4ada436a19
+     [vplus_fail] CVE-2026-2673      V-=FAIL V+=FAIL fix=2157c9d81f
+     [vplus_fail] CVE-2026-45445     V-=FAIL V+=FAIL fix=323f0b6e7d
+     [vplus_fail] CVE-2026-45446     V-=FAIL V+=FAIL fix=25b32cd9d4
+     [nondiscrim] CVE-2026-9076      V-=PASS V+=PASS fix=05b0663668
+     [vplus_fail] CVE-2012-4412      V-=FAIL V+=FAIL fix=a243b1a079
+     [vplus_fail] CVE-2014-0475      V-=FAIL V+=FAIL fix=dcf0cce30d
+     [vplus_fail] CVE-2014-4043      V-=FAIL V+=FAIL fix=89e435f355
+     [nondiscrim] CVE-2016-1234      V-=PASS V+=FAIL fix=5171f3079f
+     [vplus_fail] CVE-2019-14271     V-=FAIL V+=FAIL fix=3e880d7337
+     [vplus_fail] CVE-2019-25013     V-=FAIL V+=FAIL fix=ee7a3144c9
+     [vplus_fail] CVE-2021-3999      V-=FAIL V+=FAIL fix=23e0e8f5f1
+     [vplus_fail] CVE-2023-4806      V-=FAIL V+=FAIL fix=e09ee267c0
+     [vplus_fail] CVE-2023-5156      V-=FAIL V+=FAIL fix=ec6b95c330
+     [vplus_fail] CVE-2023-6246      V-=FAIL V+=FAIL fix=d1a83b6767
+     [vplus_fail] CVE-2024-2961      V-=FAIL V+=FAIL fix=3703c32a8d
+  --- FN (pipeline manual, oracle CONFIRMED) — missed reproductions ---
+     CVE-2021-3711      :: test fails on vulnerable tree, passes on upstream-fixed tree
+     CVE-2023-0217      :: test fails on vulnerable tree, passes on upstream-fixed tree
+     CVE-2012-3480      :: test fails on vulnerable tree, passes on upstream-fixed tree
+
+================ SUMMARY TABLE ================
+project                attempt   TP   FP   FN   TN  UNCONF  precS  precL recall
+tcpdump                    142  122    3    0    4      13  0.976  1.000  1.000
+openssl                     35    3    8    2    5      17  0.273  0.600  0.600
+glibc                       61   13   11    1    5      31  0.542  0.929  0.929

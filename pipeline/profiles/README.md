@@ -22,6 +22,8 @@ Profiles set the non-secret ones; secrets are sourced separately (see below).
 | `LLM_TEMPERATURE` | both | `0.2` | `llm.temperature` |
 | `LLM_MAX_TOKENS` | openai | `16384` | `llm.max_tokens` |
 | `LLM_TIMEOUT` | both | `600` | `llm.timeout` |
+| `SSD_CONTAMINATION_FILTER` | both | `1` / `0` | `contamination_filter.enabled` (Phase 2 post-training-cutoff CVE gate) |
+| `LLM_TRAINING_CUTOFF` | both | `2024-09-30` | `contamination_filter.cutoff_override` (explicit cutoff; skips the per-model map) |
 | `OPENAI_API_KEY` | openai | *(secret)* | from `API-openai-key` |
 | `OLLAMA_USERNAME` | ollama | `talmeida` | basic-auth user (from `API-ollama-proxy`) |
 | `OLLAMA_PASSWORD` | ollama | *(secret)* | basic-auth pass (from `API-ollama-proxy`) |
@@ -53,6 +55,27 @@ echo 'API-ollama-proxy' >> .gitignore   # if not already covered by an API-* rul
 `OLLAMA_PASSWORD` for the run.
 
 ## Shipped profiles (each = 4 models, same family unless noted)
+
+### Uniform single-model profiles (current campaign)
+
+One model on **all 4 attempts** — no ramp. Motivated by the shared Ollama GPU:
+ramped profiles made concurrent lanes (Phase 2 attempt-N model vs the Phase 1/3
+negative filter's attempt-1 model) request *different* models at once, and the
+GPU can't hold both — Ollama thrashed (evict/reload per request) and crashed.
+With one model per run, parallel same-model requests batch safely. The OpenAI
+uniform profiles mirror this so per-model attribution stays clean across the
+whole matrix.
+
+| Profile | Provider | Model (attempts 1–4) |
+|---------|----------|----------------------|
+| `openai-gpt5-mini` | openai | gpt-5-mini ×4 (10M tier) |
+| `openai-gpt54-mini` | openai | gpt-5.4-mini ×4 (10M tier) |
+| `ollama-proxy-qwen-7b` | ollama | qwen2.5:7b ×4 |
+| `ollama-proxy-qwen-32b` | ollama | qwen2.5:32b ×4 |
+| `ollama-proxy-qwen-coder-7b` | ollama | qwen2.5-coder:7b ×4 |
+| `ollama-proxy-qwen-coder-32b` | ollama | qwen2.5-coder:32b ×4 |
+
+### Ramped profiles (legacy campaign)
 
 | Profile | Provider | Ramp (attempt 1 → 4) | Token tier |
 |---------|----------|----------------------|------------|

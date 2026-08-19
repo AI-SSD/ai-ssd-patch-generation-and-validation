@@ -8,7 +8,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import List
-from .config import BASE_DIR, PipelineConfig, PHASE_SCRIPTS, cfg_section
+from .config import BASE_DIR, PipelineConfig, PHASE_SCRIPTS, cfg_section, get_config
+from .intree import intree_container_timeout, load_intree_timeout_policy
 from .models import PhaseResult, PhaseStatus
 from .utils import format_duration
 from . import notify
@@ -24,6 +25,11 @@ logger = logging.getLogger('pipeline')
 # that is a cold build (~15-20 min) plus a hang-PoC baseline (3×300s) with no
 # heartbeat in between. 0 disables idle detection (hard cap only).
 _DEFAULT_IDLE_TIMEOUTS = {0: 1800, 1: 2400, 2: 1800, 3: 2400, 4: 600}
+
+# Cold-build headroom added on top of a project's in-tree container ceiling when
+# raising the Phase 1/3 idle cap (see _intree_idle_floor). The ceiling covers the
+# silent container wait; this covers the image build that precedes it.
+_DEFAULT_INTREE_IDLE_BUILD_ALLOWANCE = 1800
 
 # How often the watchdog re-checks liveness while a phase runs.
 _WATCHDOG_POLL_SECONDS = 10
@@ -431,16 +437,53 @@ class PhaseExecutor:
         except subprocess.TimeoutExpired:
             pass
 
+    def _intree_idle_floor(self) -> int:
+        """Lower bound the idle cap must respect when the project runs in-tree tests.
+
+        An in-tree reproduction is a DETACHED container the phase waits on: nothing
+        is written to stdout and no heartbeat is emitted until it finishes, so the
+        whole container ceiling is one silent stretch. That ceiling is derived per
+        project from the recipe's own budgets and can exceed the configured cap
+        (glibc's cascade yields 2520 s against a 2400 s cap), which would have the
+        watchdog kill a perfectly healthy phase. Returns 0 for projects with no
+        in-tree recipe, leaving their tight cap exactly as configured.
+        """
+        try:
+            p0 = Path(self.config.phase0_config)
+            if not p0.is_absolute():
+                p0 = self._pipeline_root / p0
+            if not p0.exists():
+                return 0
+            import yaml
+            cfg = yaml.safe_load(p0.read_text(encoding="utf-8")) or {}
+            script = (((cfg.get("phase1") or {}).get("intree_test") or {})
+                      .get("run_script"))
+            if not script:
+                return 0
+            ceiling = intree_container_timeout(
+                script, *load_intree_timeout_policy(self._pipeline_root))
+            allowance = get_config(self.config.base_dir).get(
+                "intree_idle_build_allowance", _DEFAULT_INTREE_IDLE_BUILD_ALLOWANCE)
+            return ceiling + int(allowance or 0)
+        except Exception:
+            return 0
+
     def _get_idle_timeout(self, phase: int) -> int:
         """Per-phase inactivity timeout (seconds) from config.yaml
         phase_idle_timeouts, falling back to _DEFAULT_IDLE_TIMEOUTS. 0 disables
         idle detection (the phase then relies solely on the hard wall-clock cap)."""
         idle_cfg = cfg_section("phase_idle_timeouts", self.config.base_dir)
         if idle_cfg and phase in idle_cfg:
-            return int(idle_cfg[phase])
-        if idle_cfg and str(phase) in idle_cfg:
-            return int(idle_cfg[str(phase)])
-        return _DEFAULT_IDLE_TIMEOUTS.get(phase, 0)
+            idle = int(idle_cfg[phase])
+        elif idle_cfg and str(phase) in idle_cfg:
+            idle = int(idle_cfg[str(phase)])
+        else:
+            idle = _DEFAULT_IDLE_TIMEOUTS.get(phase, 0)
+        # Phases 1 and 3 are the ones that run the in-tree container. 0 means the
+        # operator disabled idle detection outright — respect that.
+        if idle and phase in (1, 3):
+            idle = max(idle, self._intree_idle_floor())
+        return idle
 
     def _get_timeout(self, phase: int) -> int:
         """Get timeout for a specific phase from config.yaml phase_timeouts."""

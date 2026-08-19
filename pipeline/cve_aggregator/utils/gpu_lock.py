@@ -1,19 +1,27 @@
-"""Host-global GPU mutex for the single shared Ollama GPU.
+"""Host-global GPU semaphore for the shared Ollama GPU(s).
 
-The pipeline drives **one** shared Ollama GPU. When several pipeline processes
-(cells) run concurrently — e.g. ``run_all.sh`` with ``OLLAMA_PARALLEL>1``, or a
-future two-lane scheduler overlapping Phase 2 of one cell with Phase 3 of
-another — their GPU-bound inference must be serialized. Otherwise two requests
-for *different* model families hit the GPU at once and Ollama thrashes,
-evicting and reloading multi-GiB weights per request.
+The pipeline drives a shared Ollama GPU server. When several pipeline
+processes (cells) run concurrently — e.g. ``run_all.sh`` with
+``OLLAMA_PARALLEL>1``, or the two-lane scheduler overlapping Phase 2 of one
+cell with Phase 3 of another — their GPU-bound inference must be bounded by
+the number of GPUs. Otherwise two requests for *different* model families hit
+one GPU at once and Ollama thrashes, evicting and reloading multi-GiB weights
+per request.
+
+Historically this was a single mutex (one shared GPU). It is now an **N-slot
+counting semaphore**: ``slots`` concurrent holders are admitted, one per GPU
+(the 226 proxy server has 2x L40S, so two cells may infer at once — one model
+family per card). The slot count comes from the caller (see
+``gpu_slots.detect_gpu_slots``: env ``SSD_GPU_SLOTS`` > config ``gpu_slots`` >
+probe > 1); ``slots=1`` is byte-identical to the old mutex, including its lock
+filename, so a mixed old/new deployment still mutually excludes.
 
 The previous coordination was an **advisory** poll of ``/api/ps`` (a TOCTOU
 race: two processes both observe "free" and both proceed). This module replaces
-that with a real cross-process mutex: a ``flock`` on a host-global lock file that
-every GPU-bound step holds for the duration of its work. ``flock`` is released
-automatically by the OS when the holding process exits, so a crashed/killed cell
-never leaks the lock (the per-phase watchdog that kills a hung phase therefore
-also frees the GPU).
+that with real cross-process ``flock`` slot files that every GPU-bound step
+holds for the duration of its work. ``flock`` is released automatically by the
+OS when the holding process exits, so a crashed/killed cell never leaks a slot
+(the per-phase watchdog that kills a hung phase therefore also frees the GPU).
 
 It is a **no-op** when:
   * ``provider != "ollama"`` — OpenAI and other remote APIs have no local GPU; the
@@ -22,9 +30,9 @@ It is a **no-op** when:
   * disabled via the ``SSD_GPU_LOCK=0`` env var (or ``enabled=False`` from config);
   * ``fcntl``/``flock`` is unavailable (non-POSIX host).
 
-Uncontended acquisition (the ``OLLAMA_PARALLEL=1`` default, where only one cell
-runs at a time) is a single ``open`` + ``flock`` syscall — effectively instant —
-so turning this on costs nothing until cells actually overlap.
+Uncontended acquisition (a free slot available, e.g. only one cell running) is
+a single ``open`` + ``flock`` syscall — effectively instant — so turning this
+on costs nothing until cells actually contend for the GPUs.
 
 GRANULARITY: the lock is held by the *process* doing the work, for the duration
 of one GPU-bound unit. Crucially, threads inside that process (e.g. Phase 0's
@@ -101,11 +109,34 @@ def _lock_dir() -> Path:
         return Path(tempfile.gettempdir())
 
 
-def lock_path(endpoint: str = "") -> Path:
-    """Lock-file path, keyed by *endpoint* so distinct GPU servers don't share a
-    mutex (and the same server always maps to the same file across cells)."""
+def _resolve_slots(slots: Optional[int]) -> int:
+    """Semaphore width to use for THIS acquisition (always >= 1).
+
+    Delegates to ``gpu_slots.current_slots``: the live poller file (fresh) wins,
+    then ``SSD_GPU_SLOTS`` env, then the caller-passed *slots* (its import-time
+    detected value), then 1. Reading at acquisition time is what lets the
+    periodic poller grow/shrink concurrency without restarting a cell."""
+    try:
+        from .gpu_slots import current_slots
+    except Exception:  # pragma: no cover - defensive, keep the mutex working
+        raw = os.environ.get("SSD_GPU_SLOTS", "")
+        try:
+            n = int(float(str(raw).strip()))
+        except (TypeError, ValueError):
+            n = slots if (slots and slots >= 1) else 1
+        return n if n >= 1 else 1
+    return current_slots(default=slots if (slots and slots >= 1) else None)
+
+
+def lock_path(endpoint: str = "", slot: int = 0) -> Path:
+    """Slot lock-file path, keyed by *endpoint* so distinct GPU servers don't
+    share a semaphore (and the same server always maps to the same files across
+    cells). Slot 0 keeps the legacy single-GPU filename — old code always
+    contends on it, so mixed deployments stay mutually exclusive."""
     key = hashlib.sha1((endpoint or "default").encode("utf-8")).hexdigest()[:12]
-    return _lock_dir() / f"gpu-{key}.lock"
+    if slot <= 0:
+        return _lock_dir() / f"gpu-{key}.lock"
+    return _lock_dir() / f"gpu-{key}.s{slot}.lock"
 
 
 @contextlib.contextmanager
@@ -114,15 +145,20 @@ def gpu_lock(
     *,
     enabled: bool = True,
     endpoint: str = "",
+    slots: Optional[int] = None,
     wait_timeout: Optional[float] = None,
     poll_log_secs: float = _DEFAULT_POLL_LOG_SECS,
     logger: Optional[logging.Logger] = None,
     label: str = "",
 ) -> Iterator[bool]:
-    """Hold the host-global GPU mutex for the duration of the ``with`` block.
+    """Hold one of the host-global GPU slots for the duration of the ``with`` block.
 
-    Yields ``True`` if the lock is held, ``False`` if it is a no-op (disabled /
-    non-ollama) or could not be acquired within *wait_timeout*. On timeout the
+    *slots* is the semaphore width — the number of GPUs concurrent inference may
+    use (pass ``gpu_slots.detect_gpu_slots(...)``); ``None`` resolves the
+    ``SSD_GPU_SLOTS`` env var, defaulting to 1 (the legacy single-GPU mutex).
+
+    Yields ``True`` if a slot is held, ``False`` if it is a no-op (disabled /
+    non-ollama) or no slot was free within *wait_timeout*. On timeout the
     block still runs (best-effort, logged loudly) rather than deadlocking the
     pipeline — ``wait_timeout=0``/``None`` means wait indefinitely (the default;
     a hung holder is reaped by the phase watchdog, which frees the flock).
@@ -141,40 +177,59 @@ def gpu_lock(
         except ValueError:
             wait_timeout = 0.0
 
-    path = lock_path(endpoint)
+    n = _resolve_slots(slots)
+    paths = [lock_path(endpoint, i) for i in range(n)]
     suffix = f" [{label}]" if label else ""
     fd: Optional[int] = None
     held = False
+    held_slot = -1
+    start = time.monotonic()
+    last_log = start
+    waited = False
     try:
-        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
-        start = time.monotonic()
-        last_log = start
-        waited = False
         while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                held = True
-                break
-            except OSError:
-                waited = True
-                now = time.monotonic()
-                if wait_timeout and (now - start) >= wait_timeout:
-                    log.warning(
-                        "GPU lock%s wait exceeded its %.1fs budget (waited %.1fs) — "
-                        "proceeding WITHOUT the lock (another GPU task may be running).",
-                        suffix, wait_timeout, now - start,
-                    )
+            for i, p in enumerate(paths):
+                try:
+                    # O_CLOEXEC so a child process can't inherit the slot fd and
+                    # keep the flock held past the holder's death (slot leak).
+                    cand = os.open(str(p),
+                                   os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+                                   0o644)
+                except OSError:
+                    continue
+                try:
+                    fcntl.flock(cand, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fd = cand
+                    held = True
+                    held_slot = i
                     break
-                if now - last_log >= poll_log_secs:
-                    log.info(
-                        "Waiting for GPU lock%s — held by another process (%.0fs)…",
-                        suffix, now - start,
-                    )
-                    last_log = now
-                time.sleep(1.0)
+                except OSError:
+                    try:
+                        os.close(cand)
+                    except OSError:
+                        pass
+            if held:
+                break
+            waited = True
+            now = time.monotonic()
+            if wait_timeout and (now - start) >= wait_timeout:
+                log.warning(
+                    "GPU lock%s wait exceeded its %.1fs budget (waited %.1fs) — "
+                    "proceeding WITHOUT a slot (all %d GPU slot(s) busy).",
+                    suffix, wait_timeout, now - start, n,
+                )
+                break
+            if now - last_log >= poll_log_secs:
+                log.info(
+                    "Waiting for a GPU slot%s — all %d busy (%.0fs)…",
+                    suffix, n, now - start,
+                )
+                last_log = now
+            time.sleep(1.0)
         if held and waited:
             log.info(
-                "Acquired GPU lock%s after %.0fs.", suffix, time.monotonic() - start
+                "Acquired GPU slot %d/%d%s after %.0fs.",
+                held_slot + 1, n, suffix, time.monotonic() - start,
             )
         yield held
     finally:

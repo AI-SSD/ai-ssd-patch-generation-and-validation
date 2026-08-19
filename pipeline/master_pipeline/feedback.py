@@ -444,6 +444,11 @@ class IterativeFeedbackLoop:
             include_diff=bool(rc.get("applied_diff", False)),
             include_history=bool(rc.get("attempt_history", False)),
             reflexion=bool(rc.get("reflexion", False)),
+            # Spear-prompt context from the Phase 0 CSV row: retries name the
+            # same CVE description + CWE class as the initial Phase 2 attempt.
+            description=str(vuln_data.get('CVE_Description', '') or ''),
+            cwe=str(vuln_data.get('CWE', '') or ''),
+            cwe_description=str(vuln_data.get('CWE_Description', '') or ''),
         )
     
     def _validate_retry_patch(

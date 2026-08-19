@@ -32,14 +32,15 @@ pipeline:
   abort_on_error: false
   skip_modules: []
 
-# Reproducer priority (see aggregator_config.yaml for all modes). ExploitDB PoC
-# preferred; the fix-commit test (Option A) is the fallback for CVEs with no PoC.
-# NOTE: "intree" only RUNS once this project has a phase1.intree_test recipe
-# (OpenSSL ships `make test`, but the recipe isn't written yet) — until then the
-# harvested tests route to manual and ExploitDB is the effective source.
+# Reproducer priority (see aggregator_config.yaml for all modes).
+# INTREE-FIRST, uniform across the study projects (glibc/openssl/tcpdump): the
+# fix-commit regression test is the discriminating oracle (the phase1.intree_test
+# recipe below covers both the 1.0.x and 1.1.x/3.x test systems); ExploitDB is
+# the fallback for CVEs whose fix shipped no test. On the 2026-07 corpus the
+# order is provably inconsequential (no CVE has both sources curated).
 reproduction_strategy:
-  - exploitdb
   - intree
+  - exploitdb
 
 logging:
   level: "INFO"
@@ -139,7 +140,7 @@ poc_repair:
   provider: "openai"
   openai_model: "gpt-4.1-mini"
   openai_api_key: ""
-  api_endpoint: "http://10.3.2.171:80/api/chat"
+  api_endpoint: "http://10.3.1.226:80/api/chat"
   model: "devstral:32k"
   max_repair_attempts: 3
   models_by_attempt:
@@ -207,14 +208,15 @@ phase2:
   language: "c"
   system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for OpenSSL (the TLS/SSL and general-purpose cryptography library). Your task
-    is to fix a security vulnerability by making the SMALLEST POSSIBLE EDIT to the
+    for OpenSSL (the TLS/SSL and general-purpose cryptography library). The
+    vulnerability you must fix is {cwe}.
+    Your task is to fix it by making the SMALLEST POSSIBLE EDIT to the
     vulnerable function — never by rewriting it.
   feedback_system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for OpenSSL. Your previous patch attempt FAILED validation. Analyze the
-    failure and produce an improved fix as MINIMAL edits — never rewrite the whole
-    function.
+    for OpenSSL. Your previous patch attempt for {cve_id} — {cwe} —
+    FAILED validation. Analyze the failure and produce an improved fix as
+    MINIMAL edits — never rewrite the whole function.
   internal_headers: []
 
 # ---------------------------------------------------------------------------
@@ -419,8 +421,8 @@ phase1:
   # builds, run_script runs ONLY that test. Verdict: the test FAILS on the vulnerable
   # build = reproduced. Env available: SOURCE_DIR, BUILD_DIR, INSTALL_PREFIX,
   # TEST_SUBDIR, TEST_NAME, TEST_PATH, FIX_COMMIT, COMMIT_HASH.
-  # NOTE on coverage: with reproduction_strategy [exploitdb, intree], intree is only
-  # used for CVEs with NO ExploitDB PoC. Flip to [intree, exploitdb] to PREFER tests.
+  # NOTE on coverage: with reproduction_strategy [intree, exploitdb] the harvested
+  # test is the primary reproducer; ExploitDB only covers CVEs with no test.
   # OpenSSL's test system differs by era (1.0.x test/Makefile + test/*test binaries;
   # 1.1.x/3.x test/build.info + perl recipes) — both paths are attempted below.
   intree_test:
@@ -455,14 +457,14 @@ phase1:
       TBIN="$SOURCE_DIR/test/$TEST_NAME"
       if [ -x "$TBIN" ]; then
         echo "--- running test binary: test/$TEST_NAME ---"
-        timeout "${INTREE_TEST_TIMEOUT:-300}" "$TBIN" > /tmp/it.log 2>&1; rc=$?
+        timeout -k 10 "${INTREE_TEST_TIMEOUT:-300}" "$TBIN" > /tmp/it.log 2>&1; rc=$?
         tail -25 /tmp/it.log
         if [ "$rc" -eq 0 ]; then echo "SSD_TEST_RESULT=PASS"; exit 0; else echo "SSD_TEST_RESULT=FAIL"; exit 1; fi
       fi
       # Strategy 2: the perl harness (1.1.x/3.x). TEST_NAME may be the program name;
       # the recipe is usually test_<name> — try both. not-ok/FAILED ⇒ FAIL.
       echo "--- test binary not found; trying perl harness (make test) ---"
-      timeout "${INTREE_TEST_TIMEOUT:-600}" make test "TESTS=$TEST_NAME ${TEST_NAME#test_} test_${TEST_NAME}" > /tmp/mt.log 2>&1; rc=$?
+      timeout -k 10 "${INTREE_TEST_TIMEOUT:-600}" make test "TESTS=$TEST_NAME ${TEST_NAME#test_} test_${TEST_NAME}" > /tmp/mt.log 2>&1; rc=$?
       tail -30 /tmp/mt.log
       grep -qiE "^not ok|FAILED|ERROR IN" /tmp/mt.log && { echo "SSD_TEST_RESULT=FAIL"; exit 1; }
       [ "$rc" -eq 0 ] && { echo "SSD_TEST_RESULT=PASS"; exit 0; }

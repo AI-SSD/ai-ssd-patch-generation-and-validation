@@ -241,7 +241,7 @@ poc_repair:
   openai_api_key: ""
 
   # -- Ollama settings (used only when provider: "ollama") --
-  api_endpoint: "http://10.3.2.171:80/api/chat"
+  api_endpoint: "http://10.3.1.226:80/api/chat"
   model: "devstral:32k"
 
   # Maximum number of repair attempts per PoC before flagging for manual review
@@ -344,13 +344,14 @@ phase2:
   language: "c"
   system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for the Linux kernel. Your task is to fix a security vulnerability by making
-    the SMALLEST POSSIBLE EDIT to the vulnerable function — never by rewriting it.
+    for the Linux kernel. The vulnerability you must fix is {cwe}.
+    Your task is to fix it by making the SMALLEST POSSIBLE EDIT to the
+    vulnerable function — never by rewriting it.
   feedback_system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for the Linux kernel. Your previous patch attempt FAILED validation. Analyze
-    the failure and produce an improved fix as MINIMAL edits — never rewrite the
-    whole function.
+    for the Linux kernel. Your previous patch attempt for {cve_id} — {cwe} —
+    FAILED validation. Analyze the failure and produce an improved fix as
+    MINIMAL edits — never rewrite the whole function.
 
 # ---------------------------------------------------------------------------
 # Phase 3 (patch_validator.py) – SAST (static analysis) tooling

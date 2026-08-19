@@ -1143,6 +1143,20 @@ def _load_phase1_counts(path: str) -> Dict[str, int]:
     return counts
 
 
+def _attempt_sort_key(h: Dict[str, Any]) -> float:
+    """Ordering key for a validation-history entry's ``attempt``.
+
+    Attempts are ints (1, 2, 3, ...) for the greedy patch + serial retries, but the
+    best-of-N fan-out uses dotted string labels ("1.1", "1.2", ...). Parse as float
+    so both order correctly (retry 2 > candidate 1.3 > candidate 1.1 > greedy 1);
+    unparseable values sort first.
+    """
+    try:
+        return float(h.get("attempt") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _load_feedback_counts(path: str) -> Dict[str, int]:
     """Counts for the Iterative Feedback Loop card, from the cell's
     ``results/feedback_loop_results_*.json`` summary.
@@ -1167,8 +1181,11 @@ def _load_feedback_counts(path: str) -> Dict[str, int]:
         history = r.get("validation_history") or []
         if not history:
             continue
-        # Last entry = the final attempt (highest attempt index)
-        last = max(history, key=lambda h: int(h.get("attempt") or 0), default=None)
+        # Last entry = the final attempt (highest attempt number). The best-of-N
+        # fan-out labels its candidates "1.1", "1.2", ... (strings), so this must
+        # parse as float, not int — int("1.1") raised ValueError, which (being
+        # swallowed by the caller) collapsed the WHOLE feedback card to zeros.
+        last = max(history, key=_attempt_sort_key, default=None)
         if last is None:
             continue
         poc_blocked = bool(last.get("poc_blocked"))
@@ -1472,6 +1489,7 @@ def get_progress() -> Dict[str, Any]:
                                    "syntax_invalid": 0, "task_cves": 0,
                                    "funnel_reproduced": None,
                                    "skipped_no_function": None,
+                                   "skipped_contaminated": None,
                                    "done": 0, "running": False}
             try:
                 data = json.loads(open(r2_path).read())
@@ -1498,6 +1516,7 @@ def get_progress() -> Dict[str, Any]:
                 fn = data.get("funnel") or {}
                 cs2["funnel_reproduced"] = fn.get("phase1_reproduced")
                 cs2["skipped_no_function"] = fn.get("skipped_no_function_count")
+                cs2["skipped_contaminated"] = fn.get("skipped_contaminated_count")
             except Exception:
                 pass
             for k in ("total_tasks", "syntax_valid", "syntax_invalid"):
@@ -1657,6 +1676,7 @@ def get_progress() -> Dict[str, Any]:
                 stats.setdefault("task_cves", stats["total"])
                 stats.setdefault("funnel_reproduced", None)
                 stats.setdefault("skipped_no_function", None)
+                stats.setdefault("skipped_contaminated", None)
                 for k in ("syntax_valid", "syntax_invalid"):
                     stats.setdefault(k, 0)
             elif phase == 3:

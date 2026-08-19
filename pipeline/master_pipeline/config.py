@@ -226,11 +226,36 @@ def _apply_generation_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+def _apply_contamination_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Overlay contamination-filter knobs from the environment onto *cfg*.
+
+    Same profile/env-transport pattern as the LLM overlay:
+      SSD_CONTAMINATION_FILTER=1|0   -> contamination_filter.enabled
+      LLM_TRAINING_CUTOFF=YYYY-MM-DD -> contamination_filter.cutoff_override
+    Neither var set => a complete no-op (YAML behaves as before).
+    """
+    if not isinstance(cfg, dict):
+        return cfg
+    enabled = _env_bool_opt("SSD_CONTAMINATION_FILTER")
+    cutoff = _env("LLM_TRAINING_CUTOFF")
+    if enabled is None and cutoff is None:
+        return cfg
+    section = cfg.get("contamination_filter")
+    if not isinstance(section, dict):
+        section = {}
+        cfg["contamination_filter"] = section
+    if enabled is not None:
+        section["enabled"] = enabled
+    if cutoff is not None:
+        section["cutoff_override"] = cutoff
+    return cfg
+
+
 def load_pipeline_config(base_dir: Optional[Path] = None) -> Dict[str, Any]:
     """Load ``config.yaml`` from the pipeline root, with profile env overrides."""
     base = base_dir or BASE_DIR
-    return _apply_generation_env_overrides(
-        _apply_llm_env_overrides(_load_yaml(base / "config.yaml")))
+    return _apply_contamination_env_overrides(_apply_generation_env_overrides(
+        _apply_llm_env_overrides(_load_yaml(base / "config.yaml"))))
 
 
 # ---------------------------------------------------------------------------

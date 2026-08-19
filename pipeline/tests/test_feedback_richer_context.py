@@ -17,7 +17,12 @@ import types
 
 import pytest
 
-sys.modules.setdefault("pandas", types.ModuleType("pandas"))
+try:  # prefer the real pandas when installed (VM); stub it otherwise (dev hosts)
+    import pandas  # noqa: F401
+except ImportError:
+    _pd_stub = types.ModuleType("pandas")
+    _pd_stub.DataFrame = _pd_stub.Series = object  # annotation targets (eager on <3.14)
+    sys.modules["pandas"] = _pd_stub
 import patch_generator as pg  # noqa: E402
 
 ORIG_FN = "int f(int n){\n  char b[8];\n  memcpy(b, s, n);\n  return 0;\n}"

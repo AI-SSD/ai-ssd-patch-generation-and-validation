@@ -43,9 +43,13 @@ phase_timeouts:
                 # build; 1h only got ~halfway. This is a safety cap, not a target;
                 # cached images make re-runs much faster.
   2: 10800      # Phase 2: Patch generation (LLM API calls)
-  3: 28800      # Phase 3: Patch validation (Docker builds + PoC + SAST). 8h —
-                # glibc in-tree validation needs ~5 min/CVE for the incremental
-                # rebuild; 23 validated patches × 350s ≈ 2.2h, well within 8h.
+  3: 57600      # Phase 3: Patch validation (Docker builds + PoC + SAST). 16h —
+                # best-of-N (generation.num_candidates=4, now the default) does ~4×
+                # the validation builds, and a large project (tcpdump, 121 CVEs) can
+                # exceed the old 8h cap — especially when a host-global build
+                # semaphore (SSD_BUILD_SLOTS) serializes builds across concurrent
+                # cells. The idle watchdog (phase_idle_timeouts) still kills a true
+                # stall early, so this larger hard cap only covers healthy-but-long runs.
   4: 600        # Phase 4: Reporting
 
 # Per-phase INACTIVITY (idle) timeouts (seconds) — used by the executor's idle
@@ -70,9 +74,32 @@ phase_idle_timeouts:
   3: 2400       # Phase 3: cold incremental rebuild + PoC run between heartbeats
   4: 600        # Phase 4: reporting is fast and steadily writes to stdout
 
+# An in-tree test is a DETACHED container the phase waits on — silent from launch
+# to exit — so its whole container ceiling is one uninterrupted quiet stretch. For
+# projects whose ceiling exceeds the caps above (glibc: 2520s vs 2400s) the
+# watchdog would kill a healthy phase, so phases 1 and 3 raise their cap to
+# ceiling + this allowance (which covers the image build preceding the run).
+# Projects with no in-tree recipe keep the tight cap above, unchanged.
+intree_idle_build_allowance: 1800
+
 # Docker-level timeouts (seconds) – used inside individual phases
 build_timeout: 3600     # Docker image build timeout
 run_timeout: 300        # Container run / PoC execution timeout
+
+# In-tree (Option A) container ceiling. NOT run_timeout: an in-tree verdict is a
+# marker the project's own recipe PRINTS (SSD_TEST_RESULT=PASS|FAIL), and the
+# recipe bounds itself with `timeout` so even a hanging test reaches its final
+# echo — exit 124 becomes FAIL, which for an infinite-loop CVE (CWE-835) is the
+# reproduction. If the container ceiling fires first, the shell is killed before
+# printing anything and the hang is misfiled as an anonymous build/run error.
+# Under the old flat 300s ceiling EVERY project's recipe declared budgets at or
+# above it (glibc's cascade declares 320+320+320+1500), so the ceiling always
+# won. The ceiling is now derived per project as sum(recipe budgets) + margin,
+# clamped to [floor, cap] — see master_pipeline/intree.py. Phases 1 and 3 use the
+# identical number so the fail-to-pass oracle compares like with like.
+intree_container_floor: 600    # never go below this (Phase 3's historic budget)
+intree_timeout_margin: 60      # headroom above the recipe's own budgets
+intree_container_cap: 3600     # hard bound so a wedged container can't hold a slot
 
 # Phase 1 baseline determinism: a memory-bug PoC can exit non-deterministically
 # (ASLR / heap layout / timing), so a single run may record a flaky baseline
@@ -156,32 +183,91 @@ llm:
   # -------------------------------------------------------------------------
 
   # Ollama-compatible chat API endpoint
-  endpoint: "http://10.3.2.171:80/api/chat"
+  endpoint: "http://10.3.1.226:80/api/chat"
 
-  # Models to iterate through for patch generation
+  # Models to iterate through for patch generation. Fallback only — a profile's
+  # LLM_MODELS_BY_ATTEMPT overrides this. Kept SINGLE-model: the current
+  # campaign runs uniform profiles (one model per run) so the shared Ollama GPU
+  # never swaps model families mid-run (see profiles/README.md).
   models:
-    - "qwen2.5-coder:1.5b"
     - "qwen2.5-coder:7b"
-    - "qwen2.5:1.5b"
-    - "qwen2.5:7b"
 
   # Ollama context window (avoids silent 4096 truncation)
   num_ctx: 32768
 
-  # Host-global GPU mutex. Serializes GPU-bound inference (Phase 2 generation +
-  # the feedback loop) across concurrently-running cells so the single shared
-  # Ollama GPU is never thrashed by two model families at once — a flock on a
-  # host-global lock file, auto-released if a cell dies. NO-OP for provider:
-  # openai (no local GPU; the limit there is API rate, and those cells already
-  # run in parallel) and effectively free when only one cell runs (uncontended).
-  # This is the safety primitive that makes raising run_all.sh's OLLAMA_PARALLEL
-  # (and overlapping Phase 2 with another cell's Phase 3) safe. Override per-host
-  # with SSD_GPU_LOCK=0/1; lock dir via SSD_GPU_LOCK_DIR (defaults to
-  # $SSD_PIPELINE_ROOT/.locks).
+  # Host-global GPU semaphore. Bounds GPU-bound inference (Phase 2 generation +
+  # the feedback loop) across concurrently-running cells by the number of GPUs
+  # (gpu_slots below) so no single GPU is ever thrashed by two model families
+  # at once — flock'd slot files, auto-released if a cell dies. NO-OP for
+  # provider: openai (no local GPU; the limit there is API rate, and those
+  # cells already run in parallel) and effectively free when only one cell runs
+  # (uncontended). This is the safety primitive that makes raising run_all.sh's
+  # OLLAMA_PARALLEL (and overlapping Phase 2 with another cell's Phase 3) safe.
+  # Override per-host with SSD_GPU_LOCK=0/1; lock dir via SSD_GPU_LOCK_DIR
+  # (defaults to $SSD_PIPELINE_ROOT/.locks).
   gpu_lock: true
 
-  # Wait for GPU before generation (seconds, 0 = skip)
+  # How many GPUs the pipeline may use concurrently: the gpu_lock semaphore
+  # width, the residency budget (how many model families may stay loaded at
+  # once — one per GPU), and run_all.sh's Ollama generation-lane width. The
+  # 226 proxy server has 2x L40S. Detection ladder (cve_aggregator/utils/
+  # gpu_slots.py; first hit wins):
+  #   1. SSD_GPU_SLOTS env — run_all.sh probes once at run start and exports
+  #      this, so every cell of a run agrees on one number.
+  #   2. an integer here (e.g. 2) — the simple explicit choice.
+  #   3. "auto": gpu_probe_command output > local nvidia-smi (only when the
+  #      endpoint host is this machine) > 1 (single-GPU legacy).
+  # NOTE the Ollama SERVER must also allow it: on the GPU host set
+  # OLLAMA_MAX_LOADED_MODELS >= GPU count (modern Ollama defaults to 3x GPU
+  # count, so this usually already holds). Client-side slots cannot change
+  # server scheduling.
+  gpu_slots: "auto"
+
+  # Availability probe for a REMOTE GPU host (the Ollama HTTP API exposes no
+  # GPU inventory, so "auto" cannot see a remote server's GPUs without this).
+  # A shell command that prints either a bare integer (the slot count) or
+  # nvidia-smi CSV "memory.used, memory.total" (MiB) lines, e.g.:
+  #   ssh admin@10.3.1.226 nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits
+  # CSV mode counts a GPU as available unless a foreign workload already holds
+  # >= gpu_busy_memory_fraction of its memory (our own resident model — ~17%
+  # of an L40S for a 7B — never disqualifies a GPU). Empty = no probe.
+  gpu_probe_command: ""
+  gpu_busy_memory_fraction: 0.9
+
+  # Periodic re-detection timer. run_all.sh starts a background poller
+  # (cve_aggregator/utils/gpu_slots.py --watch) that re-runs the detection
+  # ladder every gpu_poll_interval seconds and publishes the count to
+  # $lockdir/gpu_slots.current, which every cell reads at GPU-acquisition time.
+  # So a GPU freed by a foreign workload is picked up WITHOUT restarting cells:
+  # the next poll raises the count and subsequent acquisitions use the extra
+  # GPU. The live file wins over the SSD_GPU_SLOTS env fallback; a poller that
+  # dies leaves a stale file that cells ignore after ~900s, reverting to env/
+  # config. Set to 0 to disable the poller (static count from the ladder).
+  gpu_poll_interval: 60
+
+  # GPU exclusivity gate (cve_aggregator/utils/gpu_monitor.py): only LOAD a
+  # model when the GPU is empty or already serving that same model, so a fresh
+  # load never lands beside another resident model and partially offloads to
+  # CPU. Enforced before Phase 2 generation + preload, Phase 0 repair, and the
+  # first Phase 1/3 negative-filter call. Works entirely over the Ollama HTTP
+  # API (/api/ps to inspect residency + size_vram; keep_alive:0 to unload) —
+  # no SSH to the GPU host required. Modes:
+  #   evict (default) — actively unload foreign resident models (leftovers from
+  #                     a previous cell's profile on this dedicated server)
+  #   wait            — only poll until they expire; never unloads anything
+  #   off             — legacy behaviour (no gate)
+  # Env override: SSD_GPU_EXCLUSIVE=evict|wait|off. Complements gpu_lock:
+  # the lock orders our requests, the gate controls what is resident in VRAM.
+  gpu_exclusive: "evict"
+
+  # Wait for GPU before generation (seconds, 0 = skip). Also bounds how long
+  # the exclusivity gate waits for foreign models to unload.
   gpu_wait_timeout: 120
+
+  # How long the Ollama server keeps OUR model resident after a request
+  # (Phase 2 preload/requests). Long enough to bridge per-CVE gaps, short
+  # enough that an idle leftover expires on its own between cells.
+  keep_alive: "15m"
 
   # Health check settings (used by master pipeline before Phase 2)
   health_check:
@@ -223,6 +309,122 @@ llm:
   # was truncated mid-function at 8192 → "unclosed braces" → syntax-invalid.
   # gpt-4.1-mini allows up to 16384 output tokens; this gives ~2x headroom.
   max_tokens: 16384       # Maximum tokens in response
+
+  # ---------------------------------------------------------------------------
+  # Per-model context windows (OpenAI provider), in TOTAL tokens (prompt+output).
+  # The OpenAI call path uses this to (a) skip a prompt that cannot fit the
+  # model's window — recorded as context_skip, exactly like the Ollama path —
+  # and (b) shrink the requested output budget so prompt+output never exceeds
+  # the window. Needed for legacy small-window models (gpt-4 = 8K, gpt-3.5 =
+  # 16K); modern models are far larger than any prompt this pipeline builds, so
+  # the cap never binds and their behaviour is unchanged.
+  # Lookup is by exact model id, then by longest matching prefix, then
+  # openai_default_context_window. Purely model-keyed: no per-CVE/per-project
+  # logic, so adding a model is a one-line config change.
+  #
+  # Some models additionally cap the COMPLETION independently of the window
+  # (gpt-3.5-turbo: 16K window but at most 4096 output tokens), so that cap is
+  # configured separately; the effective output budget is the minimum of
+  # max_tokens, this cap, and the room the prompt leaves in the window.
+  openai_default_context_window: 128000
+  model_context_windows:
+    "gpt-4": 8192               # gpt-4-0613 (legacy, Sep-2021 cutoff)
+    "gpt-4-0613": 8192
+    "gpt-4-32k": 32768
+    "gpt-3.5-turbo": 16385      # -0125 / -1106
+    "gpt-3.5-turbo-16k": 16385
+    "gpt-3.5-turbo-instruct": 4096
+    "gpt-4-turbo": 128000
+    "gpt-4o": 128000
+    "gpt-4o-mini": 128000
+    "gpt-4.1": 1047576
+    "gpt-5": 400000
+
+  # Hard per-model completion caps (tokens). Only models whose output cap is
+  # SMALLER than their window need an entry; anything absent is bounded by the
+  # window alone.
+  model_max_output_tokens:
+    "gpt-4": 4096
+    "gpt-4-0613": 4096
+    "gpt-3.5-turbo": 4096       # 16K window but max 4096 completion tokens
+    "gpt-3.5-turbo-16k": 4096
+    "gpt-3.5-turbo-instruct": 4096
+    "gpt-4-turbo": 4096
+    "gpt-4o": 16384
+    "gpt-4.1": 32768
+    "gpt-5": 128000
+
+# =============================================================================
+# Contamination filter (Phase 2 scope gate)
+# =============================================================================
+# When enabled, patch generation (and therefore Phases 3-4 and the feedback
+# loop, which only consume Phase 2's output) is restricted to CVEs whose NVD
+# publication date is STRICTLY AFTER the active model's training-data cutoff —
+# so the model cannot have seen the vulnerability, its advisory, or its fix
+# during training. Phases 0-1 are untouched (they use no generation LLM and
+# their baselines are shared across model profiles), so the full dataset and
+# reproduction baselines stay identical; only the set of CVEs the model is
+# asked to patch narrows.
+#
+# The effective cutoff is the LATEST (max) cutoff across the active profile's
+# model ramp (llm.models / feedback_loop.models_by_attempt). With the current
+# uniform single-model profiles that is simply that model's date; if a ramp is
+# ever reintroduced, the newest model's date governs — a CVE is only "clean"
+# if it postdates EVERY model that may touch it.
+#
+# Env overrides (profile/env transport, same pattern as LLM_*):
+#   SSD_CONTAMINATION_FILTER=1|0   -> enabled
+#   LLM_TRAINING_CUTOFF=YYYY-MM-DD -> explicit cutoff (skips the map lookup)
+#
+# With the filter enabled, a ramp model MISSING from model_cutoffs (and no
+# LLM_TRAINING_CUTOFF) aborts Phase 2 loudly — silently including possibly
+# contaminated CVEs would invalidate the study.
+# ENABLED 2026-08-05: contamination-controlled protocol is now the default —
+# every model is only asked to patch CVEs published strictly after its own
+# training cutoff. Disable per run with SSD_CONTAMINATION_FILTER=0 (profile
+# env) or by flipping this flag for a full-corpus campaign.
+contamination_filter:
+  enabled: true
+
+  # Optional explicit cutoff date (YYYY-MM-DD); wins over model_cutoffs.
+  # cutoff_override: "2024-09-30"
+
+  # Training-data cutoff per model (YYYY-MM-DD). Sources:
+  #  - Qwen2.5 / Qwen2.5-Coder: the model RELEASE date is used as a conservative
+  #    upper bound (training data cannot postdate release; the commonly cited
+  #    knowledge cutoff, Oct 2023, is earlier). Base family released 2024-09-19;
+  #    the coder 14b/32b sizes shipped in the 2024-11-12 wave.
+  #  - OpenAI: documented knowledge cutoffs (platform.openai.com model pages).
+  model_cutoffs:
+    "qwen2.5:1.5b": "2024-09-19"
+    "qwen2.5:7b": "2024-09-19"
+    "qwen2.5:14b": "2024-09-19"
+    "qwen2.5:32b": "2024-09-19"
+    "qwen2.5-coder:1.5b": "2024-09-19"
+    "qwen2.5-coder:7b": "2024-09-19"
+    "qwen2.5-coder:14b": "2024-11-12"
+    "qwen2.5-coder:32b": "2024-11-12"
+    # Legacy models: OpenAI documents a Sep-2021 knowledge cutoff for both.
+    # These are the ONLY still-available capable models predating the tcpdump
+    # corpus (see profiles/openai-gpt4.env). Shut down 2026-10-23.
+    "gpt-4": "2021-09-30"
+    "gpt-4-0613": "2021-09-30"
+    "gpt-3.5-turbo": "2021-09-30"
+    "gpt-3.5-turbo-0125": "2021-09-30"
+    "gpt-4.1": "2024-06-01"
+    "gpt-4.1-mini": "2024-06-01"
+    "gpt-4.1-nano": "2024-06-01"
+    "gpt-5": "2024-09-30"
+    "gpt-5-mini": "2024-05-31"
+    "gpt-5-nano": "2024-05-31"
+    "gpt-5.1": "2024-09-30"
+    # gpt-5.4-mini: documented knowledge cutoff 2025-08-31
+    # (developers.openai.com/api/docs/models/gpt-5.4-mini, checked 2026-08-05).
+    "gpt-5.4-mini": "2025-08-31"
+    # TODO(VERIFY): fill from OpenAI's model docs before enabling the filter on
+    # these profiles — the run ABORTS if an active model has no entry here.
+    # "gpt-5.2": ""
+    # "gpt-5.4": ""
 
 # =============================================================================
 # Phase 2: Candidate generation (over-generate-and-validate)
@@ -281,7 +483,10 @@ generation:
   # ablation runner flips these per variant via SSD_PROMPT_* env vars.
   prompt_components:
     include_poc: true          # inject the PoC exploit source (the exact attack)
-    include_cwe: true          # inject the CWE class + description
+    include_cwe: true          # inject the CWE class + description (both the user
+                               # prompt's WEAKNESS CLASS line and the system
+                               # prompt's {cwe} spear variables; false ⇒ the
+                               # spear variables render their neutral fallback)
     include_description: true  # inject the CVE description
     project_priming: true      # use the project's tailored system prompt;
                                # false ⇒ a generic security-engineer preamble

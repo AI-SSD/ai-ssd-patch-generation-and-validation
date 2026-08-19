@@ -43,7 +43,8 @@ pipeline:
 
 # PREFER the fix-commit test pcap (Option A) — it is the natural, discriminating
 # reproducer for tcpdump. ExploitDB is the fallback for CVEs whose fix shipped no
-# test (rare for the overread batch).
+# test (rare for the overread batch). INTREE-FIRST is uniform across the study
+# projects (glibc/openssl/tcpdump) as of 2026-08-02.
 reproduction_strategy:
   - intree
   - exploitdb
@@ -88,8 +89,10 @@ commit_discovery:
   repo_url: "https://github.com/the-tcpdump-group/tcpdump.git"
   repo_local_path: "../tcpdump"
   clone_timeout: 1200
-  # REQUIRED for the in-tree reproducer: harvest the test pcap the fix added.
-  harvest_regression_tests: true
+  # DEAD KNOB — superseded by the top-level reproduction_strategy ("intree" in
+  # the strategy is what enables test harvesting). Kept false for uniformity
+  # with glibc/openssl; the in-tree path stays fully active.
+  harvest_regression_tests: false
   # tcpdump's discriminating reproducer is a crafted CAPTURE FILE (data), not a
   # compilable C test — opt the harvester in to these data extensions (scoped to
   # files under a test/ dir). Empty for source-test projects (glibc/openssl), so
@@ -145,7 +148,7 @@ poc_repair:
   provider: "openai"
   openai_model: "gpt-4.1-mini"
   openai_api_key: ""
-  api_endpoint: "http://10.3.2.171:80/api/chat"
+  api_endpoint: "http://10.3.1.226:80/api/chat"
   model: "devstral:32k"
   max_repair_attempts: 3
   models_by_attempt:
@@ -209,22 +212,24 @@ output:
 # ---------------------------------------------------------------------------
 # Phase 2: LLM patch generation (C)
 # ---------------------------------------------------------------------------
+# The prompts are per-CVE templates: {cwe} expands to THIS CVE's weakness class
+# from the Phase 0 CSV (no hardcoded vulnerability type — the old "most tcpdump
+# bugs are buffer over-reads" framing mislabeled every non-over-read CVE).
+# ND_TCHECK stays as a conditional project idiom, not a presumed diagnosis.
 phase2:
   language: "c"
   system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for tcpdump (the command-line network packet analyzer). Most tcpdump
-    vulnerabilities are buffer over-reads in the protocol printers (print-*.c):
-    the code reads past the captured packet bounds. Fix the vulnerability by
-    making the SMALLEST POSSIBLE EDIT to the vulnerable function — typically a
-    bounds check (e.g. ND_TCHECK / length validation before dereferencing) —
-    never by rewriting it.
+    for tcpdump (the command-line network packet analyzer). The vulnerability
+    you must fix is {cwe}. Fix it by making the SMALLEST POSSIBLE EDIT to the
+    vulnerable function — when the weakness calls for a bounds/length check on
+    packet data, prefer tcpdump's own idioms (e.g. ND_TCHECK / length validation
+    before dereferencing) — never by rewriting the function.
   feedback_system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for tcpdump. Your previous patch attempt FAILED validation. Analyze the
-    failure and produce an improved fix as MINIMAL edits (usually a missing
-    bounds/length check before a packet-buffer dereference) — never rewrite the
-    whole function.
+    for tcpdump. Your previous patch attempt for {cve_id} — {cwe} — FAILED
+    validation. Analyze the failure and produce an improved fix as MINIMAL
+    edits — never rewrite the whole function.
   internal_headers: []
 
 # ---------------------------------------------------------------------------
@@ -473,7 +478,7 @@ phase1:
       FLAGS="$(grep -hE "(^|[[:space:]])$TEST_NAME([[:space:]]|\.)" "$SOURCE_DIR/tests/TESTLIST" 2>/dev/null | head -1 | awk '{$1="";$2="";$3="";sub(/^[ \t]+/,"");print}')"
       [ -z "$FLAGS" ] && FLAGS="-nn -v"
       echo "--- $TBIN $FLAGS -r $CAP ---"
-      timeout "${INTREE_TEST_TIMEOUT:-120}" "$TBIN" $FLAGS -r "$CAP" > /tmp/it.log 2>&1; rc=$?
+      timeout -k 10 "${INTREE_TEST_TIMEOUT:-120}" "$TBIN" $FLAGS -r "$CAP" > /tmp/it.log 2>&1; rc=$?
       tail -30 /tmp/it.log
       # REPRODUCTION SANITY GATE: a tcpdump CLI/BPF arg-parse failure ("syntax
       # error in filter expression", usage, invalid option) means our FLAGS were

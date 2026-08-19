@@ -145,7 +145,20 @@ python3 -m pytest tests/ -v
 pipeline/
 ├── pipeline.py                  # Entry point (wraps master_pipeline)
 ├── master_pipeline/             # Core orchestrator package (phases 0–4 coordination)
+│   ├── config.py                # Shared configuration loader
+│   ├── executor.py              # Phase executor with idle-watchdog
+│   ├── orchestrator.py          # Master orchestrator (phase sequencing + feedback loop)
+│   ├── feedback.py              # Feedback-loop context assembly
+│   ├── intree.py                # Container-timeout policy for in-tree regression tests
+│   ├── contamination.py         # Training-data contamination filter (Phase 2 scope gate)
+│   └── candidates.py            # Candidate fan-out framework (over-generate-and-validate)
 ├── cve_aggregator/              # Phase 0: Data aggregation package
+│   ├── modules/                 # Aggregator pipeline modules
+│   └── utils/                   # Shared utilities
+│       ├── build_lock.py        # Host-global build semaphore (flock-based)
+│       ├── gpu_lock.py          # Host-global GPU serialization (multi-slot semaphore)
+│       ├── gpu_monitor.py       # Remote Ollama GPU residency gate (evict/wait/off)
+│       └── gpu_slots.py         # Multi-GPU slot detection and live polling
 ├── orchestrator.py              # Phase 1: Docker env build + PoC execution
 ├── patch_generator.py           # Phase 2: LLM patch generation
 ├── patch_validator.py           # Phase 3: Patch validation
@@ -153,16 +166,25 @@ pipeline/
 ├── cleanup.py                   # Artifact cleanup utility
 ├── config.yaml                  # Pipeline configuration
 ├── requirements.txt             # Python dependencies
+├── profiles/                    # LLM model profiles (.env files)
+├── groundtruth/                 # Independent reproduction oracle (V−/V+ differential)
+│   ├── run_groundtruth.py       # Oracle harness
+│   ├── reconcile_gt.py          # Verdict reconciliation → confusion matrix
+│   └── inputs/                  # Per-project oracle inputs
 ├── setup/                       # Environment setup utilities
 │   ├── setup.sh                 # Environment setup
 │   ├── verify_setup.sh          # Setup verification
 │   └── fix_containerd.sh        # Docker/containerd recovery helper
+├── run_all.sh                   # Multi-project benchmark runner (pipelined sweep mode)
+├── run_project.sh               # Single-project tmux launcher
 ├── glibc/                       # Local glibc repository
 ├── exploit-database/            # Local ExploitDB clone
 ├── exploits/                    # PoC exploit files (approved from manual_supervision)
 ├── manual_supervision/          # PoC files pending manual review + .ok marker files
 ├── documentation/               # Reference data and methodology docs
 │   ├── file-function.csv        # Vulnerable function→file mapping (used by phases 2–3)
+│   ├── groundtruth-validation-methodology.md  # Ground-truth oracle methodology
+│   ├── groundtruth-validation-results.md      # Ground-truth validation results
 │   ├── module_descriptions.txt  # Phase 0 module descriptions
 │   ├── image.png                # Pipeline diagram image
 │   ├── methodology.xml          # CVE aggregator methodology diagram
@@ -179,6 +201,7 @@ pipeline/
 │   ├── manual_review_queue.json          # PoCs queued for manual review
 │   └── pipeline_run_*.json               # Per-run execution summaries
 ├── logs/                        # Pipeline log files
+├── tests/                       # Unit and integration tests
 └── deprecated/                  # Archived files not part of the active execution flow
     ├── glibc_cve_aggregator.py  # Empty; replaced by cve_aggregator/ package
     ├── llm-endpoint.py          # Standalone LLM test script
@@ -200,3 +223,8 @@ Key settings in `config.yaml` or CLI args:
 | `--run-timeout` | `300` | Container execution timeout |
 | `--dry-run` | `False` | Print plan without executing |
 | `--cleanup` | `False` | Remove containers after execution (images preserved) |
+| `contamination_filter.enabled` | `true` | Restrict Phase 2 to post-training-cutoff CVEs (env: `SSD_CONTAMINATION_FILTER=1\|0`) |
+| `llm.gpu_exclusive` | `evict` | GPU residency gate mode: `evict`, `wait`, or `off` (env: `SSD_GPU_EXCLUSIVE`) |
+| `llm.gpu_slots` | `auto` | Number of concurrent GPU slots (env: `SSD_GPU_SLOTS`) |
+| `SSD_BUILD_SLOTS` | *(unset)* | Cap concurrent Docker builds host-wide (env only; 0/unset = unbounded) |
+

@@ -42,13 +42,19 @@ from master_pipeline.config import (  # noqa: E402
 # Candidate fan-out framework (over-generate-and-validate). Pure/stdlib-only, no
 # circular import: candidates.py imports nothing from patch_generator.
 from master_pipeline.candidates import Recipe, Candidate  # noqa: E402
+from master_pipeline.contamination import (  # noqa: E402
+    ContaminationConfigError, resolve_cutoff, split_post_cutoff)
 
 # Structural-analysis view: blanks comment interiors and non-first
 # preprocessor branches while preserving offsets, so brace matching is not
 # corrupted by braces/apostrophes in comments (e.g. GNU-style `foo' quoting)
 # or by #if/#else groups that open the same brace in every branch.
 from cve_aggregator.utils.code_parser import _build_analysis_view  # noqa: E402
+from cve_aggregator.utils.cwe_lookup import get_cwe_description  # noqa: E402
 from cve_aggregator.utils.gpu_lock import gpu_lock  # noqa: E402
+from cve_aggregator.utils.gpu_slots import detect_gpu_slots, current_slots  # noqa: E402
+from cve_aggregator.utils.gpu_monitor import (  # noqa: E402
+    ensure_exclusive, resolve_mode)
 from cve_aggregator.utils.llm_compat import (  # noqa: E402
     is_openai_reasoning_model as _shared_is_openai_reasoning_model,
 )
@@ -77,7 +83,7 @@ PROMPT_PROJECT_PRIMING = bool(_pc.get("project_priming", True))
 LLM_PROVIDER = str(_llm.get("provider", "ollama")).lower()
 
 # Ollama-specific settings
-API_ENDPOINT = str(_llm.get("endpoint", "http://10.3.2.171:80/api/chat"))
+API_ENDPOINT = str(_llm.get("endpoint", "http://10.3.1.226:80/api/chat"))
 NUM_CTX = int(_llm.get("num_ctx", 32768))
 MODELS = [str(m) for m in _llm.get("models", [
     "qwen2.5-coder:1.5b", "qwen2.5-coder:7b", "qwen2.5:1.5b", "qwen2.5:7b"
@@ -117,11 +123,31 @@ FEEDBACK_MODELS_BY_ATTEMPT = {
 if LLM_PROVIDER == "openai" and FEEDBACK_MODELS_BY_ATTEMPT.get("1"):
     OPENAI_MODEL = FEEDBACK_MODELS_BY_ATTEMPT["1"]
 
-# Host-global GPU mutex: serialize GPU-bound inference across concurrent cells so
-# the single shared Ollama GPU isn't thrashed by two model families at once. No-op
-# for the OpenAI provider and uncontended (≈free) when only one cell runs. Disable
-# with llm.gpu_lock: false or SSD_GPU_LOCK=0.
+# Host-global GPU semaphore: bound GPU-bound inference across concurrent cells
+# by the number of GPUs, so no single GPU is thrashed by two model families at
+# once. No-op for the OpenAI provider and uncontended (≈free) when only one
+# cell runs. Disable with llm.gpu_lock: false or SSD_GPU_LOCK=0.
 GPU_LOCK_ENABLED = bool(_llm.get("gpu_lock", True))
+# GPU residency gate: only LOAD a model when a GPU is free for it (empty, or
+# already serving that same model) so a fresh load never partially offloads to
+# CPU beside another resident model. "evict" (default) actively unloads
+# leftover models from previous cells; "wait" only polls; "off" disables the
+# gate. Env override: SSD_GPU_EXCLUSIVE. Complements gpu_lock (request ordering).
+GPU_EXCLUSIVE_MODE = resolve_mode(_llm.get("gpu_exclusive"))
+# How many GPUs the pipeline may use concurrently (semaphore width + residency
+# budget). Import-time detection ladder: SSD_GPU_SLOTS env (exported once per
+# run by run_all.sh) > llm.gpu_slots int > llm.gpu_probe_command / local
+# nvidia-smi > 1 (legacy single-GPU). Only resolved for ollama — OpenAI has no
+# local GPU. This is the FALLBACK default; each GPU acquisition re-reads the
+# live poller value via _gpu_slots_now(), so a GPU freed mid-run is picked up.
+GPU_SLOTS = detect_gpu_slots(_llm, endpoint=API_ENDPOINT) if LLM_PROVIDER == "ollama" else 1
+
+
+def _gpu_slots_now() -> int:
+    """Current GPU slot count (live poller file > env > import-time GPU_SLOTS)."""
+    if LLM_PROVIDER != "ollama":
+        return 1
+    return current_slots(_llm, endpoint=API_ENDPOINT, default=GPU_SLOTS)
 
 # Shared request settings
 API_TIMEOUT = int(_llm.get("timeout", 600))
@@ -145,6 +171,15 @@ LLM_KEEP_ALIVE = str(_llm.get("keep_alive", "15m"))
 LLM_PRELOAD = bool(_llm.get("preload", True))
 LLM_PRELOAD_TIMEOUT = int(_llm.get("preload_timeout", 300))
 LLM_MAX_TOKENS = int(_llm.get("max_tokens", 8192))
+# Per-model context windows for the OpenAI provider (see config.yaml
+# llm.model_context_windows). Legacy small-window models (gpt-4 = 8K,
+# gpt-3.5-turbo = 16K) need prompt+output to be bounded; modern models are far
+# larger than any prompt built here, so the bound never binds for them.
+OPENAI_CONTEXT_WINDOWS = dict(_llm.get("model_context_windows") or {})
+OPENAI_DEFAULT_CONTEXT_WINDOW = int(_llm.get("openai_default_context_window", 128000))
+# Hard completion caps for models that cap output below their window
+# (gpt-3.5-turbo: 16K window, 4096 max completion).
+OPENAI_MAX_OUTPUT_TOKENS = dict(_llm.get("model_max_output_tokens") or {})
 
 # Paths
 CSV_PATH = BASE_DIR / str(_paths.get("csv_file", "documentation/file-function.csv"))
@@ -234,17 +269,26 @@ EDIT RULES:
 # The role preamble comes from config; the SEARCH/REPLACE format (the parser
 # contract) and the feedback tail stay in code so every project emits the edit
 # format Phase 2's extractor expects. glibc keeps its exact wording via its YAML.
+#
+# The preambles are per-CVE TEMPLATES ("spear prompts"): they may reference
+# {cve_id}, {cwe}, {cwe_id} or {cwe_name}, filled at generation time by
+# render_system_prompt() from the Phase 0 CSV's CWE/CWE_Description columns
+# (extracted from NVD during aggregation) — so the weakness class named in the
+# prompt is the one actually recorded for the CVE at hand, never a hardcoded
+# guess about the project's typical bug class. A CVE with no usable CWE renders
+# a neutral fallback so the sentence still reads.
 # ---------------------------------------------------------------------------
 _DEFAULT_SYSTEM_PREAMBLE = (
     "You are an expert security engineer specializing in fixing software "
-    "vulnerabilities. Your task is to fix a security vulnerability by making the "
-    "SMALLEST POSSIBLE EDIT to the vulnerable function — never by rewriting it."
+    "vulnerabilities. The vulnerability you must fix is {cwe}. Your task is to "
+    "fix it by making the SMALLEST POSSIBLE EDIT to the vulnerable function — "
+    "never by rewriting it."
 )
 _DEFAULT_FEEDBACK_PREAMBLE = (
     "You are an expert security engineer specializing in fixing software "
-    "vulnerabilities. Your previous patch attempt FAILED validation. Analyze the "
-    "failure and produce an improved fix as MINIMAL edits — never rewrite the "
-    "whole function."
+    "vulnerabilities. Your previous patch attempt for {cve_id} — {cwe} — FAILED "
+    "validation. Analyze the failure and produce an improved fix as MINIMAL "
+    "edits — never rewrite the whole function."
 )
 _FEEDBACK_TAIL = (
     "\n\nCarefully read the FAILURE ANALYSIS: if the PoC still works your fix was "
@@ -253,9 +297,84 @@ _FEEDBACK_TAIL = (
     "left alone)."
 )
 
+# ---------------------------------------------------------------------------
+# Spear-prompt template variables ({cve_id} / {cwe} / {cwe_id} / {cwe_name})
+# ---------------------------------------------------------------------------
+# Substitution is token-exact (only these four names), so any other brace pair
+# in a project's YAML prompt or in the SEARCH/REPLACE contract passes through
+# verbatim — this is deliberately NOT str.format().
+_PROMPT_VAR_RE = re.compile(r"\{(cve_id|cwe_id|cwe_name|cwe)\}")
+
+# NVD catch-all buckets carry no actionable weakness class for the prompt.
+_UNINFORMATIVE_CWES = {"nvd-cwe-other", "nvd-cwe-noinfo"}
+_CWE_COMBINED_FALLBACK = "an unclassified security weakness (no CWE recorded in NVD)"
+_CWE_ID_FALLBACK = "unclassified"
+_CWE_NAME_FALLBACK = "no CWE classification available"
+
+
+def _cwe_prompt_vars(cwe: Optional[str], cwe_description: Optional[str]) -> Dict[str, str]:
+    """Resolve the CWE template tokens from the Phase 0 CSV columns.
+
+    ``cwe`` is OutputGenerator's comma-joined ID list ("CWE-125,CWE-787");
+    ``cwe_description`` its "CWE-125: Out-of-bounds Read | ..." string. Names
+    come from the shared cwe_lookup table first, then from ``cwe_description``
+    (which may carry an NVD/MITRE-sourced name the static table lacks). NVD
+    catch-alls (NVD-CWE-Other/noinfo) are dropped; when nothing usable remains
+    — or the include_cwe ablation is off — the tokens render neutral fallbacks
+    so the surrounding sentence still reads.
+    """
+    raw = str(cwe or "").strip()
+    desc_raw = str(cwe_description or "").strip()
+    if raw.lower() in ("nan", "none"):
+        raw = ""
+    if desc_raw.lower() in ("nan", "none"):
+        desc_raw = ""
+
+    ids = [c.strip() for c in raw.split(",") if c.strip()]
+    ids = [c for c in ids if c.lower() not in _UNINFORMATIVE_CWES]
+    if not PROMPT_INCLUDE_CWE:
+        ids = []
+
+    if not ids:
+        return {"cwe": _CWE_COMBINED_FALLBACK, "cwe_id": _CWE_ID_FALLBACK,
+                "cwe_name": _CWE_NAME_FALLBACK}
+
+    names: Dict[str, str] = {}
+    for cid in ids:
+        name = get_cwe_description(cid)
+        if not name:
+            m = re.search(re.escape(cid) + r"\s*:\s*([^|]+)", desc_raw)
+            name = m.group(1).strip() if m else ""
+        names[cid] = name
+
+    combined = ", ".join(f"{cid} ({names[cid]})" if names[cid] else cid for cid in ids)
+    name_parts = [names[cid] for cid in ids if names[cid]]
+    return {
+        "cwe": combined,
+        "cwe_id": ", ".join(ids),
+        "cwe_name": "; ".join(name_parts) if name_parts else _CWE_NAME_FALLBACK,
+    }
+
+
+def render_system_prompt(template: str, cve_id: str = "",
+                         cwe: Optional[str] = None,
+                         cwe_description: Optional[str] = None) -> str:
+    """Fill a system-prompt template's spear variables for one CVE.
+
+    A template without variables is returned unchanged, so projects that keep a
+    static prompt are unaffected. Called with no CVE/CWE arguments it renders
+    the neutral fallbacks — the safety net for any path that reaches the LLM
+    without per-CVE data (no raw ``{cwe}`` token ever leaves the process).
+    """
+    tokens = _cwe_prompt_vars(cwe, cwe_description)
+    tokens["cve_id"] = (cve_id or "").strip() or "this CVE"
+    return _PROMPT_VAR_RE.sub(lambda m: tokens[m.group(1)], template)
+
+
 # Populated by _apply_phase2() at import (and re-applied in main() once the
 # active --phase0-config is known). Module globals so functions read the current
-# value at call time.
+# value at call time. These hold the assembled TEMPLATES; the per-CVE call
+# sites pass them through render_system_prompt() before the LLM sees them.
 SYSTEM_PROMPT = ""
 FEEDBACK_SYSTEM_PROMPT = ""
 PATCH_LANGUAGE = "c"
@@ -771,45 +890,19 @@ def wait_for_gpu(model: Optional[str] = None, timeout: Optional[int] = None,
     if LLM_PROVIDER == "openai":
         return True  # No GPU to wait for when using OpenAI
 
-    from urllib.parse import urlparse, urlunparse
-
     if timeout is None:
         timeout = GPU_WAIT_TIMEOUT
     if timeout <= 0:
         return True  # wait disabled via config (shared backend manages its own VRAM)
 
-    parsed = urlparse(API_ENDPOINT)
-    ps_url = urlunparse((parsed.scheme, parsed.netloc, "/api/ps", "", "", ""))
-    start = time.time()
-
-    while True:
-        try:
-            resp = requests.get(ps_url, timeout=10, auth=OLLAMA_AUTH)
-            resp.raise_for_status()
-            running = resp.json().get("models", [])
-            total_vram = sum(e.get("size_vram", 0) for e in running)
-            if not running or total_vram == 0:
-                return True
-            # Our target model is already loaded → it will serve immediately; a
-            # busy GPU only matters when it is occupied by OTHER models and ours
-            # is not resident (then we wait for ollama to load/evict).
-            if model and any(e.get("name") == model or e.get("model") == model
-                             for e in running):
-                return True
-        except Exception:
-            return True  # can't reach /api/ps — assume available
-
-        elapsed = time.time() - start
-        if timeout and elapsed >= timeout:
-            return False
-
-        names = [e.get("name", "?") for e in running]
-        vram_gib = total_vram / (1024 ** 3)
-        logger.info(
-            "GPU busy (%.1f GiB VRAM used by %s) — waiting (%d/%d s) …",
-            vram_gib, ", ".join(names), int(elapsed), timeout,
-        )
-        time.sleep(poll_interval)
+    # Delegate to the exclusivity gate: empty-or-ours passes immediately; in
+    # "evict" mode (default) foreign resident models — leftovers from a previous
+    # cell's profile — are actively unloaded so OUR load never lands beside them
+    # and partially offloads to CPU. "wait" preserves the old passive behaviour.
+    return ensure_exclusive(API_ENDPOINT, auth=OLLAMA_AUTH, model=model,
+                            mode=GPU_EXCLUSIVE_MODE, timeout=timeout,
+                            poll_interval=poll_interval, log=logger,
+                            slots=_gpu_slots_now())
 
 
 def _preload_ollama_model(model: str, timeout: Optional[int] = None,
@@ -830,6 +923,11 @@ def _preload_ollama_model(model: str, timeout: Optional[int] = None,
     parsed = urlparse(API_ENDPOINT)
     ps_url = urlunparse((parsed.scheme, parsed.netloc, "/api/ps", "", "", ""))
     gen_url = urlunparse((parsed.scheme, parsed.netloc, "/api/generate", "", "", ""))
+    # Gate the LOAD itself: never trigger it while a foreign model is resident,
+    # or Ollama may place our weights partially on CPU for the whole burst.
+    ensure_exclusive(API_ENDPOINT, auth=OLLAMA_AUTH, model=model,
+                     mode=GPU_EXCLUSIVE_MODE, timeout=GPU_WAIT_TIMEOUT,
+                     log=logger, slots=_gpu_slots_now())
     logger.info("Pre-loading Ollama model '%s' into VRAM …", model)
 
     def _trigger():
@@ -1100,22 +1198,94 @@ def _is_openai_reasoning_model(model: str) -> bool:
     return _shared_is_openai_reasoning_model(model)
 
 
-def _openai_sampling_kwargs(model: str, temperature: Optional[float] = None) -> Dict[str, Any]:
+def _lookup_by_model_prefix(table: Dict[str, Any], model: str) -> Optional[int]:
+    """Exact model-id hit, else the longest matching prefix, else None.
+
+    Prefix matching lets one entry cover a family's dated snapshots
+    (``gpt-4o`` covers ``gpt-4o-2024-08-06``; ``gpt-5`` covers ``gpt-5.4-mini``).
+    """
+    m = (model or "").lower()
+    if m in table:
+        return int(table[m])
+    best = ""
+    for key in table:
+        k = str(key).lower()
+        if m.startswith(k) and len(k) > len(best):
+            best = k
+    return int(table[best]) if best else None
+
+
+def _openai_model_max_ctx(model: str) -> int:
+    """Total context window (prompt+output tokens) for an OpenAI *model*."""
+    hit = _lookup_by_model_prefix(OPENAI_CONTEXT_WINDOWS, model)
+    return hit if hit is not None else OPENAI_DEFAULT_CONTEXT_WINDOW
+
+
+def _openai_model_max_output(model: str) -> Optional[int]:
+    """Hard completion cap for *model*, or None when only the window bounds it."""
+    return _lookup_by_model_prefix(OPENAI_MAX_OUTPUT_TOKENS, model)
+
+
+_TOKENIZER_CACHE: Dict[str, Any] = {}
+
+
+def _estimate_prompt_tokens(*texts: str, model: str = "") -> int:
+    """Prompt-token count for the context guard: exact when possible.
+
+    Uses ``tiktoken`` (optional dependency) for an EXACT count when installed,
+    which matters because a character heuristic is badly calibrated across
+    content types: dense C source tokenises near 2 chars/token while prose runs
+    near 4, so one divisor either under-counts (request 400s with
+    ``context_length_exceeded``) or over-counts (usable prompts skipped).
+    Falls back to a deliberately conservative 2.5 chars/token when tiktoken is
+    unavailable. A fixed slack covers per-message framing overhead.
+    """
+    chars = sum(len(t or "") for t in texts)
+    key = model or "cl100k_base"
+    if key not in _TOKENIZER_CACHE:
+        try:
+            import tiktoken
+            try:
+                _TOKENIZER_CACHE[key] = tiktoken.encoding_for_model(model) if model \
+                    else tiktoken.get_encoding("cl100k_base")
+            except KeyError:      # unknown/newer model id → the modern default
+                _TOKENIZER_CACHE[key] = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _TOKENIZER_CACHE[key] = None
+    enc = _TOKENIZER_CACHE[key]
+    if enc is not None:
+        try:
+            return sum(len(enc.encode(t or "")) for t in texts) + 64
+        except Exception:
+            pass
+    return int(chars / 2.5) + 256
+
+
+def _openai_sampling_kwargs(model: str, temperature: Optional[float] = None,
+                            max_output: Optional[int] = None) -> Dict[str, Any]:
     """Return model-appropriate token/temperature kwargs for the chat call.
 
     *temperature* overrides the configured ``LLM_TEMPERATURE`` for this single
     call (used by the candidate fan-out to sample diverse candidates at different
     temperatures); ``None`` keeps the configured default — so existing callers
     are unchanged.
+
+    *max_output* (when set) is the room the prompt leaves inside the model's
+    context window; the output budget is clamped to it so prompt+output cannot
+    exceed the window. ``None`` keeps the configured budget unclamped.
     """
     if _is_openai_reasoning_model(model):
         # Reasoning models bill reasoning tokens against the completion budget,
         # so give them headroom (8k can be fully consumed by reasoning, leaving
         # empty content). Temperature is omitted (only the default is allowed),
         # so a per-candidate override does not apply to these models.
-        return {"max_completion_tokens": max(LLM_MAX_TOKENS, 16384)}
+        budget = max(LLM_MAX_TOKENS, 16384)
+        if max_output is not None:
+            budget = min(budget, max_output)
+        return {"max_completion_tokens": budget}
     temp = LLM_TEMPERATURE if temperature is None else float(temperature)
-    return {"max_tokens": LLM_MAX_TOKENS, "temperature": temp}
+    budget = LLM_MAX_TOKENS if max_output is None else min(LLM_MAX_TOKENS, max_output)
+    return {"max_tokens": budget, "temperature": temp}
 
 
 def _call_openai_api(model: str, user_prompt: str, system_prompt: str,
@@ -1152,9 +1322,36 @@ def _call_openai_api(model: str, user_prompt: str, system_prompt: str,
         "error": None
     }
 
+    # --- Context-fit guard (mirrors the Ollama path) -------------------------
+    # Legacy small-window models (gpt-4 = 8K, gpt-3.5-turbo = 16K) cannot hold
+    # every prompt this pipeline builds. Skip what cannot fit — flagged as
+    # context_skip so the ramp advances, exactly like the Ollama path — and
+    # clamp the output budget so prompt+output stays inside the window. For
+    # modern large-window models neither branch binds, so behaviour is unchanged.
+    model_max = _openai_model_max_ctx(model)
+    est_prompt_tokens = _estimate_prompt_tokens(system_prompt, user_prompt, model=model)
+    metadata["est_prompt_tokens"] = est_prompt_tokens
+    metadata["model_max_ctx"] = model_max
+    if est_prompt_tokens > model_max - _MIN_OUTPUT_HEADROOM:
+        reason = (f"context_exceeds_model_window: prompt ~{est_prompt_tokens} tokens "
+                  f"exceeds the usable context window (model '{model}' max {model_max})")
+        logger.error(
+            "Model '%s' SKIPPED — prompt (~%d tokens) exceeds its context window "
+            "(%d tokens); advancing to the next model in the ramp.",
+            model, est_prompt_tokens, model_max)
+        metadata["error"] = reason
+        metadata["context_skip"] = True
+        metadata["timestamp_end"] = datetime.now().isoformat()
+        return None, metadata
+
     # Token/temperature contract differs between classic and reasoning models.
     # Start from the name-based guess; the loop below adapts if the API rejects it.
-    sampling = _openai_sampling_kwargs(model, temperature)
+    output_room = max(256, model_max - est_prompt_tokens)
+    hard_cap = _openai_model_max_output(model)
+    if hard_cap is not None:
+        output_room = min(output_room, hard_cap)
+    metadata["output_budget"] = output_room
+    sampling = _openai_sampling_kwargs(model, temperature, max_output=output_room)
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -1194,12 +1391,29 @@ def _call_openai_api(model: str, user_prompt: str, system_prompt: str,
             # heuristic missed), swap to the other contract and retry without
             # consuming the delay. Covers both directions.
             msg = str(e).lower()
+            # The character-based prompt estimate can still under-count for
+            # dense C source (short identifiers/operators tokenise below the
+            # assumed chars-per-token). Rather than burning the CVE, shrink the
+            # output budget by the overshoot the API reports and retry; the
+            # patch itself is small, so a reduced budget is nearly always enough.
+            if "context_length" in msg or "maximum context length" in msg:
+                key = ("max_completion_tokens" if "max_completion_tokens" in sampling
+                       else "max_tokens")
+                shrunk = max(512, int(sampling.get(key, LLM_MAX_TOKENS) * 0.5))
+                if shrunk < sampling.get(key, 0):
+                    logger.info(
+                        "Model %s: prompt+output exceeded the context window — "
+                        "halving the output budget to %d and retrying.", model, shrunk)
+                    sampling[key] = shrunk
+                    metadata["output_budget"] = shrunk
+                    continue
             if "max_completion_tokens" in msg and "max_tokens" in sampling:
                 logger.info(
                     f"Model {model} requires max_completion_tokens — switching "
                     f"parameter contract and retrying."
                 )
-                sampling = {"max_completion_tokens": max(LLM_MAX_TOKENS, 16384)}
+                sampling = {"max_completion_tokens": min(max(LLM_MAX_TOKENS, 16384),
+                                                         output_room)}
                 continue
             if (("'temperature'" in msg or "unsupported value: 'temperature'" in msg
                  or "temperature" in msg and "unsupported" in msg)
@@ -1213,7 +1427,7 @@ def _call_openai_api(model: str, user_prompt: str, system_prompt: str,
                 logger.info(
                     f"Model {model} requires max_tokens — switching parameter contract."
                 )
-                sampling = {"max_tokens": LLM_MAX_TOKENS,
+                sampling = {"max_tokens": min(LLM_MAX_TOKENS, output_room),
                             "temperature": LLM_TEMPERATURE if temperature is None else float(temperature)}
                 continue
         if attempt < MAX_RETRIES - 1:
@@ -1254,8 +1468,10 @@ def call_llm_api(model: str, user_prompt: str, system_prompt: Optional[str] = No
     """
     # Resolve the default at CALL time so a project-specific prompt applied after
     # import (main() re-applies phase2 once --phase0-config is known) is honored.
+    # Rendering with no arguments fills any spear variables with their neutral
+    # fallbacks — no raw {cwe} token ever reaches the model.
     if system_prompt is None:
-        system_prompt = SYSTEM_PROMPT
+        system_prompt = render_system_prompt(SYSTEM_PROMPT)
     # Hold the host-global GPU mutex for the duration of this inference so a
     # concurrent cell's GPU work can't thrash the shared model. No-op for OpenAI
     # and uncontended when a single cell runs. Per-call here is safe: Phase 2 and
@@ -1263,7 +1479,7 @@ def call_llm_api(model: str, user_prompt: str, system_prompt: Optional[str] = No
     # threads), and releasing between calls lets other GPU tasks interleave.
     _used_model = (model_override or OPENAI_MODEL) if LLM_PROVIDER == "openai" else (model_override or model)
     with gpu_lock(LLM_PROVIDER, enabled=GPU_LOCK_ENABLED, endpoint=API_ENDPOINT,
-                  logger=logger, label=f"phase2:{_used_model}"):
+                  slots=_gpu_slots_now(), logger=logger, label=f"phase2:{_used_model}"):
         if LLM_PROVIDER == "openai":
             return _call_openai_api(model_override or OPENAI_MODEL, user_prompt,
                                     system_prompt, temperature=temperature)
@@ -2186,7 +2402,7 @@ def _family_ramp_from(start_model: str) -> List[str]:
 
 
 def _generate_with_family_fallback(
-    prompt: str, start_model: str
+    prompt: str, start_model: str, system_prompt: Optional[str] = None
 ) -> Tuple[Optional[str], Dict[str, Any], str]:
     """Phase-2 generation with family-ramp fallback on context overflow.
 
@@ -2204,7 +2420,7 @@ def _generate_with_family_fallback(
     used_model = start_model
     for candidate in ramp:
         used_model = candidate
-        raw_response, metadata = call_llm_api(candidate, prompt)
+        raw_response, metadata = call_llm_api(candidate, prompt, system_prompt=system_prompt)
         if raw_response is None and metadata.get("context_skip") and candidate != ramp[-1]:
             logger.warning(
                 "Phase 2: model '%s' cannot fit the prompt in its context window — "
@@ -2255,11 +2471,20 @@ def process_single_vulnerability(
     prompt = create_patch_prompt(cve_id, function_name, vulnerable_code,
                                  file_context, vuln_context)
 
+    # Render the per-CVE spear system prompt: the {cwe}/{cve_id} template
+    # variables are filled from this row's Phase 0 CWE columns.
+    system_prompt = render_system_prompt(
+        SYSTEM_PROMPT, cve_id,
+        cwe=str(row.get("CWE", "") or ""),
+        cwe_description=str(row.get("CWE_Description", "") or ""),
+    )
+
     # Call the LLM, starting with the first model of the family and falling
     # through to the next model on a context-window overflow (ollama only; a
     # no-op for OpenAI, which ignores the per-call model). The model that
     # actually handled it is what we record for this CVE.
-    raw_response, metadata, model = _generate_with_family_fallback(prompt, model)
+    raw_response, metadata, model = _generate_with_family_fallback(
+        prompt, model, system_prompt=system_prompt)
     result["model"] = model
 
     if raw_response is None:
@@ -2395,6 +2620,9 @@ def generate_one_candidate(row: Any, model: str, recipe: Recipe) -> Candidate:
 
     raw_response, metadata = call_llm_api(
         model, prompt,
+        system_prompt=render_system_prompt(
+            SYSTEM_PROMPT, cve_id,
+            cwe=_get("CWE"), cwe_description=_get("CWE_Description")),
         model_override=recipe.model,
         temperature=recipe.temperature,
     )
@@ -2451,7 +2679,10 @@ def generate_patch_with_feedback(
     prior_attempts: Optional[List[Dict[str, Any]]] = None,
     include_diff: bool = False,
     include_history: bool = False,
-    reflexion: bool = False
+    reflexion: bool = False,
+    description: str = "",
+    cwe: str = "",
+    cwe_description: str = ""
 ) -> Dict[str, Any]:
     """
     Generate a new patch using failure feedback from Phase 3 validation.
@@ -2473,6 +2704,11 @@ def generate_patch_with_feedback(
         output_dir: Optional custom output directory
         generation_model: Explicit model id for this attempt (per-attempt
             escalation from feedback_loop.models_by_attempt). None = provider default.
+        description: CVE description from the Phase 0 CSV (feedback loop passes
+            it so retries carry the same vulnerability context as attempt 1)
+        cwe: comma-joined CWE IDs from the Phase 0 CSV (``CWE`` column); fills
+            the spear-prompt template variables and the WEAKNESS CLASS line
+        cwe_description: the CSV's ``CWE_Description`` column
 
     Returns:
         Dictionary with processing results including:
@@ -2511,10 +2747,12 @@ def generate_patch_with_feedback(
         "is_retry": True
     }
     
-    # Create feedback-enhanced prompt (PoC source so the model sees the
-    # exact attack it failed to stop; description comes from the CSV when
-    # invoked through Phase 2, or is omitted in feedback-only invocations)
-    vuln_context = _build_vulnerability_context(cve_id)
+    # Create feedback-enhanced prompt (PoC source so the model sees the exact
+    # attack it failed to stop; description/CWE come from the Phase 0 CSV row —
+    # the feedback loop passes them so retries keep the per-CVE weakness
+    # framing; legacy callers that omit them just lose those sections)
+    vuln_context = _build_vulnerability_context(
+        cve_id, description=description, cwe=cwe, cwe_description=cwe_description)
     prompt = create_feedback_prompt(
         cve_id=cve_id,
         function_name=function_name,
@@ -2530,9 +2768,12 @@ def generate_patch_with_feedback(
         reflexion=reflexion
     )
     
-    # Call LLM API with feedback system prompt (escalated model when configured)
+    # Call LLM API with the per-CVE rendered feedback system prompt (escalated
+    # model when configured)
     raw_response, metadata = call_llm_api(
-        model, prompt, system_prompt=FEEDBACK_SYSTEM_PROMPT,
+        model, prompt,
+        system_prompt=render_system_prompt(
+            FEEDBACK_SYSTEM_PROMPT, cve_id, cwe=cwe, cwe_description=cwe_description),
         model_override=generation_model,
     )
 
@@ -2717,6 +2958,35 @@ def run_pipeline(
     else:
         logger.warning(f"No Phase 1 manifest at {manifest_path} — proceeding with all CVEs")
 
+    # Contamination filter: with contamination_filter.enabled on, only CVEs
+    # published STRICTLY AFTER the active model's training-data cutoff are
+    # patched (the model cannot have seen the vulnerability or its fix during
+    # training). Applied here — after the reproduced gate, before funnel
+    # bookkeeping — so Phases 3-4 and the feedback loop inherit the narrowed
+    # set automatically. A misconfigured cutoff (unknown model) aborts loudly:
+    # silently including contaminated CVEs would invalidate the study.
+    contam_skipped: List[str] = []
+    try:
+        contam_cutoff, contam_source = resolve_cutoff(_cfg)
+    except ContaminationConfigError as exc:
+        logger.error(f"Contamination filter misconfigured — aborting Phase 2: {exc}")
+        raise
+    if contam_cutoff is not None:
+        _pub_by_cve: Dict[str, Any] = {}
+        for _, _row in df.iterrows():
+            _cid = str(_row['CVE']).upper()
+            if _cid not in _pub_by_cve:
+                _pub_by_cve[_cid] = _row.get('CVE_Published', '') if 'CVE_Published' in df.columns else ''
+        _kept, contam_skipped = split_post_cutoff(
+            _pub_by_cve, contam_cutoff, results_dir=manifest_path.parent, log=logger)
+        df = df[df['CVE'].str.upper().isin(set(_kept))]
+        logger.info(
+            f"Contamination filter ON (cutoff {contam_cutoff.isoformat()} from "
+            f"{contam_source}): {len(_kept)} CVE(s) published after the cutoff "
+            f"proceed to generation; {len(contam_skipped)} excluded")
+        if contam_skipped:
+            logger.info(f"Excluded as pre-cutoff/contaminated: {contam_skipped}")
+
     # Funnel bookkeeping (persisted so the dashboard reconciles Phase 1 → Phase 2
     # from the artifact instead of inferring it): CVEs Phase 1 reproduced but
     # skipped here for having no extractable vulnerable function (empty
@@ -2731,7 +3001,7 @@ def run_pipeline(
         # reproduced CVEs outside the filter would be mislabeled "no function".
         if cve_filter:
             _repro_up &= {str(c).upper() for c in cve_filter}
-        skipped_no_function = sorted(_repro_up - _df_cves)
+        skipped_no_function = sorted(_repro_up - _df_cves - set(contam_skipped))
         phase1_reproduced = len(_repro_up)
     else:
         skipped_no_function = []
@@ -2741,6 +3011,11 @@ def run_pipeline(
         "patch_cves": len(_df_cves),
         "skipped_no_function": skipped_no_function,
         "skipped_no_function_count": len(skipped_no_function),
+        "contamination_enabled": contam_cutoff is not None,
+        "contamination_cutoff": contam_cutoff.isoformat() if contam_cutoff else None,
+        "contamination_cutoff_source": contam_source if contam_cutoff else None,
+        "skipped_contaminated": contam_skipped,
+        "skipped_contaminated_count": len(contam_skipped),
     }
 
     if len(df) == 0:
@@ -2750,7 +3025,10 @@ def run_pipeline(
         # so exit cleanly and let Phases 3/4 run on an empty set — a red ❌ here
         # would wrongly fail the whole pipeline over "nothing to do".
         logger.warning("No CVEs eligible for patch generation (none reproduced in "
-                       "Phase 1 / no extracted function) — nothing to patch; exiting cleanly")
+                       "Phase 1 / no extracted function"
+                       + (" / all pre-cutoff under the contamination filter"
+                          if contam_cutoff is not None else "")
+                       + ") — nothing to patch; exiting cleanly")
         # Write a fresh ZEROED summary so the execution-summary table reads 0/0
         # for THIS run — otherwise a stale pipeline_summary.json (e.g. a previous
         # project's run in a shared base-dir) would be read and show a bogus count.

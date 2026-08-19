@@ -7,10 +7,12 @@
 #   Stage 2  OpenAI sweep      : Phase 2/3/4 for the OpenAI profiles, in parallel
 #                                (cloud inference → light VM load), capped
 #   Stage 3  Ollama sweep      : two-lane pipeline for the Ollama profiles:
-#                                Phase 2 generation feeds a Phase 3/4 validation
-#                                lane so validation can overlap the next cell's
-#                                generation. GPU-bound inference still serializes
-#                                safely via the host-global gpu_lock.
+#                                N Phase-2 generation lanes (N = detected GPU
+#                                count, one model family per GPU) feed a Phase
+#                                3/4 validation lane so validation overlaps the
+#                                next cells' generation. GPU-bound inference is
+#                                bounded safely by the host-global gpu_lock
+#                                semaphore (SSD_GPU_SLOTS slots).
 #
 # Tracking: runs/<run_id>/ holds orchestrator.log (global), logs/<cell>.log (per
 # project×profile), cells/<cell>.state (machine-readable status for the dashboard).
@@ -23,12 +25,17 @@
 #
 # Knobs (env vars, all optional):
 #   PROJECTS="glibc tcpdump openssl"
-#   OPENAI_PROFILES="openai-fast openai-mix openai-high openai-codex"
-#   OLLAMA_PROFILES="ollama-proxy-qwen-coder ollama-proxy-deepseek ollama-proxy-devstral ollama-proxy-frontier-coder"
+#   OPENAI_PROFILES="openai-gpt5-mini openai-gpt54-mini"
+#   OLLAMA_PROFILES="ollama-proxy-qwen-7b ollama-proxy-qwen-32b ollama-proxy-qwen-coder-7b ollama-proxy-qwen-coder-32b"
 #   BASELINE_PROFILE=openai-fast     # builds Phase 0/1 once; all profiles reuse it
 #   MAX_PARALLEL=3                   # OpenAI-sweep concurrency (VM cores/RAM)
-#   OLLAMA_PARALLEL=1                # Phase-2 generation lane width (currently 1)
+#   OLLAMA_PARALLEL=auto             # Phase-2 generation lane width; "auto" =
+#                                    # detected GPU count (SSD_GPU_SLOTS), so a
+#                                    # 2-GPU server generates 2 cells at once
 #   OLLAMA_VALIDATE_PARALLEL=1       # Phase-3/4 validation lane width
+#   SSD_GPU_SLOTS=2                  # pin the GPU count (skips the probe)
+#   RESUME_DONE_FROM=runs/<id>       # skip cells already DONE in that run dir
+#                                    # (resume a run — do only the pending cells)
 #   SWEEP_PHASES="2 3 4"  BASELINE_PHASES="0 1"
 #   NTFY_TOPIC / NTFY_SERVER / SLACK_WEBHOOK / DISCORD_WEBHOOK  (notifications)
 #     ntfy also auto-reads config.yaml's `notifications:` block (ntfy_url /
@@ -40,17 +47,20 @@ PIPELINE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PIPELINE_ROOT"
 
 # ---- configuration -------------------------------------------------------
-# Focused profile set (current campaign). Full set kept here for reference:
+# Focused profile set (current campaign): UNIFORM single-model profiles — the
+# same model on all 4 attempts, so the shared Ollama GPU never has to swap
+# model families mid-run (ramped profiles caused evict/reload thrashing).
+# Ramped set kept here for reference:
 #   openai: openai-fast openai-mix openai-high openai-codex
 #   ollama: ollama-proxy-qwen-coder ollama-proxy-qwen ollama-proxy-deepseek \
 #           ollama-proxy-devstral ollama-proxy-frontier-coder
 # Override any of these via env vars (e.g. OPENAI_PROFILES="..." ./run_all.sh).
 read -ra PROJECTS        <<< "${PROJECTS:-glibc tcpdump openssl}"
-read -ra OPENAI_PROFILES <<< "${OPENAI_PROFILES:-openai-fast openai-codex}"
-read -ra OLLAMA_PROFILES <<< "${OLLAMA_PROFILES:-ollama-proxy-qwen-coder ollama-proxy-qwen}"
+read -ra OPENAI_PROFILES <<< "${OPENAI_PROFILES:-openai-gpt5-mini openai-gpt54-mini}"
+read -ra OLLAMA_PROFILES <<< "${OLLAMA_PROFILES:-ollama-proxy-qwen-7b ollama-proxy-qwen-32b ollama-proxy-qwen-coder-7b ollama-proxy-qwen-coder-32b}"
 BASELINE_PROFILE="${BASELINE_PROFILE:-openai-fast}"
 MAX_PARALLEL="${MAX_PARALLEL:-3}"
-OLLAMA_PARALLEL="${OLLAMA_PARALLEL:-1}"
+OLLAMA_PARALLEL="${OLLAMA_PARALLEL:-auto}"   # "auto" → detected GPU slot count (see below)
 OLLAMA_VALIDATE_PARALLEL="${OLLAMA_VALIDATE_PARALLEL:-1}"
 SWEEP_PHASES="${SWEEP_PHASES:-2 3 4}"
 BASELINE_PHASES="${BASELINE_PHASES:-0 1}"
@@ -77,6 +87,32 @@ OVERLAP_FAMILIES="${OVERLAP_FAMILIES:-false}"
 # per-repeat-unique patched image tags. Same make -j$(nproc) CPU caveat as above.
 # Default false = repeats run sequentially.
 REPEAT_PARALLEL="${REPEAT_PARALLEL:-false}"
+# PIPELINE_SWEEP=true (#14) overlaps baselines with sweeps: each project's sweep
+# (Phase 2/3/4) starts as soon as ITS baseline (Phase 0/1) is ready, running while
+# the REMAINING projects' baselines still build — instead of waiting for every
+# baseline first. A ready project's Phase-2 generation (OpenAI API / Ollama GPU,
+# no local build) overlaps other projects' baseline builds; the host-global build
+# semaphore (BUILD_SLOTS below) keeps the concurrent docker builds from thrashing
+# the CPU. Only for REPEATS=1 (the multi-project campaign case); REPEATS>1 falls
+# back to the sequential-baseline path. Default false = today's behaviour.
+PIPELINE_SWEEP="${PIPELINE_SWEEP:-false}"
+# BUILD_SLOTS=N caps CONCURRENT docker builds host-wide (exported as SSD_BUILD_SLOTS,
+# consumed by cve_aggregator.utils.build_lock around every Phase-1/Phase-3 build).
+# Empty/unset = no cap (byte-identical to today, correct when cells don't overlap).
+# On an 8-core host with make -j8, use 1 (one full-CPU build at a time). Because
+# overlap without a cap thrashes, PIPELINE_SWEEP defaults this to 1 when unset.
+BUILD_SLOTS="${BUILD_SLOTS:-}"
+if [[ "$PIPELINE_SWEEP" == "true" && -z "$BUILD_SLOTS" ]]; then
+  BUILD_SLOTS=1
+fi
+[[ -n "$BUILD_SLOTS" ]] && export SSD_BUILD_SLOTS="$BUILD_SLOTS"
+# In PIPELINE_SWEEP mode each ready project's sweep runs in its OWN subshell with its
+# own run_pool, so generation concurrency ≈ (active sweeps) × MAX_PARALLEL.
+# PIPELINE_MAX_ACTIVE caps how many project sweeps run at once, bounding that fan-out
+# at large project counts. Default 4 (a no-op for ≤4 projects); the build semaphore
+# and gpu_lock still bound CPU builds and the Ollama GPU independently.
+PIPELINE_MAX_ACTIVE="${PIPELINE_MAX_ACTIVE:-4}"
+[[ "$PIPELINE_MAX_ACTIVE" =~ ^[0-9]+$ ]] && (( PIPELINE_MAX_ACTIVE >= 1 )) || PIPELINE_MAX_ACTIVE=4
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 RUN_DIR="$PIPELINE_ROOT/runs/$RUN_ID"
@@ -93,6 +129,11 @@ echo $$ > "$RUN_DIR/run_all.pgid"
 # ---- helpers -------------------------------------------------------------
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$GLOBAL_LOG"; }
 
+# Stop the background GPU-slot poller (set once it is started; safe to call
+# before then). Referenced by the INT/TERM trap and the normal-exit path.
+GPU_POLLER_PID=""
+stop_gpu_poller() { [[ -n "${GPU_POLLER_PID:-}" ]] && kill "$GPU_POLLER_PID" 2>/dev/null; return 0; }
+
 # Read one key from config.yaml's `notifications:` block (pure awk; no yq/PyYAML
 # dependency, since run_all.sh may run before any venv is active).
 _cfg_notif() {   # _cfg_notif <key> -> value (quotes + trailing comment stripped)
@@ -102,6 +143,19 @@ _cfg_notif() {   # _cfg_notif <key> -> value (quotes + trailing comment stripped
       sub(/^[[:space:]]*[^:]*:[[:space:]]*/, "")           # drop "key:"
       sub(/[[:space:]]*#.*$/, "")                          # drop trailing comment
       gsub(/"/, ""); sub(/[[:space:]]+$/, "")              # drop quotes + rtrim
+      print; exit
+    }' "$PIPELINE_ROOT/config.yaml" 2>/dev/null
+}
+
+# Read one key from config.yaml's `llm:` block (same pure-awk approach as
+# _cfg_notif — no yq/PyYAML needed before the venv exists).
+_cfg_llm() {   # _cfg_llm <key> -> value (quotes + trailing comment stripped)
+  awk -v k="$1" '
+    /^[^[:space:]]/ { inblk = ($0 ~ /^llm:/) }
+    inblk && $1 == k":" {
+      sub(/^[[:space:]]*[^:]*:[[:space:]]*/, "")
+      sub(/[[:space:]]*#.*$/, "")
+      gsub(/"/, ""); sub(/[[:space:]]+$/, "")
       print; exit
     }' "$PIPELINE_ROOT/config.yaml" 2>/dev/null
 }
@@ -222,6 +276,24 @@ seed_cell() {
 
 # True when a project already has a usable Phase 0/1 baseline (image manifest +
 # Phase-0 CSV) in its baseline dir — so REUSE_BASELINE can skip the rebuild.
+# Mark a project's baseline cell DONE (reused). Copies the original build
+# started/ended/exit from the resume reference (RESUME_DONE_FROM) when present,
+# else stamps started==ended (elapsed 0) — never an EMPTY started, which the
+# dashboard renders as a blank elapsed column.
+mark_baseline_reused() {
+  local proj="$1" cell="${proj}__${BASELINE_PROFILE}"
+  local ref="${RESUME_DONE_FROM:+$RESUME_DONE_FROM/cells/$cell.state}"
+  if [[ -n "$ref" && -f "$ref" ]]; then
+    local _ _rs _re _rx
+    IFS='|' read -r _ _ _rs _re _rx _ < "$ref"
+    local now; now="$(date +%s)"
+    write_state "$cell" DONE baseline-reused "${_rs:-$now}" "${_re:-$now}" "${_rx:-0}" ""
+  else
+    local now; now="$(date +%s)"
+    write_state "$cell" DONE baseline-reused "$now" "$now" 0 ""
+  fi
+}
+
 baseline_exists() {
   local proj="$1" d="$PIPELINE_ROOT/projects/${proj}__${BASELINE_PROFILE}/results"
   [[ -d "$d" ]] || return 1
@@ -239,6 +311,19 @@ run_cell() {
   local cell="${proj}__${prof}${tag}" clog="$RUN_DIR/logs/${proj}__${prof}${tag}.log"
   local started; started="$(date +%s)"
   mkdir -p "$(dirname "$clog")"
+  # Resume: if this cell already completed in a reference run (RESUME_DONE_FROM),
+  # skip re-running it — its outputs in projects/<cell>/ are preserved as-is.
+  # Lets a relaunch pick up ONLY the not-yet-done cells (e.g. on more GPUs).
+  if [[ -n "${RESUME_DONE_FROM:-}" && -f "$RESUME_DONE_FROM/cells/$cell.state" ]] \
+     && [[ "$(cut -d'|' -f1 "$RESUME_DONE_FROM/cells/$cell.state")" == "DONE" ]]; then
+    # Preserve the ORIGINAL started/ended/exit from the reference run so the
+    # dashboard shows the real duration (not 0:00 from a same-instant re-stamp).
+    local _rs _re _rx _
+    IFS='|' read -r _ _ _rs _re _rx _ < "$RESUME_DONE_FROM/cells/$cell.state"
+    write_state "$cell" DONE resumed "${_rs:-$started}" "${_re:-$(date +%s)}" "${_rx:-0}" "$clog"
+    log "RESUME $cell — already DONE in $(basename "$RESUME_DONE_FROM"); skipping."
+    return 0
+  fi
   write_state "$cell" RUNNING "$stage" "$started" "" "" "$clog"
   log "START  $cell  [$stage]  phases='$phases'"
   notify_evt "$NOTIFY_CELL" "▶️ ${cell} started [${stage}] — phases '${phases}'"
@@ -281,10 +366,18 @@ run_ollama_two_lane() {
   local -a validate_queue=()
   local -a validate_pids=()
   local -a validate_specs=()
+  local -a gen_pids=()
+  local -a gen_specs=()
   local spec proj prof
 
-  if (( OLLAMA_PARALLEL != 1 )); then
-    log "WARN: OLLAMA_PARALLEL=${OLLAMA_PARALLEL} requested, but the two-lane Ollama scheduler currently runs a single Phase-2 generation lane. Using 1 generation lane."
+  # Generation lane width = the GPU slot count (OLLAMA_PARALLEL, resolved from
+  # SSD_GPU_SLOTS when "auto"): with N GPUs, N cells generate concurrently —
+  # one model family per GPU, admission bounded by the Python-side gpu_lock
+  # semaphore and the gpu_monitor residency budget.
+  local gen_parallel="$OLLAMA_PARALLEL"
+  if ! [[ "$gen_parallel" =~ ^[0-9]+$ ]] || (( gen_parallel < 1 )); then
+    log "WARN: OLLAMA_PARALLEL=${gen_parallel} is invalid; using 1 generation lane."
+    gen_parallel=1
   fi
   if (( validate_parallel < 1 )); then
     log "WARN: OLLAMA_VALIDATE_PARALLEL=${validate_parallel} is invalid; using 1."
@@ -305,8 +398,8 @@ run_ollama_two_lane() {
         wait "$vpid" || true
       fi
     done
-    validate_pids=("${keep_pids[@]}")
-    validate_specs=("${keep_specs[@]}")
+    validate_pids=(${keep_pids[@]+"${keep_pids[@]}"})
+    validate_specs=(${keep_specs[@]+"${keep_specs[@]}"})
   }
 
   _start_validate_job() {
@@ -321,25 +414,49 @@ run_ollama_two_lane() {
     _reap_validate_jobs
     while (( ${#validate_queue[@]} > 0 && ${#validate_pids[@]} < validate_parallel )); do
       _start_validate_job "${validate_queue[0]}"
-      validate_queue=("${validate_queue[@]:1}")
+      if (( ${#validate_queue[@]} > 1 )); then validate_queue=("${validate_queue[@]:1}"); else validate_queue=(); fi
     done
   }
 
-  for spec in "${specs[@]}"; do
-    proj="${spec%%:*}"; prof="${spec##*:}"
-    _pump_validate_jobs
-    if run_cell "$proj" "$prof" "2" "ollama-generate"; then
-      queue_cell_stage "$proj" "$prof" "ollama-validate-queued"
-      validate_queue+=("$spec")
-      _pump_validate_jobs
-    else
-      log "WARN: skipping validation for ${proj}__${prof} because Phase 2 failed."
-    fi
-  done
+  # Reap finished generation cells; a successful one enqueues its validation.
+  _reap_gen_jobs() {
+    local -a keep_pids=()
+    local -a keep_specs=()
+    local idx gpid gspec gproj gprof
+    for idx in "${!gen_pids[@]}"; do
+      gpid="${gen_pids[$idx]}"
+      [[ -n "$gpid" ]] || continue
+      if kill -0 "$gpid" 2>/dev/null; then
+        keep_pids+=("$gpid")
+        keep_specs+=("${gen_specs[$idx]}")
+      else
+        gspec="${gen_specs[$idx]}"
+        gproj="${gspec%%:*}"; gprof="${gspec##*:}"
+        if wait "$gpid"; then
+          queue_cell_stage "$gproj" "$gprof" "ollama-validate-queued"
+          validate_queue+=("$gspec")
+        else
+          log "WARN: skipping validation for ${gproj}__${gprof} because Phase 2 failed."
+        fi
+      fi
+    done
+    gen_pids=(${keep_pids[@]+"${keep_pids[@]}"})
+    gen_specs=(${keep_specs[@]+"${keep_specs[@]}"})
+  }
 
-  while (( ${#validate_queue[@]} > 0 || ${#validate_pids[@]} > 0 )); do
+  local next=0
+  while true; do
+    _reap_gen_jobs
+    while (( next < ${#specs[@]} && ${#gen_pids[@]} < gen_parallel )); do
+      spec="${specs[$next]}"; next=$(( next + 1 ))
+      proj="${spec%%:*}"; prof="${spec##*:}"
+      run_cell "$proj" "$prof" "2" "ollama-generate" &
+      gen_pids+=("$!")
+      gen_specs+=("$spec")
+    done
     _pump_validate_jobs
-    (( ${#validate_queue[@]} == 0 && ${#validate_pids[@]} == 0 )) && break
+    (( next >= ${#specs[@]} && ${#gen_pids[@]} == 0 \
+       && ${#validate_queue[@]} == 0 && ${#validate_pids[@]} == 0 )) && break
     sleep 2
   done
 }
@@ -367,7 +484,7 @@ cleanup_running() {
     write_state "$cell" ABORTED "$stg" "$started" "$(date +%s)" 130 "$logf"
   done
 }
-trap 'trap - INT TERM; log "Interrupted — aborting."; cleanup_running; rm -f "$RUN_DIR/run_all.pgid"; notify "🛑 ${RUN_ID} aborted" high; kill 0 2>/dev/null; exit 130' INT TERM
+trap 'trap - INT TERM; log "Interrupted — aborting."; stop_gpu_poller; cleanup_running; rm -f "$RUN_DIR/run_all.pgid"; notify "🛑 ${RUN_ID} aborted" high; kill 0 2>/dev/null; exit 130' INT TERM
 
 # ---- preflight -----------------------------------------------------------
 log "RUN $RUN_ID  | projects: ${PROJECTS[*]}  | openai: ${OPENAI_PROFILES[*]}  | ollama: ${OLLAMA_PROFILES[*]}"
@@ -393,6 +510,48 @@ ensure_venv() {
 }
 ensure_venv
 
+# ---- GPU slot detection (multi-GPU Ollama server) --------------------------
+# Probe ONCE here and export SSD_GPU_SLOTS so every cell (gpu_lock semaphore
+# width + gpu_monitor residency budget) agrees on the same number. Ladder:
+# pre-set SSD_GPU_SLOTS env > config.yaml llm.gpu_slots (int) >
+# llm.gpu_probe_command > local nvidia-smi (local endpoint only) > 1.
+if [[ -z "${SSD_GPU_SLOTS:-}" ]]; then
+  GPU_SLOTS="$("$PIPELINE_ROOT/.venv/bin/python3" \
+      "$PIPELINE_ROOT/cve_aggregator/utils/gpu_slots.py" \
+      --config "$PIPELINE_ROOT/config.yaml" 2>/dev/null || echo 1)"
+else
+  GPU_SLOTS="$SSD_GPU_SLOTS"
+fi
+[[ "$GPU_SLOTS" =~ ^[0-9]+$ ]] && (( GPU_SLOTS >= 1 )) || GPU_SLOTS=1
+export SSD_GPU_SLOTS="$GPU_SLOTS"
+if [[ "$OLLAMA_PARALLEL" == "auto" ]]; then
+  OLLAMA_PARALLEL="$GPU_SLOTS"
+fi
+[[ "$OLLAMA_PARALLEL" =~ ^[0-9]+$ ]] && (( OLLAMA_PARALLEL >= 1 )) || OLLAMA_PARALLEL=1
+log "GPU slots: $GPU_SLOTS  → Ollama generation lanes: $OLLAMA_PARALLEL"
+
+# ---- GPU-slot poller (periodic re-detection timer) -------------------------
+# Background process that re-runs the detection ladder every gpu_poll_interval
+# seconds and publishes the count to the live slots file every cell reads at
+# GPU-acquisition time — so a GPU freed by a foreign workload is picked up
+# without restarting anything. Disable with GPU_POLL_INTERVAL=0.
+GPU_POLL_INTERVAL="${GPU_POLL_INTERVAL:-$(_cfg_llm gpu_poll_interval)}"
+[[ "$GPU_POLL_INTERVAL" =~ ^[0-9]+$ ]] || GPU_POLL_INTERVAL=60
+if (( GPU_POLL_INTERVAL > 0 )); then
+  "$PIPELINE_ROOT/.venv/bin/python3" \
+      "$PIPELINE_ROOT/cve_aggregator/utils/gpu_slots.py" --watch \
+      --interval "$GPU_POLL_INTERVAL" --config "$PIPELINE_ROOT/config.yaml" \
+      >> "$RUN_DIR/logs/gpu_poller.log" 2>&1 &
+  GPU_POLLER_PID="$!"
+  # CRITICAL: remove the poller from the shell's job table so the bare `wait`
+  # in run_pool (and elsewhere) never blocks on this never-exiting background
+  # child. stop_gpu_poller still kills it by PID. Without this, the first bare
+  # `wait` hangs the whole run.
+  disown 2>/dev/null || true
+  echo "$GPU_POLLER_PID" > "$RUN_DIR/gpu_poller.pid"
+  log "GPU-slot poller started (pid $GPU_POLLER_PID, every ${GPU_POLL_INTERVAL}s) → logs/gpu_poller.log"
+fi
+
 # Initialise every (project, profile) cell as PENDING for the dashboard.
 declare -A _all_profiles=()
 for p in "${OPENAI_PROFILES[@]}" "${OLLAMA_PROFILES[@]}"; do _all_profiles["$p"]=1; done
@@ -412,7 +571,10 @@ done
 
 notify_evt "$NOTIFY_RUN" "▶️ Benchmark ${RUN_ID} started: ${#PROJECTS[@]} projects × ${#_all_profiles[@]} profiles"
 
-# ---- Stage 1: baselines once (sequential — heaviest, one cold build per project)
+# ---- Stage 1: baselines. DEFAULT/repeats path builds every baseline first, then
+# sweeps. In PIPELINE_SWEEP mode (REPEATS=1) this whole block is skipped — baselines
+# are built and their sweeps launched interleaved in the pipelined loop below (#14).
+if [[ "$PIPELINE_SWEEP" != "true" ]] || (( REPEATS > 1 )); then
 log "===== STAGE 1: baselines (profile=$BASELINE_PROFILE, phases='$BASELINE_PHASES') ====="
 notify_evt "$NOTIFY_STAGE" "🔧 Stage 1 starting: baselines for ${#PROJECTS[@]} project(s) [profile=$BASELINE_PROFILE, phases '$BASELINE_PHASES']"
 GOOD_PROJECTS=()
@@ -420,7 +582,7 @@ export RUN_TAG=""   # baseline is ALWAYS untagged; only the sweep loop sets RUN_
 for proj in "${PROJECTS[@]}"; do
   if [[ "$REUSE_BASELINE" == "true" ]] && baseline_exists "$proj"; then
     log "REUSE: existing baseline found for $proj — skipping Phase '$BASELINE_PHASES' build."
-    write_state "${proj}__${BASELINE_PROFILE}" DONE baseline-reused "" "$(date +%s)" 0 ""
+    mark_baseline_reused "$proj"
     GOOD_PROJECTS+=("$proj")
     notify_evt "$NOTIFY_PROJECT" "♻️ Project '${proj}': reusing existing baseline"
     continue
@@ -438,6 +600,7 @@ for proj in "${PROJECTS[@]}"; do
   fi
 done
 notify_evt "$NOTIFY_STAGE" "✅ Stage 1 baselines done (${#GOOD_PROJECTS[@]}/${#PROJECTS[@]} ok)"
+fi   # end non-pipelined Stage-1 (PIPELINE_SWEEP builds baselines in the loop below)
 
 # Sweep — optionally repeated REPEATS times over the SAME (static) baseline, each
 # repeat isolated in its own RUN_TAG dir, for run-to-run variance on the stochastic
@@ -517,22 +680,71 @@ run_one_repeat() {
   fi
 }
 
-_repeat_pids=()
-for (( rep=1; rep<=REPEATS; rep++ )); do
-  if [[ "$REPEAT_PARALLEL" == "true" ]] && (( REPEATS > 1 )); then
-    run_one_repeat "$rep" &
-    _repeat_pids+=("$!")
-  else
-    run_one_repeat "$rep"
+if [[ "$PIPELINE_SWEEP" == "true" ]] && (( REPEATS == 1 )); then
+  # ── #14 PIPELINED baseline↔sweep: build each project's baseline, then launch its
+  # sweep in the BACKGROUND so the next project's baseline build overlaps it. The
+  # build semaphore (SSD_BUILD_SLOTS) bounds concurrent docker builds, while a ready
+  # project's Phase-2 generation (API/GPU, no build lock) runs during other
+  # projects' baseline builds. Each per-project sweep reuses run_one_repeat with
+  # GOOD_PROJECTS scoped (in a subshell) to that one project.
+  log "===== PIPELINED baselines↔sweeps (build_slots=${SSD_BUILD_SLOTS:-off}) ====="
+  notify_evt "$NOTIFY_STAGE" "🔧 Pipelined baseline↔sweep for ${#PROJECTS[@]} project(s) [build_slots=${SSD_BUILD_SLOTS:-off}]"
+  export RUN_TAG=""
+  _sweep_pids=()
+  for proj in "${PROJECTS[@]}"; do
+    _base_ok=0
+    if [[ "$REUSE_BASELINE" == "true" ]] && baseline_exists "$proj"; then
+      log "REUSE: existing baseline found for $proj — skipping Phase '$BASELINE_PHASES' build."
+      mark_baseline_reused "$proj"
+      notify_evt "$NOTIFY_PROJECT" "♻️ Project '${proj}': reusing existing baseline"
+      _base_ok=1
+    else
+      notify_evt "$NOTIFY_PROJECT" "📦 Project '${proj}': building baseline (phases '$BASELINE_PHASES')"
+      if run_cell "$proj" "$BASELINE_PROFILE" "$BASELINE_PHASES" baseline; then
+        _base_ok=1
+      else
+        log "WARN: baseline FAILED for $proj — skipping its sweep."
+        notify "⚠️ ${RUN_ID}: baseline failed for $proj (its sweep is skipped)" high
+        for prof in "${!_all_profiles[@]}"; do
+          [[ "$prof" == "$BASELINE_PROFILE" ]] && continue
+          write_state "${proj}__${prof}" SKIPPED "baseline-failed" "" "" "" ""
+        done
+      fi
+    fi
+    if (( _base_ok )); then
+      # Scope GOOD_PROJECTS to this one project inside a subshell, then run its
+      # sweep in the background so subsequent baseline builds overlap it.
+      ( GOOD_PROJECTS=("$proj"); run_one_repeat 1 ) &
+      _sweep_pids+=("$!")
+      # Bound concurrent sweeps (each ≈ MAX_PARALLEL generation cells) so a large
+      # project list can't fan out unboundedly. The backgrounded sweeps are the only
+      # bg jobs at this level (baselines run inline), so jobs -rp counts them.
+      while (( $(jobs -rp | wc -l) >= PIPELINE_MAX_ACTIVE )); do sleep 2; done
+    fi
+  done
+  if (( ${#_sweep_pids[@]} )); then
+    for _p in "${_sweep_pids[@]}"; do wait "$_p" 2>/dev/null || true; done
   fi
-done
-# Wait for any backgrounded repeats before the run is marked COMPLETE.
-if (( ${#_repeat_pids[@]} )); then
-  for _p in "${_repeat_pids[@]}"; do wait "$_p" 2>/dev/null || true; done
+  export RUN_TAG=""
+else
+  _repeat_pids=()
+  for (( rep=1; rep<=REPEATS; rep++ )); do
+    if [[ "$REPEAT_PARALLEL" == "true" ]] && (( REPEATS > 1 )); then
+      run_one_repeat "$rep" &
+      _repeat_pids+=("$!")
+    else
+      run_one_repeat "$rep"
+    fi
+  done
+  # Wait for any backgrounded repeats before the run is marked COMPLETE.
+  if (( ${#_repeat_pids[@]} )); then
+    for _p in "${_repeat_pids[@]}"; do wait "$_p" 2>/dev/null || true; done
+  fi
+  export RUN_TAG=""
 fi
-export RUN_TAG=""
 
 # ---- done ----------------------------------------------------------------
+stop_gpu_poller                 # end the periodic GPU-slot poller
 read -r DONE FAILED OTHER < <(summarize)
 ELAPSED=$(( $(date +%s) - START_EPOCH ))
 touch "$RUN_DIR/COMPLETE"

@@ -42,6 +42,8 @@ from cve_aggregator.utils.llm_compat import (
     is_unsupported_temperature_error,
     openai_temperature_kwargs,
 )
+from cve_aggregator.utils.gpu_monitor import ensure_exclusive, resolve_mode
+from cve_aggregator.utils.gpu_slots import current_slots
 
 # ---------------------------------------------------------------------------
 # Negative-signal patterns — the deterministic fallback for the negative filter.
@@ -289,7 +291,7 @@ class PoCAnalyzer:
         if provider == "ollama":
             self.provider = "ollama"
             self.model = _env("LLM_MODEL") or ramp1 or "qwen2.5-coder:7b"
-            self.api_endpoint = _env("LLM_ENDPOINT") or "http://10.3.2.171:80/api/chat"
+            self.api_endpoint = _env("LLM_ENDPOINT") or "http://10.3.1.226:80/api/chat"
             user, password = _env("OLLAMA_USERNAME"), _env("OLLAMA_PASSWORD")
             self.ollama_auth = (user, password) if (user and password) else None
             self.logger.info(
@@ -333,6 +335,18 @@ class PoCAnalyzer:
             {"role": "user", "content": user_prompt},
         ]
         if self.provider == "ollama":
+            # One-time GPU exclusivity gate (per process): make sure the first
+            # negative-filter call doesn't LOAD our model beside a foreign
+            # resident one (CPU offload for the whole phase). Cheap after the
+            # first call; same-model residency passes straight through.
+            if not getattr(self, "_gpu_gate_done", False):
+                ensure_exclusive(self.api_endpoint, auth=self.ollama_auth,
+                                 model=self.model, mode=resolve_mode(),
+                                 timeout=120, log=self.logger,
+                                 slots=current_slots(
+                                     endpoint=self.api_endpoint,
+                                     logger=self.logger))
+                self._gpu_gate_done = True
             payload = {
                 "model": self.model,
                 "messages": messages,

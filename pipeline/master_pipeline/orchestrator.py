@@ -1690,45 +1690,55 @@ RECOMMENDED ACTIONS:
         _p = str(llm_cfg.get("ollama_password", "") or "")
         ollama_auth = (_u, _p) if (_u and _p) else None
 
-        try:
-            test_payload = {
-                "model": test_model,
-                "messages": [{"role": "user", "content": "Hello"}],
-                "stream": False,
-                "options": {"num_predict": hc_num_predict}
-            }
+        # Retry the probe: a transient proxy/network blip (a brief 502, a dropped
+        # connection, the remote GPU momentarily reloading) must NOT abort the whole
+        # cell. Phase 2 itself retries generation, so a momentary preflight failure
+        # is not a real "API down" — only a persistent one is.
+        import time
+        hc_retries = max(1, int(hc_cfg.get("retries", 4)))
+        test_payload = {
+            "model": test_model,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": False,
+            "options": {"num_predict": hc_num_predict}
+        }
+        logger.info(f"Testing connection to {api_endpoint} (model={test_model}, "
+                    f"auth={'basic' if ollama_auth else 'none'})...")
+        last_err = "unknown error"
+        for attempt in range(1, hc_retries + 1):
+            try:
+                response = requests.post(
+                    api_endpoint,
+                    json=test_payload,
+                    timeout=hc_timeout,
+                    auth=ollama_auth,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    if "message" not in data and "response" not in data:
+                        logger.warning(f"API returned unexpected format: {data.keys()}")
+                    return True
+                last_err = f"status {response.status_code}: {response.text[:200]}"
+            except requests.exceptions.Timeout:
+                last_err = f"timeout - server at {api_endpoint} not responding"
+            except requests.exceptions.ConnectionError as e:
+                last_err = f"cannot connect to {api_endpoint}: {e}"
+            except Exception as e:
+                last_err = f"health check error: {e}"
 
-            logger.info(f"Testing connection to {api_endpoint} (model={test_model}, "
-                        f"auth={'basic' if ollama_auth else 'none'})...")
-            response = requests.post(
-                api_endpoint,
-                json=test_payload,
-                timeout=hc_timeout,
-                auth=ollama_auth,
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                if "message" in data or "response" in data:
-                    return True
-                else:
-                    logger.warning(f"API returned unexpected format: {data.keys()}")
-                    return True
-            else:
-                logger.error(f"API returned status {response.status_code}: {response.text[:200]}")
-                return False
-                
-        except requests.exceptions.Timeout:
-            logger.error(f"LLM API timeout - server at {api_endpoint} not responding")
-            logger.error("Consider checking if the Ollama server is running")
-            return False
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"Cannot connect to LLM API at {api_endpoint}")
-            logger.error(f"Connection error: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"LLM API health check failed: {e}")
-            return False
+            if attempt < hc_retries:
+                backoff = 20 * attempt
+                logger.warning(
+                    f"LLM API health check failed (attempt {attempt}/{hc_retries}): "
+                    f"{last_err} — retrying in {backoff}s (transient proxy/network blip?)"
+                )
+                time.sleep(backoff)
+
+        logger.error(
+            f"LLM API not reachable after {hc_retries} attempts: {last_err}. "
+            f"Check the Ollama endpoint {api_endpoint}."
+        )
+        return False
     
     def _check_phase_dependencies(self, phase: int) -> bool:
         """Check if dependencies for a phase are met."""

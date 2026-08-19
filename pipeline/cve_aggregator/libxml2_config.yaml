@@ -118,7 +118,7 @@ poc_repair:
   provider: "openai"
   openai_model: "gpt-4.1-mini"
   openai_api_key: ""
-  api_endpoint: "http://10.3.2.171:80/api/chat"
+  api_endpoint: "http://10.3.1.226:80/api/chat"
   model: "devstral:32k"
   max_repair_attempts: 3
   models_by_attempt:
@@ -186,14 +186,15 @@ phase2:
   language: "c"
   system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for libxml2 (the GNOME XML parsing library). Your task is to fix a security
-    vulnerability by making the SMALLEST POSSIBLE EDIT to the vulnerable function
-    — never by rewriting it.
+    for libxml2 (the GNOME XML parsing library). The vulnerability you must fix
+    is {cwe}.
+    Your task is to fix it by making the SMALLEST POSSIBLE EDIT to the
+    vulnerable function — never by rewriting it.
   feedback_system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for libxml2. Your previous patch attempt FAILED validation. Analyze the
-    failure and produce an improved fix as MINIMAL edits — never rewrite the whole
-    function.
+    for libxml2. Your previous patch attempt for {cve_id} — {cwe} —
+    FAILED validation. Analyze the failure and produce an improved fix as
+    MINIMAL edits — never rewrite the whole function.
   internal_headers: []
 
 # ---------------------------------------------------------------------------

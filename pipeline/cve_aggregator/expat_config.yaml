@@ -18,12 +18,13 @@ pipeline:
   abort_on_error: false
   skip_modules: []
 
-# ExploitDB preferred; fix-commit test (Option A) fallback. NOTE: expat's tests are
-# a monolithic runtests.c harness (not per-CVE .c), so intree harvest is weaker here
-# than libtasn1 — ExploitDB / library-link PoCs are the likely effective source.
+# INTREE-FIRST (uniform pipeline-wide where a phase1.intree_test recipe exists);
+# ExploitDB is the fallback. NOTE: expat's tests are a monolithic runtests.c
+# harness (not per-CVE .c), so intree harvest is weaker here than libtasn1 —
+# ExploitDB / library-link PoCs may end up the effective source for many CVEs.
 reproduction_strategy:
-  - exploitdb
   - intree
+  - exploitdb
 
 logging:
   level: "INFO"
@@ -109,7 +110,7 @@ poc_repair:
   provider: "openai"
   openai_model: "gpt-4.1-mini"
   openai_api_key: ""
-  api_endpoint: "http://10.3.2.171:80/api/chat"
+  api_endpoint: "http://10.3.1.226:80/api/chat"
   model: "devstral:32k"
   max_repair_attempts: 3
   models_by_attempt:
@@ -177,14 +178,15 @@ phase2:
   language: "c"
   system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for Expat (the libexpat XML parsing library). Your task is to fix a security
-    vulnerability by making the SMALLEST POSSIBLE EDIT to the vulnerable function
-    — never by rewriting it.
+    for Expat (the libexpat XML parsing library). The vulnerability you must fix
+    is {cwe}.
+    Your task is to fix it by making the SMALLEST POSSIBLE EDIT to the
+    vulnerable function — never by rewriting it.
   feedback_system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for Expat (libexpat). Your previous patch attempt FAILED validation. Analyze
-    the failure and produce an improved fix as MINIMAL edits — never rewrite the
-    whole function.
+    for Expat (libexpat). Your previous patch attempt for {cve_id} — {cwe} —
+    FAILED validation. Analyze the failure and produce an improved fix as
+    MINIMAL edits — never rewrite the whole function.
   internal_headers: []
 
 # ---------------------------------------------------------------------------
@@ -387,7 +389,7 @@ phase1:
       BIN="$TDIR/runtests"
       if [ ! -x "$BIN" ]; then echo "runtests binary not built:"; tail -20 /tmp/mt.log; echo "SSD_TEST_RESULT=NORESULT"; exit 2; fi
       echo "--- running monolithic libcheck harness: $BIN ---"
-      ( cd "$TDIR" && timeout "${INTREE_TEST_TIMEOUT:-400}" ./runtests ) > /tmp/it.log 2>&1; rc=$?
+      ( cd "$TDIR" && timeout -k 10 "${INTREE_TEST_TIMEOUT:-400}" ./runtests ) > /tmp/it.log 2>&1; rc=$?
       tail -25 /tmp/it.log
       # libcheck runtests: exit 0 = all cases pass; non-zero (incl. crash signal) =
       # a case failed = the bug reproduced on the vulnerable build.

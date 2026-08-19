@@ -30,6 +30,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from poc_analyzer import PoCAnalyzer
 from master_pipeline.sast_config import load_sast_config
 from master_pipeline import sast_runner  # shared Phase 1/3 SAST run + classify
+from master_pipeline.intree import (  # shared Phase 1/3 in-tree timeout policy
+    intree_container_timeout, load_intree_timeout_policy,
+)
 from cve_aggregator.utils.phase1_readiness import (  # shared with the dashboard
     classify_phase1_readiness, SKIPPED_MANUAL, NOT_READY,
 )
@@ -590,6 +593,54 @@ def next_older_ubuntu_version(current: str) -> Optional[str]:
     return versions[idx - 1] if idx > 0 else None
 
 
+# =============================================================================
+# Container-timeout contract (shared by BOTH reproducer paths)
+# =============================================================================
+# A container-level timeout is surfaced by _run_image as exit code -1 plus a
+# banner it prints itself. Both reproducers hit it — an ExploitDB PoC that hangs
+# and an in-tree regression test that hangs — and both used to read it ad hoc,
+# which is how the in-tree path ended up filing hangs as "build/run error" while
+# the PoC path fed its own banner to the LLM negative filter. These three names
+# are the single definition of "this run timed out" and "what the PoC actually
+# printed"; every site that cares uses them, so the two paths cannot drift apart.
+#
+# Nothing here is project-specific: it describes the harness's OWN output, not
+# any project's build system or test framework.
+_TIMEOUT_BANNER = "TIMEOUT after "
+_TIMEOUT_PARTIAL_SEP = "Partial output: "
+
+
+def _timeout_banner(run_timeout: int, logs: str) -> str:
+    """The banner _run_image returns in place of a timed-out container's logs."""
+    return (f"{_TIMEOUT_BANNER}{run_timeout}s (PoC caused hang/deadlock). "
+            f"{_TIMEOUT_PARTIAL_SEP}{logs}")
+
+
+def is_timeout_run(exit_code: Optional[int], logs: Optional[str]) -> bool:
+    """True when a container run ended on the run timeout rather than exiting.
+
+    -1 alone is NOT sufficient: _run_image also returns -1 for infrastructure
+    errors (image missing, daemon refused the run), which are not hangs and must
+    not be credited or counted as such. The banner is what distinguishes them.
+    """
+    return exit_code == -1 and _TIMEOUT_BANNER in (logs or "")
+
+
+def strip_timeout_banner(logs: Optional[str]) -> str:
+    """The PoC's own partial output, with the harness's diagnostic removed.
+
+    The negative filter judges whether the EXPLOIT failed. Handing it our own
+    "PoC caused hang/deadlock" text is the same category error the wrapper-vs-PoC
+    split already guards against for bash's "Killed": the model reads the harness
+    and reports exploit failure, which vetoes the hang-is-the-bug verdict that
+    both paths are supposed to reach.
+    """
+    text = logs or ""
+    if _TIMEOUT_PARTIAL_SEP in text:
+        return text.split(_TIMEOUT_PARTIAL_SEP, 1)[1]
+    return text
+
+
 class ExecutionStatus(Enum):
     SUCCESS = "Success"
     BUILD_ERROR = "Build Error"
@@ -713,6 +764,17 @@ class ExecutionResult:
     needs_manual_revision: bool = False           # routed to manual revision
     poc_uses_project_build: Optional[str] = None  # "yes" | "no" (C PoCs) | None (interpreted/unknown)
     baseline_cache_key: Optional[str] = None      # fingerprint for baseline memoization (image sig + runtime policy)
+    # The run hit a container-level timeout. A NEUTRAL fact about how the run
+    # ended, deliberately independent of the verdict: a hang can be credited as a
+    # DoS reproduction (baseline -1) or routed to manual revision, and this field
+    # is True either way. It is kept separate from `status` so labelling a hang
+    # changes no gate and no tally — `status` still drives the manual-supervision
+    # gate and the reproduced/manual counts exactly as before.
+    # `failure_breakdown.timeouts` counts this field for NON-reproduced runs only
+    # (counting credited hangs would break that block's partition). It used to
+    # count ExecutionStatus.TIMEOUT, which nothing ever assigns, so it read 0
+    # while real hangs sat unlabelled inside needs_manual_revision.
+    timed_out: bool = False
 
 
 # =============================================================================
@@ -960,10 +1022,18 @@ class ProjectRepoManager:
     def update_or_clone(self) -> bool:
         """
         Update the local project repository. Clone if missing.
-        This MUST succeed or Phase 1 aborts.
+
+        Returns False ONLY when there is no usable local clone (missing, not a
+        git repo, or a fresh clone failed) — that is the sole condition that
+        aborts Phase 1. A refresh (fetch/pull) failure on an EXISTING clone is
+        NON-fatal: it is retried and, if it still fails (e.g. a transient HTTP
+        502 from the git host), Phase 1 PROCEEDS with the existing local history
+        rather than discarding the whole baseline. Any genuinely-missing recent
+        commit is handled per-CVE downstream (routed to manual revision).
 
         Returns:
-            True if update successful, False otherwise (Phase 1 should abort)
+            True if the repo is usable (updated, or existing clone kept),
+            False only when no usable local clone could be obtained.
         """
         project_name = self.repo_path.name
         self.logger.info(f"Pre-updating project repository at: {self.repo_path}")
@@ -991,15 +1061,33 @@ class ProjectRepoManager:
             self.logger.error(f"Not a git repo: {self.repo_path}")
             return False
 
+        # An existing, valid clone is already usable, so a refresh (fetch/pull)
+        # failure here is NON-fatal: retry transient errors, then proceed with the
+        # local history rather than aborting the whole baseline over a network blip
+        # (e.g. an HTTP 502 from the git host).
+        import time
         try:
-            # fetch --all then pull --ff-only
-            result = subprocess.run(
-                ["git", "-C", str(self.repo_path), "fetch", "--all"],
-                capture_output=True, text=True, timeout=600
-            )
-            if result.returncode != 0:
-                self.logger.error(f"git fetch failed: {result.stderr}")
-                return False
+            fetch_ok = False
+            for attempt in range(1, 4):
+                result = subprocess.run(
+                    ["git", "-C", str(self.repo_path), "fetch", "--all"],
+                    capture_output=True, text=True, timeout=600
+                )
+                if result.returncode == 0:
+                    fetch_ok = True
+                    break
+                self.logger.warning(
+                    f"git fetch failed (attempt {attempt}/3): {result.stderr.strip()}"
+                )
+                if attempt < 3:
+                    time.sleep(5 * attempt)
+
+            if not fetch_ok:
+                self.logger.warning(
+                    f"git fetch did not succeed after 3 attempts; proceeding with the "
+                    f"existing local clone of '{project_name}' (it may lack very recent commits)."
+                )
+                return True
 
             result = subprocess.run(
                 ["git", "-C", str(self.repo_path), "pull", "--ff-only"],
@@ -1014,11 +1102,15 @@ class ProjectRepoManager:
 
             return True
         except subprocess.TimeoutExpired:
-            self.logger.error(f"Repository '{project_name}' update timed out")
-            return False
+            self.logger.warning(
+                f"Repository '{project_name}' refresh timed out; proceeding with existing local clone"
+            )
+            return True
         except Exception as e:
-            self.logger.error(f"Repository '{project_name}' update error: {e}")
-            return False
+            self.logger.warning(
+                f"Repository '{project_name}' refresh error ({e}); proceeding with existing local clone"
+            )
+            return True
 
 
 # =============================================================================
@@ -1035,29 +1127,36 @@ def _docker_build(client, path: str, tag: str, rm: bool = True, forcerm: bool = 
 
     Returns (image_object, log_text_or_list).
     """
-    if platform:
-        cmd = ["docker", "build", "--platform", platform, "--load", "-t", tag, "."]
-        if rm:
-            cmd.insert(2, "--rm")
-        if forcerm:
-            cmd.insert(2, "--force-rm")
-        if logger:
-            logger.debug(f"Building via CLI: {' '.join(cmd)} (cwd={path})")
-        result = subprocess.run(
-            cmd, cwd=path, capture_output=True, text=True, timeout=timeout
-        )
-        if result.returncode != 0:
-            error_tail = (result.stdout + result.stderr)[-5000:]
-            raise docker.errors.BuildError(
-                reason=f"docker build exited {result.returncode}:\n{error_tail}",
-                build_log=[],
+    from cve_aggregator.utils.build_lock import build_slot
+
+    # Host-global build semaphore (no-op unless SSD_BUILD_SLOTS>=1): caps the number
+    # of concurrent docker builds so the scheduler can overlap cells without CPU
+    # thrash. Generation (API/GPU) does NOT take this lock, so Phase-2 of ready cells
+    # keeps flowing while builds serialize.
+    with build_slot(label=tag, logger=logger):
+        if platform:
+            cmd = ["docker", "build", "--platform", platform, "--load", "-t", tag, "."]
+            if rm:
+                cmd.insert(2, "--rm")
+            if forcerm:
+                cmd.insert(2, "--force-rm")
+            if logger:
+                logger.debug(f"Building via CLI: {' '.join(cmd)} (cwd={path})")
+            result = subprocess.run(
+                cmd, cwd=path, capture_output=True, text=True, timeout=timeout
             )
-        image = client.images.get(tag)
-        return image, result.stdout + result.stderr
-    else:
-        return client.images.build(
-            path=path, tag=tag, rm=rm, forcerm=forcerm, timeout=timeout,
-        )
+            if result.returncode != 0:
+                error_tail = (result.stdout + result.stderr)[-5000:]
+                raise docker.errors.BuildError(
+                    reason=f"docker build exited {result.returncode}:\n{error_tail}",
+                    build_log=[],
+                )
+            image = client.images.get(tag)
+            return image, result.stdout + result.stderr
+        else:
+            return client.images.build(
+                path=path, tag=tag, rm=rm, forcerm=forcerm, timeout=timeout,
+            )
 
 
 # =============================================================================
@@ -2456,7 +2555,7 @@ class DockerManager:
                 # A timeout (exit -1) is surfaced to the caller. For DoS-class
                 # CVEs a hang/deadlock is itself the reproduction; the caller
                 # routes ambiguous timeouts to manual revision.
-                return -1, f"TIMEOUT after {run_timeout}s (PoC caused hang/deadlock). Partial output: {logs}"
+                return -1, _timeout_banner(run_timeout, logs)
             self.logger.error(f"Failed to run container for {vuln.cve}: {e}")
             return -1, str(e)
 
@@ -2756,7 +2855,16 @@ class ReportGenerator:
         build_errors = sum(1 for r in self.results if r.status == ExecutionStatus.BUILD_ERROR.value)
         execution_errors = sum(1 for r in self.results if r.status == ExecutionStatus.EXECUTION_ERROR.value)
         poc_not_found = sum(1 for r in self.results if r.status == ExecutionStatus.POC_NOT_FOUND.value)
-        timeouts = sum(1 for r in self.results if r.status == ExecutionStatus.TIMEOUT.value)
+        # Count the FLAG, not the status: nothing assigns ExecutionStatus.TIMEOUT,
+        # so the old expression was structurally 0 and hid every real hang.
+        # `not reproduced` keeps this block a PARTITION of the corpus: a hang that
+        # the DoS branch credits is a SUCCESS (it is counted in
+        # successful_reproductions and excluded from total_failures), so counting
+        # it here too would let `timeouts` exceed `total_failures`.
+        timeouts = sum(1 for r in self.results
+                       if not r.vulnerability_reproduced
+                       and (getattr(r, "timed_out", False)
+                            or r.status == ExecutionStatus.TIMEOUT.value))
         unknown_errors = sum(1 for r in self.results if r.status == ExecutionStatus.UNKNOWN_ERROR.value)
         needs_review = sum(1 for r in self.results if r.status == ExecutionStatus.NEEDS_REVIEW.value)
         successful = sum(1 for r in self.results if r.vulnerability_reproduced)
@@ -2861,6 +2969,16 @@ class PipelineOrchestrator:
         raw_cfg = _load_phase0_config(phase0_config_path)
         self._p1 = _resolve_phase1_settings(raw_cfg, self.base_dir)
         self._arch_fallback_enabled = bool(self._p1.get("enable_arch_fallback", True))
+
+        # In-tree runs get their OWN ceiling, derived from the budgets the
+        # project's run recipe declares. The flat run_timeout used to guillotine
+        # the recipe before it could print SSD_TEST_RESULT, turning a genuine
+        # hang (which IS the reproduction for an infinite-loop CVE) into an
+        # anonymous "build/run error". Phase 3 derives the same number, so the
+        # baseline and the validation are measured on the same clock.
+        self.intree_run_timeout = intree_container_timeout(
+            self._p1.get("intree_run_script"), *load_intree_timeout_policy()
+        )
         # SAST baseline (methodology: Phase 3 scores only the patch's delta).
         # Phase 1 runs the SAME configured tools on the UNPATCHED vulnerable file
         # and stores the findings in the manifest as the baseline.
@@ -3317,7 +3435,11 @@ class PipelineOrchestrator:
         poc_exit = record.get("exit_code")
         if poc_exit is None:
             poc_exit = exit_code
-        is_timeout = (not marker_present) and ("TIMEOUT" in run_logs)
+        # Same definition every other site uses. Stricter than a bare "TIMEOUT"
+        # substring (which a PoC could print itself); the accept path already
+        # required exit -1 via timeout_sig, so this only sharpens the label the
+        # no-baseline branch reads back off these runs.
+        is_timeout = (not marker_present) and is_timeout_run(exit_code, run_logs)
         sig = (poc_exit, marker_present, is_timeout)
         self.logger.info(
             f"  Baseline run {i + 1}/{max_runs}: exit={poc_exit} "
@@ -3494,7 +3616,7 @@ class PipelineOrchestrator:
             result.poc_uses_project_build = "yes"
 
             exit_code, run_logs = self.docker_mgr.run_container_from_tag(
-                vuln, vuln.cve_image_tag, self.run_timeout
+                vuln, vuln.cve_image_tag, self.intree_run_timeout
             )
             result.poc_executed = True
             result.container_logs = run_logs
@@ -3547,6 +3669,27 @@ class PipelineOrchestrator:
                 self.logger.warning(f"  {vuln.cve}: {reason} → manual revision")
                 result.status = ExecutionStatus.NEEDS_REVIEW.value
                 result.needs_manual_revision = True
+                result.error_message = reason
+                self._flag_for_manual_revision(vuln, reason, run_logs[-4000:], exit_code)
+            elif is_timeout_run(exit_code, run_logs):
+                # The CONTAINER ceiling fired, so the recipe never reached its
+                # final echo and there is no marker to read. The recipe bounds
+                # itself well inside this ceiling and escalates SIGTERM→SIGKILL,
+                # so getting here means the test process could not be reaped at
+                # all (uninterruptible I/O, an unkillable child). That is an
+                # environment failure, NOT evidence about the CVE: crediting the
+                # hang would be guessing, since we cannot tell a hung test from a
+                # hung harness. Flag it as a timeout in its own right so it is
+                # visible in failure_breakdown instead of hiding among generic
+                # build/run errors (which is how the tcpdump CWE-835 losses went
+                # unnoticed for five campaigns).
+                reason = (f"In-tree test hit the container ceiling "
+                          f"({self.intree_run_timeout}s) before the recipe's own "
+                          f"timeout could report — unreapable hang, no verdict")
+                self.logger.warning(f"  {vuln.cve}: {reason} → manual revision")
+                result.status = ExecutionStatus.NEEDS_REVIEW.value
+                result.needs_manual_revision = True
+                result.timed_out = True
                 result.error_message = reason
                 self._flag_for_manual_revision(vuln, reason, run_logs[-4000:], exit_code)
             else:
@@ -3890,6 +4033,10 @@ class PipelineOrchestrator:
                     result.baseline_exit_code = memo.get("baseline_exit_code")
                     result.vulnerability_reproduced = True
                     result.status = ExecutionStatus.SUCCESS.value
+                    # -1 IS the hang sentinel, so a memoized -1 baseline records a
+                    # run that timed out. Deriving it here keeps a warm re-run's
+                    # results.json identical to the cold run it reuses.
+                    result.timed_out = (result.baseline_exit_code == -1)
                     self.logger.info(
                         f"  {vuln.cve}: reusing memoized baseline "
                         f"(exit={result.baseline_exit_code}) — identical image + "
@@ -3912,6 +4059,11 @@ class PipelineOrchestrator:
                     else last_run.get("run_logs", "")
                 )
                 result.container_logs = last_run.get("run_logs")
+                # A hang that did NOT reach unanimity still hung. _capture_baseline
+                # already decided per run; reuse its verdict rather than re-deriving
+                # one, so a flaky hang is counted exactly like a stable one instead
+                # of vanishing into the non-deterministic bucket unlabelled.
+                result.timed_out = any(r.get("is_timeout") for r in (baseline_runs or []))
                 reason = (
                     f"Non-deterministic PoC — the exit-code signature did not "
                     f"stabilize across {self._baseline_runs} runs "
@@ -3952,10 +4104,25 @@ class PipelineOrchestrator:
                 f"[stable across ≥{self._baseline_min_agree}/{self._baseline_runs} runs]"
             )
 
+            is_container_timeout = (not marker_present
+                                    and is_timeout_run(poc_exit_code, run_logs))
+            if is_container_timeout:
+                result.timed_out = True
+
             # Step 4: LLM-assisted negative filter (safety net). It can only flag
             # an explicit failure → manual revision; it never asserts success.
+            #
+            # On a timeout the logs are PREFIXED with our own banner ("TIMEOUT
+            # after Ns (PoC caused hang/deadlock). Partial output: …"). Handing
+            # that to the filter is the same category error the comment above
+            # warns about for bash's "Killed": the model reads the harness's
+            # diagnostic, concludes the exploit failed, and short-circuits the
+            # chain BEFORE the hang→DoS branch below can credit it — which is
+            # why that branch had never once fired. Judge the PoC's own partial
+            # output instead, and let the explicit timeout policy decide.
+            filter_input = strip_timeout_banner(poc_output) if is_container_timeout else poc_output
             nf = self.poc_analyzer.negative_filter(
-                poc_output, poc_exit_code, vuln.cve,
+                filter_input, poc_exit_code, vuln.cve,
                 poc_metadata.get("poc_category", "OTHER"),
             )
             result.negative_filter_flagged = nf["failed"]
@@ -3975,8 +4142,7 @@ class PipelineOrchestrator:
                 self._flag_for_manual_revision(
                     vuln, nf["reason"], poc_output, poc_exit_code
                 )
-            elif (not marker_present and poc_exit_code == -1
-                    and "TIMEOUT" in run_logs
+            elif (is_container_timeout
                     and poc_metadata.get("poc_category") in ("DOS", "FORMAT_STRING", "OTHER", "INFO_LEAK")
                     and not self._poc_looks_network(poc_path)):
                 # The PoC caused a STABLE container timeout (_capture_baseline
@@ -4003,7 +4169,7 @@ class PipelineOrchestrator:
                 # harness/container infrastructure failure, or exit -1 for a
                 # non-timeout cause. Registering the raw container exit code as a
                 # baseline here would be a false positive.
-                if not marker_present and "TIMEOUT" in run_logs:
+                if is_container_timeout:
                     reason = ("Container timeout — PoC caused hang/deadlock (non-DoS "
                               "category; routing to manual revision for human confirmation)")
                 elif not marker_present:
@@ -4103,6 +4269,13 @@ class PipelineOrchestrator:
                         a_code = a_rec.get("exit_code")
                         if a_code is None:
                             a_code = a_exit
+                        # The 32-bit re-run is a full PoC execution and can hang
+                        # exactly like the 64-bit one, so it gets the same
+                        # treatment: record the timeout, and never judge the
+                        # exploit by our own banner.
+                        if not a_marker and is_timeout_run(a_code, a_logs):
+                            result.timed_out = True
+                            a_out = strip_timeout_banner(a_logs)
                         a_nf = self.poc_analyzer.negative_filter(
                             a_out, a_code, vuln.cve,
                             poc_metadata.get("poc_category", "OTHER"),

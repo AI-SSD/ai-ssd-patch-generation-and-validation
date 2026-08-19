@@ -34,3 +34,4 @@ flawfinder>=2.0.0
 # Visualization (Phase 4)
 matplotlib>=3.5.0
 numpy>=1.21.0
+tiktoken>=0.5.0        # exact prompt-token counts for the OpenAI context guard (optional but recommended)

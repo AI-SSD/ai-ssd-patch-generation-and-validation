@@ -332,7 +332,7 @@ def _grid_content_uncached(run_dir):
 
     secs = []
     if baseline_cells:
-        secs.append(_section("Baseline (built once)", baseline_cells))
+        secs.append(_section("Dataset (built once)", baseline_cells))
     if sweep_cells:
         secs.append(_section("Sweep", sweep_cells))
     for r in reps:      # rep1, rep2, … each its own project×profile matrix
@@ -451,11 +451,16 @@ def cell_progress_html(cell: str) -> str:
         if s1 and not s2.get("running"):
             nofunc = s2.get("skipped_no_function")
             repro_in = s2.get("funnel_reproduced") or int(s1.get("reproduced", 0))
+            contam = s2.get("skipped_contaminated")
             if nofunc is None:
                 tcves = int(s2.get("task_cves") or s2["total_tasks"])
-                nofunc = max(0, int(s1.get("reproduced", 0)) - tcves)
+                # Inference can't split no-function from contamination-filtered;
+                # attribute the whole gap to no-function only when the filter
+                # bucket is absent (older artifacts).
+                nofunc = max(0, int(s1.get("reproduced", 0)) - tcves - int(contam or 0))
             chain2 = (row("Reproduced (in)", repro_in, "#6cf")
-                      + (row("&minus; no patchable fn", nofunc, "#fc6") if nofunc else ""))
+                      + (row("&minus; no patchable fn", nofunc, "#fc6") if nofunc else "")
+                      + (row("&minus; pre-cutoff (contam. filter)", contam, "#c9f") if contam else ""))
         c2 = (prog(s2, "tasks")
               + chain2
               + row("Patch tasks", f"{d2}/{s2['total_tasks']}" if s2.get("running") else s2["total_tasks"])
@@ -593,8 +598,26 @@ def cell_content(run_dir, cell):
                   f"<small>({kb} KB, {mt})</small></li>")
     if not items:
         items = "<li>(no logs yet — the cell may not have started)</li>"
+
+    # Phase 4 report + charts: view (inline) / download links per file.
+    reps = report_files(cell)
+    if reps:
+        ritems = ""
+        for label, rel, kb, mt in reps:
+            q = quote(rel)
+            ritems += (f"<li><a href='/file?f={q}' target=_blank>{html.escape(label)}</a> "
+                       f"<small>({kb} KB, {mt})</small> "
+                       f"&nbsp;<a href='/file?f={q}&dl=1'>&#8681; download</a></li>")
+        reports_html = ("<h3 style='margin:1rem 0 .3rem'>Reports (Phase 4)</h3>"
+                        "<p><small>Markdown report + charts. Click to view; "
+                        "&#8681; downloads the file.</small></p><ul>" + ritems + "</ul>")
+    else:
+        reports_html = ("<h3 style='margin:1rem 0 .3rem'>Reports (Phase 4)</h3>"
+                        "<p><small>(no report yet — Phase 4 has not produced one for "
+                        "this cell)</small></p>")
+
     return ("<p><small>orchestration = phase-level flow; the per-phase files have the "
-            "detailed build/LLM output.</small></p><ul>" + items + "</ul>")
+            "detailed build/LLM output.</small></p><ul>" + items + "</ul>" + reports_html)
 
 
 _CELLCTL_BAR = (
@@ -664,6 +687,65 @@ def raw_text(run_dir, relpath, full):
     if not (path.endswith(".log") and safe_under(path, roots) and os.path.isfile(path)):
         return None
     return tail_text(path, full=full)
+
+
+# ---- artifact files (Phase 4 reports + charts, and other cell artifacts) --
+# Only png/jpeg/pdf render inline; everything else is served either as plain
+# text (readable in the browser) or forced to download. HTML is deliberately
+# NOT rendered inline (would be same-origin script execution on generated
+# content) — it downloads instead.
+_ARTIFACT_CTYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".pdf": "application/pdf",
+    ".md": "text/plain; charset=utf-8", ".txt": "text/plain; charset=utf-8",
+    ".csv": "text/plain; charset=utf-8", ".json": "text/plain; charset=utf-8",
+    ".log": "text/plain; charset=utf-8", ".yaml": "text/plain; charset=utf-8",
+    ".yml": "text/plain; charset=utf-8",
+}
+
+
+def artifact_path(relpath):
+    """Resolve *relpath* to a real file under projects/, or None if unsafe.
+
+    Blocks path traversal (the realpath must stay under the projects root) and
+    directories. Any file a cell produced is fair game — the same tree the
+    per-cell ZIP already bundles — so a link to a report/chart just works.
+    """
+    root = os.path.join(HERE, "projects")
+    path = os.path.realpath(os.path.join(HERE, relpath))
+    if safe_under(path, [root]) and os.path.isfile(path):
+        return path
+    return None
+
+
+def artifact_ctype(path, download):
+    """(content-type, inline?) for *path*. Unknown types download as bytes."""
+    ext = os.path.splitext(path)[1].lower()
+    if download:
+        return "application/octet-stream", False
+    ctype = _ARTIFACT_CTYPES.get(ext)
+    if ctype is None:
+        return "application/octet-stream", False   # unknown -> download
+    return ctype, True
+
+
+def report_files(cell):
+    """List (label, relpath, kb, mtime) for a cell's Phase 4 report artifacts."""
+    rdir = os.path.join(HERE, "projects", cell, "reports")
+    out = []
+    if not os.path.isdir(rdir):
+        return out
+    for p in sorted(glob.glob(os.path.join(rdir, "*")),
+                    key=lambda x: os.path.getmtime(x), reverse=True):
+        if not os.path.isfile(p):
+            continue
+        try:
+            kb = os.path.getsize(p) // 1024
+            mt = time.strftime("%H:%M:%S", time.localtime(os.path.getmtime(p)))
+        except OSError:
+            kb, mt = 0, "?"
+        out.append((os.path.basename(p), os.path.relpath(p, HERE), kb, mt))
+    return out
 
 
 def view_page(run_dir, relpath, full):
@@ -778,10 +860,10 @@ def control_content():
     repeat_grp = (
         "<div class=grp><b>Repeats</b> &nbsp; "
         "<input type=number id=s_repeats value='1' min=1 max=50 step=1 style='width:5rem'> &times; sweep "
-        "<small>(repeat Phase&nbsp;2–4 over the SAME baseline for run-to-run variance; "
+        "<small>(repeat Phase&nbsp;2–4 over the SAME dataset for run-to-run variance; "
         "each repeat in its own dir <code>…__repN</code>)</small> &nbsp; "
-        "<label class=ck><input type=checkbox id=s_reuse> Reuse existing baseline "
-        "<small>(skip the Phase&nbsp;0–1 build when a baseline already exists)</small></label>"
+        "<label class=ck><input type=checkbox id=s_reuse> Reuse existing dataset "
+        "<small>(skip the Phase&nbsp;0–1 build when a dataset already exists)</small></label>"
         "<br><b>Runtime</b> &nbsp; "
         "<label class=ck><input type=checkbox id=s_overlap> Overlap OpenAI + Ollama sweeps "
         "<small>(keeps the remote GPU busy during the OpenAI sweep)</small></label> &nbsp; "
@@ -800,8 +882,8 @@ def control_content():
         "<div class=grp><b>Projects</b>" + (s_proj or "<i>none</i>") + "</div>"
         "<div class=grp><b>Profiles (AI families)</b></div>" + s_prof +
         "<div class=grp><b>Phases</b>" + s_phase +
-        " &nbsp; <small>0–1 build baselines (once, via the baseline profile); 2–4 sweep every profile</small></div>"
-        "<div class=grp><b>Baseline profile</b> <select id=s_baseline>" + base_opts + "</select></div>"
+        " &nbsp; <small>0–1 build the dataset (once, via the dataset profile); 2–4 sweep every profile</small></div>"
+        "<div class=grp><b>Dataset profile</b> <select id=s_baseline>" + base_opts + "</select></div>"
         + repeat_grp + manual_grp +
         "<button class='act start' onclick='doStart()'>&#9654; Start run</button>"
         "<span id=startres></span></fieldset>")
@@ -1050,13 +1132,22 @@ class H(BaseHTTPRequestHandler):
 
     def _send_file(self, path, filename, ctype="application/zip"):
         """Stream a file as an attachment download (chunked — never read whole into RAM)."""
+        self._send_artifact(path, filename, ctype, "attachment")
+
+    def _send_artifact(self, path, filename, ctype, disposition="attachment"):
+        """Stream a file with an explicit Content-Disposition (chunked).
+
+        *disposition* is "inline" (view in the browser) or "attachment"
+        (download). Chunked read so large PNG/PDF/ZIP artifacts never load
+        whole into RAM.
+        """
         try:
             size = os.path.getsize(path)
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(size))
             self.send_header("Content-Disposition",
-                             'attachment; filename="%s"' % filename.replace('"', ""))
+                             '%s; filename="%s"' % (disposition, filename.replace('"', "")))
             self.end_headers()
             with open(path, "rb") as fh:
                 while True:
@@ -1146,6 +1237,25 @@ class H(BaseHTTPRequestHandler):
                 pg = view_page(rd, (q.get("f") or [""])[0], bool(q.get("full"))) if rd else None
                 self._send(pg if pg else "<h3>403 — not a log file</h3><a href=/>&laquo; grid</a>",
                            200 if pg else 403)
+            elif path == "/file":
+                # Serve a single cell artifact (Phase 4 report .md / chart .png,
+                # or any file the cell produced) — inline for viewing, or as an
+                # attachment with &dl=1. Localhost-only, exactly like the ZIP
+                # download (reached through the auth-terminating nginx proxy);
+                # a direct-to-app-port network reader is refused.
+                rel = (q.get("f") or [""])[0]
+                dl = bool(q.get("dl"))
+                fp = artifact_path(rel)
+                if not self._is_local():
+                    self._send("forbidden (artifact access is localhost-only — reach "
+                               "the dashboard via the nginx auth proxy)", 403,
+                               ctype="text/plain; charset=utf-8")
+                elif fp is None:
+                    self._send("<h3>404 — no such artifact</h3><a href=/>&laquo; grid</a>", 404)
+                else:
+                    ctype, inline = artifact_ctype(fp, dl)
+                    disp = "inline" if inline else "attachment"
+                    self._send_artifact(fp, os.path.basename(fp), ctype, disp)
             elif path == "/api/download":
                 # Bundle one project__profile execution (results, logs, reports,
                 # metrics, config, patches, validation outputs) into a single ZIP.

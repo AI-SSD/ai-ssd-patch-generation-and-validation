@@ -23,6 +23,15 @@ The aggregator operates as a sequence of discrete, decoupled modules. They commu
 6. **`PoCRepairLLM`**: Uses an LLM (Ollama or OpenAI) to automatically repair syntax errors and scraping artifacts in invalid PoC scripts.
 7. **`OutputGenerator`**: Exports the final, clean data into a global JSON file, a filtered JSON file, a structured CSV (`cve_poc_complete.csv`), and standalone exploit files (`exploits/`).
 
+### Shared Utilities (`cve_aggregator/utils/`)
+
+In addition to the core pipeline modules, the aggregator package contains shared utilities consumed by the wider pipeline:
+
+- **`build_lock`**: Host-global flock-based counting semaphore that caps concurrent Docker builds (`SSD_BUILD_SLOTS`). Crash-safe — the OS frees slots on process exit.
+- **`gpu_lock`**: Host-global GPU serialization (multi-slot semaphore) ensuring concurrent cells don't thrash the shared Ollama model.
+- **`gpu_monitor`**: Remote Ollama GPU residency gate (`evict`/`wait`/`off` modes) — ensures a model is only loaded when a GPU is free, preventing CPU offload.
+- **`gpu_slots`**: Multi-GPU slot detection and live polling — probes how many GPUs are available and publishes slot counts for all GPU-aware components.
+
 ## ⚙️ Configuration
 
 The aggregator is entirely driven by YAML configuration files. This allows you to point the pipeline at any open-source project without changing Python code.

@@ -112,7 +112,7 @@ poc_repair:
   provider: "openai"
   openai_model: "gpt-4.1-mini"
   openai_api_key: ""
-  api_endpoint: "http://10.3.2.171:80/api/chat"
+  api_endpoint: "http://10.3.1.226:80/api/chat"
   model: "devstral:32k"
   max_repair_attempts: 3
   models_by_attempt:
@@ -180,14 +180,15 @@ phase2:
   language: "c"
   system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for GNU Libtasn1 (the ASN.1/DER parsing library). Your task is to fix a
-    security vulnerability by making the SMALLEST POSSIBLE EDIT to the vulnerable
-    function — never by rewriting it.
+    for GNU Libtasn1 (the ASN.1/DER parsing library). The vulnerability you must
+    fix is {cwe}.
+    Your task is to fix it by making the SMALLEST POSSIBLE EDIT to the
+    vulnerable function — never by rewriting it.
   feedback_system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for GNU Libtasn1. Your previous patch attempt FAILED validation. Analyze the
-    failure and produce an improved fix as MINIMAL edits — never rewrite the whole
-    function.
+    for GNU Libtasn1. Your previous patch attempt for {cve_id} — {cwe} —
+    FAILED validation. Analyze the failure and produce an improved fix as
+    MINIMAL edits — never rewrite the whole function.
   internal_headers: []
 
 # ---------------------------------------------------------------------------
@@ -410,7 +411,7 @@ phase1:
       # compile can't do this (the test isn't built by `make all`, and needs the
       # generated headers). On the VULNERABLE build the test FAILS = reproduced.
       echo "--- make check TESTS=$TEST_NAME (subdir: $TEST_SUBDIR) ---"
-      timeout "${INTREE_TEST_TIMEOUT:-400}" make -C "$TEST_SUBDIR" check TESTS="$TEST_NAME" > /tmp/mt.log 2>&1; rc=$?
+      timeout -k 10 "${INTREE_TEST_TIMEOUT:-400}" make -C "$TEST_SUBDIR" check TESTS="$TEST_NAME" > /tmp/mt.log 2>&1; rc=$?
       tail -30 /tmp/mt.log
       # Trust ONLY the automake .trs verdict (written when the test actually RAN).
       # A make-check failure WITHOUT a .trs means the test didn't run (not

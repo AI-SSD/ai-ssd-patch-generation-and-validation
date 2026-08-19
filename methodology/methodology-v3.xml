@@ -1,2 +1,234 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<mxfile host="app.diagrams.net"><diagram name="Patch Generation Methodology v3" id="67y4caDXKMbkUt7eREjM">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</diagram></mxfile>
+<mxfile host="app.diagrams.net">
+  <diagram name="Patch Generation Methodology v3" id="67y4caDXKMbkUt7eREjM">
+    <mxGraphModel dx="1522" dy="1071" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="dwZvLoOHMn5egd8erE4k-1" parent="1" style="swimlane;whiteSpace=wrap;html=1;startSize=30;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1" value="Phase 0: CVE Aggregator" vertex="1">
+          <mxGeometry x="40" y="40" width="260" height="545" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-2" parent="dwZvLoOHMn5egd8erE4k-1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="1. Fetch &amp; Enrich CVEs&#10;(NVD 2.0 API; CVE.org enrichment optional, off by default)" vertex="1">
+          <mxGeometry x="30" y="45" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-3" parent="dwZvLoOHMn5egd8erE4k-1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="2. Discover Commits&#10;(fix + vulnerable parent; production-source preferred)" vertex="1">
+          <mxGeometry x="30" y="120" width="200" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-4" parent="dwZvLoOHMn5egd8erE4k-1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="3. Map PoCs to CVEs&#10;(ExploitDB cross-reference + reverse-search)" vertex="1">
+          <mxGeometry x="30" y="190" width="200" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="upd8-intree" parent="dwZvLoOHMn5egd8erE4k-1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="3b. Harvest In-Tree Regression Tests&#10;(from fix / sibling CVE-citing commits)" vertex="1">
+          <mxGeometry x="30" y="260" width="200" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-5" parent="dwZvLoOHMn5egd8erE4k-1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="4. Validate &amp; Repair PoCs&#10;(syntax check + LLM repair)" vertex="1">
+          <mxGeometry x="30" y="330" width="200" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-6" parent="dwZvLoOHMn5egd8erE4k-1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="5. Build Dataset&#10;(CSV / JSON; rows = ExploitDB PoCs + in-tree tests)" vertex="1">
+          <mxGeometry x="30" y="400" width="200" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-7" parent="dwZvLoOHMn5egd8erE4k-1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" value="Manual Review Gate&#10;(timed pause, auto-skip after 30 min; .ok markers)" vertex="1">
+          <mxGeometry x="30" y="470" width="200" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-8" edge="1" parent="dwZvLoOHMn5egd8erE4k-1" source="dwZvLoOHMn5egd8erE4k-2" target="dwZvLoOHMn5egd8erE4k-3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-9" edge="1" parent="dwZvLoOHMn5egd8erE4k-1" source="dwZvLoOHMn5egd8erE4k-3" target="dwZvLoOHMn5egd8erE4k-4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-10" edge="1" parent="dwZvLoOHMn5egd8erE4k-1" source="dwZvLoOHMn5egd8erE4k-4" target="upd8-intree" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="upd8-e1" edge="1" parent="dwZvLoOHMn5egd8erE4k-1" source="upd8-intree" target="dwZvLoOHMn5egd8erE4k-5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-11" edge="1" parent="dwZvLoOHMn5egd8erE4k-1" source="dwZvLoOHMn5egd8erE4k-5" target="dwZvLoOHMn5egd8erE4k-6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-12" edge="1" parent="dwZvLoOHMn5egd8erE4k-1" source="dwZvLoOHMn5egd8erE4k-5" target="dwZvLoOHMn5egd8erE4k-7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0;exitY=0.5;entryX=0;entryY=0.5;dashed=1;entryDx=0;entryDy=0;exitDx=0;exitDy=0;" value="invalid / no runnable PoC">
+          <mxGeometry relative="1" x="-0.3151" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="10" y="358" />
+              <mxPoint x="10" y="497" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-13" parent="1" style="swimlane;whiteSpace=wrap;html=1;startSize=30;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1" value="Phase 1: Vulnerability Reproduction" vertex="1">
+          <mxGeometry x="360" y="40" width="320" height="650" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-14" parent="dwZvLoOHMn5egd8erE4k-13" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="1. Resolve Build Era&#10;(tree version → Ubuntu base; commit-date fallback)" vertex="1">
+          <mxGeometry x="50" y="45" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-15" parent="dwZvLoOHMn5egd8erE4k-13" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="2. Build Base + CVE Image&#10;(reuse base per ubuntu_version; era + i386 fallbacks)" vertex="1">
+          <mxGeometry x="50" y="110" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-16" parent="dwZvLoOHMn5egd8erE4k-13" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="3. Run Reproducer (PoC / in-tree test)&#10;→ deterministic baseline (multi-run agreement)" vertex="1">
+          <mxGeometry x="50" y="175" width="220" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-17" parent="dwZvLoOHMn5egd8erE4k-13" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1" value="Reproducer links project build?" vertex="1">
+          <mxGeometry x="50" y="240" width="220" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-18" parent="dwZvLoOHMn5egd8erE4k-13" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="4. LLM Negative Filter&#10;(explicit-failure scan of stdout; regex authoritative / fallback)" vertex="1">
+          <mxGeometry x="50" y="360" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-19" parent="dwZvLoOHMn5egd8erE4k-13" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1" value="Exploit self-reported failure&#10;or no usable baseline?" vertex="1">
+          <mxGeometry x="50" y="450" width="220" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-20" parent="dwZvLoOHMn5egd8erE4k-13" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1" value="Manual Revision" vertex="1">
+          <mxGeometry x="20" y="570" width="130" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-21" parent="dwZvLoOHMn5egd8erE4k-13" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1" value="Confirm Reproduced" vertex="1">
+          <mxGeometry x="170" y="570" width="130" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-22" edge="1" parent="dwZvLoOHMn5egd8erE4k-13" source="dwZvLoOHMn5egd8erE4k-14" target="dwZvLoOHMn5egd8erE4k-15" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-23" edge="1" parent="dwZvLoOHMn5egd8erE4k-13" source="dwZvLoOHMn5egd8erE4k-15" target="dwZvLoOHMn5egd8erE4k-16" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-24" edge="1" parent="dwZvLoOHMn5egd8erE4k-13" source="dwZvLoOHMn5egd8erE4k-16" target="dwZvLoOHMn5egd8erE4k-17" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-25" edge="1" parent="dwZvLoOHMn5egd8erE4k-13" source="dwZvLoOHMn5egd8erE4k-17" target="dwZvLoOHMn5egd8erE4k-18" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" value="Yes">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-26" edge="1" parent="dwZvLoOHMn5egd8erE4k-13" source="dwZvLoOHMn5egd8erE4k-17" target="dwZvLoOHMn5egd8erE4k-20" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0;exitY=0.5;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" value="No (after era + i386 fallbacks)">
+          <mxGeometry relative="1" x="-0.8613" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="-20" y="277" />
+              <mxPoint x="-20" y="600" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-27" edge="1" parent="dwZvLoOHMn5egd8erE4k-13" source="dwZvLoOHMn5egd8erE4k-18" target="dwZvLoOHMn5egd8erE4k-19" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-28" edge="1" parent="dwZvLoOHMn5egd8erE4k-13" source="dwZvLoOHMn5egd8erE4k-19" target="dwZvLoOHMn5egd8erE4k-20" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.25;exitY=1;entryX=0.5;entryY=0;" value="Yes">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-29" edge="1" parent="dwZvLoOHMn5egd8erE4k-13" source="dwZvLoOHMn5egd8erE4k-19" target="dwZvLoOHMn5egd8erE4k-21" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.75;exitY=1;entryX=0.5;entryY=0;" value="No">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-30" parent="1" style="swimlane;whiteSpace=wrap;html=1;startSize=30;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1" value="Phase 2: Patch Generation" vertex="1">
+          <mxGeometry x="740" y="40" width="260" height="350" as="geometry" />
+        </mxCell>
+        <mxCell id="upd8-cgate" parent="dwZvLoOHMn5egd8erE4k-30" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;dashed=1;fontStyle=1" value="0. Contamination Gate (default ON)&#10;(only CVEs published after the model's training cutoff)" vertex="1">
+          <mxGeometry x="30" y="45" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-31" parent="dwZvLoOHMn5egd8erE4k-30" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="1. Code Analysis &amp; Prompting&#10;(vuln code + per-CVE CWE spear prompt + PoC)" vertex="1">
+          <mxGeometry x="30" y="120" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-32" parent="dwZvLoOHMn5egd8erE4k-30" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="2. Generate Patch&#10;(SEARCH/REPLACE edits; context-window guard + family ramp)" vertex="1">
+          <mxGeometry x="30" y="195" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-33" parent="dwZvLoOHMn5egd8erE4k-30" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="3. Extract Artifacts&#10;(patched file + patched function)" vertex="1">
+          <mxGeometry x="30" y="270" width="200" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="upd8-e2" edge="1" parent="dwZvLoOHMn5egd8erE4k-30" source="upd8-cgate" target="dwZvLoOHMn5egd8erE4k-31" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-34" edge="1" parent="dwZvLoOHMn5egd8erE4k-30" source="dwZvLoOHMn5egd8erE4k-31" target="dwZvLoOHMn5egd8erE4k-32" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-35" edge="1" parent="dwZvLoOHMn5egd8erE4k-30" source="dwZvLoOHMn5egd8erE4k-32" target="dwZvLoOHMn5egd8erE4k-33" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-36" parent="1" style="swimlane;whiteSpace=wrap;html=1;startSize=30;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1" value="Phase 3: Patch Validation" vertex="1">
+          <mxGeometry x="40" y="609" width="280" height="541" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-37" parent="dwZvLoOHMn5egd8erE4k-36" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="1. Build Patched Image&#10;(incremental FROM Phase 1 image)" vertex="1">
+          <mxGeometry x="30" y="45" width="220" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-38" parent="dwZvLoOHMn5egd8erE4k-36" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="2. Re-run Reproducer&#10;(same wrapper / in-tree test as Phase 1)" vertex="1">
+          <mxGeometry x="30" y="120" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-39" parent="dwZvLoOHMn5egd8erE4k-36" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1" value="Exploit blocked?&#10;(behaviour differs from vulnerable baseline; in-tree test PASS)" vertex="1">
+          <mxGeometry x="30" y="185" width="220" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-40" parent="dwZvLoOHMn5egd8erE4k-36" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="3. Static Check (SAST, host-side)&#10;(YAML-declared: cppcheck, clang-tidy, semgrep, flawfinder / semgrep, pmd)" vertex="1">
+          <mxGeometry x="30" y="295" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-41" parent="dwZvLoOHMn5egd8erE4k-36" style="rhombus;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1" value="SAST clean?&#10;(no NEW findings vs Phase 1 SAST baseline)" vertex="1">
+          <mxGeometry x="30" y="360" width="220" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-42" parent="dwZvLoOHMn5egd8erE4k-36" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1" value="4. Feedback / Report&#10;(metrics / artifacts)" vertex="1">
+          <mxGeometry x="30" y="470" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-43" edge="1" parent="dwZvLoOHMn5egd8erE4k-36" source="dwZvLoOHMn5egd8erE4k-37" target="dwZvLoOHMn5egd8erE4k-38" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-44" edge="1" parent="dwZvLoOHMn5egd8erE4k-36" source="dwZvLoOHMn5egd8erE4k-38" target="dwZvLoOHMn5egd8erE4k-39" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-45" edge="1" parent="dwZvLoOHMn5egd8erE4k-36" source="dwZvLoOHMn5egd8erE4k-39" target="dwZvLoOHMn5egd8erE4k-40" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" value="Yes (blocked)">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-47" edge="1" parent="dwZvLoOHMn5egd8erE4k-36" source="dwZvLoOHMn5egd8erE4k-40" target="dwZvLoOHMn5egd8erE4k-41" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-46" edge="1" parent="dwZvLoOHMn5egd8erE4k-36" source="dwZvLoOHMn5egd8erE4k-41" target="dwZvLoOHMn5egd8erE4k-42" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" value="Yes">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-48" parent="1" style="swimlane;whiteSpace=wrap;html=1;startSize=30;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1" value="Phase 4: Reporting" vertex="1">
+          <mxGeometry x="730" y="1020" width="260" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-49" parent="dwZvLoOHMn5egd8erE4k-48" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;fontStyle=1" value="Document Results&#10;(metrics, charts, per-model / per-CVE tables)" vertex="1">
+          <mxGeometry x="30" y="54" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-50" edge="1" parent="1" source="dwZvLoOHMn5egd8erE4k-6" target="dwZvLoOHMn5egd8erE4k-14" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;fontStyle=1;entryDx=0;entryDy=0;exitDx=0;exitDy=0;" value="dataset (CSV)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="320" y="467" />
+              <mxPoint x="320" y="110" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-51" edge="1" parent="1" source="dwZvLoOHMn5egd8erE4k-21" target="upd8-cgate" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;fontStyle=1;entryDx=0;entryDy=0;" value="reproduced + baseline">
+          <mxGeometry relative="1" x="-0.1496" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="710" y="640" />
+              <mxPoint x="710" y="115" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-52" edge="1" parent="1" source="dwZvLoOHMn5egd8erE4k-33" target="dwZvLoOHMn5egd8erE4k-37" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;fontStyle=1;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" value="patch artifacts">
+          <mxGeometry relative="1" x="0.3801" as="geometry">
+            <mxPoint x="-1" as="offset" />
+            <Array as="points">
+              <mxPoint x="870" y="743" />
+              <mxPoint x="340" y="743" />
+              <mxPoint x="340" y="682" />
+            </Array>
+            <mxPoint x="120" y="793" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-54" edge="1" parent="1" source="dwZvLoOHMn5egd8erE4k-39" target="dwZvLoOHMn5egd8erE4k-31" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;strokeColor=#FF0000;strokeWidth=2;fontStyle=1;exitX=1;exitY=0.5;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" value="No: PoC still works / hang / build failed&#10;→ feedback (attempt-1 best-of-4 fan-out,&#10;then max 3 re-prompts)">
+          <mxGeometry relative="1" x="-0.6226" y="-25" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="990" y="834" />
+              <mxPoint x="990" y="190" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-55" edge="1" parent="1" source="dwZvLoOHMn5egd8erE4k-41" target="dwZvLoOHMn5egd8erE4k-31" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;strokeColor=#FF0000;strokeWidth=2;fontStyle=1;exitX=1;exitY=0.5;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" value="No: new SAST findings&#10;→ feedback">
+          <mxGeometry relative="1" x="-0.6654" y="-21" as="geometry">
+            <mxPoint as="offset" />
+            <Array as="points">
+              <mxPoint x="990" y="1009" />
+              <mxPoint x="990" y="190" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="upd8-note" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontStyle=2;fontSize=10;" value="Environment errors (no baseline / execution error)&#10;break the feedback loop; the best-of-4 fan-out&#10;fires once, at attempt 1." vertex="1">
+          <mxGeometry x="1010" y="540" width="230" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="dwZvLoOHMn5egd8erE4k-56" edge="1" parent="1" source="dwZvLoOHMn5egd8erE4k-42" target="dwZvLoOHMn5egd8erE4k-49" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;entryX=0;entryY=0.5;entryDx=0;entryDy=0;">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

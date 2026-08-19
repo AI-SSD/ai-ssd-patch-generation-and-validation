@@ -1,0 +1,4411 @@
+[
+  {
+    "cve": "CVE-2014-8767",
+    "fix_commit": "35e410ca1f6ae8d87c9103cf04d6f6c85735b11b",
+    "parent_commit": "35e410ca1f6ae8d87c9103cf04d6f6c85735b11b^",
+    "era": "24.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "",
+    "FilePath": "tests/TESTLIST",
+    "groundtruth": "UNCONFIRMABLE",
+    "reason": "no source file to revert (fix touches only tests/meta)",
+    "revert_files": []
+  },
+  {
+    "cve": "CVE-2014-8768",
+    "fix_commit": "35e410ca1f6ae8d87c9103cf04d6f6c85735b11b",
+    "parent_commit": "35e410ca1f6ae8d87c9103cf04d6f6c85735b11b^",
+    "era": "24.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "",
+    "FilePath": "tests/TESTLIST",
+    "groundtruth": "UNCONFIRMABLE",
+    "reason": "no source file to revert (fix touches only tests/meta)",
+    "revert_files": []
+  },
+  {
+    "cve": "CVE-2014-8769",
+    "fix_commit": "35e410ca1f6ae8d87c9103cf04d6f6c85735b11b",
+    "parent_commit": "35e410ca1f6ae8d87c9103cf04d6f6c85735b11b^",
+    "era": "24.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "",
+    "FilePath": "tests/TESTLIST",
+    "groundtruth": "UNCONFIRMABLE",
+    "reason": "no source file to revert (fix touches only tests/meta)",
+    "revert_files": []
+  },
+  {
+    "cve": "CVE-2016-7923",
+    "fix_commit": "64f6392084ec0768b8afc04612eac0a458bc5e0d",
+    "parent_commit": "64f6392084ec0768b8afc04612eac0a458bc5e0d^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "arp_print",
+    "FilePath": "print-arp.c",
+    "revert_files": [
+      "print-arp.c"
+    ],
+    "pcap": "arp-too-long-tha.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "global-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #1 0x43025b in arp_print print-arp.c:361",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7924",
+    "fix_commit": "d9dbb118f2f9c09a8548a2b34a6573f611c0bcf7",
+    "parent_commit": "d9dbb118f2f9c09a8548a2b34a6573f611c0bcf7^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "oam_print",
+    "FilePath": "print-atm.c",
+    "revert_files": [
+      "netdissect.h",
+      "print-atm.c"
+    ],
+    "pcap": "atm-oam-heapoverflow.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x435528 in EXTRACT_32BITS extract.h:150",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7925",
+    "fix_commit": "c4744fc29aefea62ab751d50d5e4743c3065ef5f",
+    "parent_commit": "c4744fc29aefea62ab751d50d5e4743c3065ef5f^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "sl_if_print",
+    "FilePath": "print-sl.c",
+    "revert_files": [
+      "print-sl.c"
+    ],
+    "pcap": "heapoverflow-sl_if_print.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x54a86c in sl_if_print print-sl.c:78",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7926",
+    "fix_commit": "8be5413f3a168bd9913ac7ab348404f5af54dd42",
+    "parent_commit": "8be5413f3a168bd9913ac7ab348404f5af54dd42^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ethertype_print",
+    "FilePath": "print-ether.c",
+    "revert_files": [
+      "print-ether.c"
+    ],
+    "pcap": "isoclns-heapoverflow.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x4ad376 in isoclns_print print-isoclns.c:684",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7927",
+    "fix_commit": "da946bdc6c4a6f8adaaef67f93d95f499a9cb145",
+    "parent_commit": "da946bdc6c4a6f8adaaef67f93d95f499a9cb145^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ieee802_11_radio_print",
+    "FilePath": "print-802_11.c",
+    "revert_files": [
+      "print-802_11.c"
+    ],
+    "pcap": "radiotap-heapoverflow.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x424106 in ieee802_11_radio_print print-802_11.c:3125",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7928",
+    "fix_commit": "a36c495ef49f96d41cd39caa5283aa6c4c32fd8b",
+    "parent_commit": "a36c495ef49f96d41cd39caa5283aa6c4c32fd8b^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ipcomp_print",
+    "FilePath": "print-ipcomp.c",
+    "revert_files": [
+      "print-ipcomp.c"
+    ],
+    "pcap": "ipcomp-heapoverflow.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x49b5c7 in EXTRACT_16BITS extract.h:144",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7929",
+    "fix_commit": "5e48a557542817a3bd6d344a1b96a3c9ad8ccfb8",
+    "parent_commit": "5e48a557542817a3bd6d344a1b96a3c9ad8ccfb8^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "juniper_parse_header",
+    "FilePath": "print-juniper.c",
+    "revert_files": [
+      "print-juniper.c"
+    ],
+    "pcap": "juniper_header-heapoverflow.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x4bfaf9 in juniper_parse_header print-juniper.c:1202",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7930",
+    "fix_commit": "9845aa1860a411c40e5f86b74443508d58fc67f9",
+    "parent_commit": "9845aa1860a411c40e5f86b74443508d58fc67f9^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "llc_print",
+    "FilePath": "print-llc.c",
+    "revert_files": [
+      "print-llc.c"
+    ],
+    "pcap": "llc-xid-heapoverflow.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x4c9f99 in llc_print print-llc.c:361",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7931",
+    "fix_commit": "69ead2a09cf7d0666c6a7ac12e47fd9743242c61",
+    "parent_commit": "69ead2a09cf7d0666c6a7ac12e47fd9743242c61^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "mpls_print",
+    "FilePath": "print-mpls.c",
+    "revert_files": [
+      "print-mpls.c"
+    ],
+    "pcap": "mpls-label-heapoverflow.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x4de5e4 in mpls_print print-mpls.c:127",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7932",
+    "fix_commit": "df259cada3c5a2d0a6da7b33c1a259953980a639",
+    "parent_commit": "df259cada3c5a2d0a6da7b33c1a259953980a639^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "pimv2_check_checksum",
+    "FilePath": "print-pim.c",
+    "revert_files": [
+      "print-pim.c"
+    ],
+    "pcap": "heapoverflow-in_checksum.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x413c74 in in_cksum in_cksum.c:116",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7933",
+    "fix_commit": "f6ae2501feb6aa4d54f39d4df6355bd6bcfa34d3",
+    "parent_commit": "f6ae2501feb6aa4d54f39d4df6355bd6bcfa34d3^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ppp_hdlc_if_print",
+    "FilePath": "print-ppp.c",
+    "revert_files": [
+      "print-ppp.c"
+    ],
+    "pcap": "heapoverflow-ppp_hdlc_if_print.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x515dc9 in ppp_hdlc_if_print print-ppp.c:1694",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7934",
+    "fix_commit": "cb922d07cce6574874b954555ebad4338748087b",
+    "parent_commit": "cb922d07cce6574874b954555ebad4338748087b^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "rtcp_print",
+    "FilePath": "print-udp.c",
+    "revert_files": [
+      "print-udp.c"
+    ],
+    "pcap": "rtp-seg-fault-1.pcap",
+    "flags": "-t -v -T rtp",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "SEGV",
+      "crash": null,
+      "top_frame": "    #0 0x564b38 in EXTRACT_32BITS extract.h:150",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7936",
+    "fix_commit": "cb696b8e91d9860dd30ec3b7dcb16424cd6e18ac",
+    "parent_commit": "cb696b8e91d9860dd30ec3b7dcb16424cd6e18ac^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "udp_print",
+    "FilePath": "print-udp.c",
+    "revert_files": [
+      "print-udp.c"
+    ],
+    "pcap": "udp-length-heapoverflow.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x563b7b in EXTRACT_16BITS extract.h:144",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7939",
+    "fix_commit": "237efcf593ee369519e9dfdc9166702219dabfec",
+    "parent_commit": "237efcf593ee369519e9dfdc9166702219dabfec^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "gre_print",
+    "FilePath": "print-gre.c",
+    "revert_files": [
+      "print-gre.c"
+    ],
+    "pcap": "gre-heapoverflow-1.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x47de2f in EXTRACT_16BITS extract.h:144",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7940",
+    "fix_commit": "968776fbf5cd65c7ea2168912bd9f4379727eb11",
+    "parent_commit": "968776fbf5cd65c7ea2168912bd9f4379727eb11^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "stp_print",
+    "FilePath": "print-stp.c",
+    "revert_files": [
+      "extract.h",
+      "print-stp.c"
+    ],
+    "pcap": "stp-heapoverflow-1.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x558e4f in stp_print print-stp.c:383",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7973",
+    "fix_commit": "5356a9ea6903b835185eda83e8a17d6e4e990fb5",
+    "parent_commit": "5356a9ea6903b835185eda83e8a17d6e4e990fb5^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "atalk_print",
+    "FilePath": "print-atalk.c",
+    "revert_files": [
+      "print-atalk.c"
+    ],
+    "pcap": "heapoverflow-atalk_print.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x43218f in atalk_print print-atalk.c:175",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7974",
+    "fix_commit": "98f666f243759373773f08f8a91d42cc6f8c3e50",
+    "parent_commit": "98f666f243759373773f08f8a91d42cc6f8c3e50^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ipN_print",
+    "FilePath": "print-ip.c",
+    "revert_files": [
+      "print-ip.c"
+    ],
+    "pcap": "heap-overflow-1.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x4975b5 in ipN_print print-ip.c:690",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7975",
+    "fix_commit": "3e00e6a4b8fd976f05f094bba2b2c7657985c7ae",
+    "parent_commit": "3e00e6a4b8fd976f05f094bba2b2c7657985c7ae^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "tcp_print",
+    "FilePath": "print-tcp.c",
+    "revert_files": [
+      "print-tcp.c"
+    ],
+    "pcap": "heapoverflow-tcp_print.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55caa5 in tcp_print print-tcp.c:613",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7983",
+    "fix_commit": "7bf069c2517690262aacbddc437731af991b31a7",
+    "parent_commit": "7bf069c2517690262aacbddc437731af991b31a7^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "bootp_print",
+    "FilePath": "print-bootp.c",
+    "revert_files": [
+      "netdissect.h",
+      "print-bootp.c",
+      "print-tftp.c",
+      "util-print.c"
+    ],
+    "pcap": "tftp-heapoverflow.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #1 0x56159d in tftp_print print-tftp.c:143",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7985",
+    "fix_commit": "6bc44295cfbe1f7b6633c755841518f4b159aa8a",
+    "parent_commit": "6bc44295cfbe1f7b6633c755841518f4b159aa8a^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ieee802_11_print",
+    "FilePath": "print-802_11.c",
+    "revert_files": [
+      "netdissect.h",
+      "print-802_11.c",
+      "print-ap1394.c",
+      "print-calm-fast.c",
+      "print-ether.c",
+      "print-fddi.c",
+      "print-fr.c",
+      "print-geneve.c",
+      "print-geonet.c",
+      "print-ipfc.c",
+      "print-juniper.c",
+      "print-llc.c",
+      "print-medsa.c",
+      "print-rrcp.c",
+      "print-sll.c",
+      "print-symantec.c",
+      "print-token.c"
+    ],
+    "pcap": "calm-fast-mac-lookup-heapoverflow.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x40b4ca in lookup_emem addrtoname.c:335",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-7992",
+    "fix_commit": "4ef024c8e94459e3ab9afae90e1948406e1d04db",
+    "parent_commit": "4ef024c8e94459e3ab9afae90e1948406e1d04db^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "cip_if_print",
+    "FilePath": "print-cip.c",
+    "revert_files": [
+      "print-cip.c"
+    ],
+    "pcap": "heap-overflow-2.pcap",
+    "flags": "-t -v -n",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #1 0x4557d9 in cip_if_print print-cip.c:68",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2016-8575",
+    "fix_commit": "c39c1d99ac3b6d5d9519b39da6717180651650d3",
+    "parent_commit": "c39c1d99ac3b6d5d9519b39da6717180651650d3^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "q933_print",
+    "FilePath": "print-fr.c",
+    "revert_files": [
+      "print-fr.c"
+    ],
+    "pcap": "q933-heapoverflow-2.pcap",
+    "flags": "-t",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5618b85a0b7e in q933_print print-fr.c:909",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-11108",
+    "fix_commit": "60c708bb926465d349f83a16978501913cae027d",
+    "parent_commit": "60c708bb926465d349f83a16978501913cae027d^",
+    "era": "24.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "stp_print",
+    "FilePath": "print-stp.c",
+    "revert_files": [
+      "print-stp.c"
+    ],
+    "pcap": "stp-v4-length-sigsegv.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 1,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "FAIL",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 1,
+      "configure_failed": false
+    },
+    "groundtruth": "REFUTED",
+    "reason": "test still fails on the upstream-fixed tree (fix/test mismatch)"
+  },
+  {
+    "cve": "CVE-2017-11541",
+    "fix_commit": "21d702a136c5c16882e368af7c173df728242280",
+    "parent_commit": "21d702a136c5c16882e368af7c173df728242280^",
+    "era": "24.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "safeputs",
+    "FilePath": "util-print.c",
+    "revert_files": [
+      "util-print.c"
+    ],
+    "pcap": "hoobr_safeputs.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x562f4a40d8ee in safeputs util-print.c:907",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-11542",
+    "fix_commit": "bed48062a64fca524156d7684af19f5b4a116fae",
+    "parent_commit": "bed48062a64fca524156d7684af19f5b4a116fae^",
+    "era": "24.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "pimv1_print",
+    "FilePath": "print-pim.c",
+    "revert_files": [
+      "print-pim.c"
+    ],
+    "pcap": "hoobr_pimv1.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55b5e4ed3f9c in pimv1_print print-pim.c:309",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-11543",
+    "fix_commit": "7039327875525278d17edee59720e29a3e76b7b3",
+    "parent_commit": "7039327875525278d17edee59720e29a3e76b7b3^",
+    "era": "24.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "sliplink_print",
+    "FilePath": "print-sl.c",
+    "revert_files": [
+      "print-sl.c"
+    ],
+    "pcap": "slip-bad-direction.pcap",
+    "flags": "-ve",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "SEGV",
+      "crash": null,
+      "top_frame": "    #0 0x55588b59a866 in compressed_sl_print print-sl.c:253",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12893",
+    "fix_commit": "6f5ba2b651cd9d4b7fa8ee5c4f94460645877c45",
+    "parent_commit": "6f5ba2b651cd9d4b7fa8ee5c4f94460645877c45^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "name_len",
+    "FilePath": "smbutil.c",
+    "revert_files": [
+      "smbutil.c"
+    ],
+    "pcap": "nbns-valgrind.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55c0528b13a5 in name_len smbutil.c:235",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12894",
+    "fix_commit": "730fc35968c5433b9e2a829779057f4f9495dc51",
+    "parent_commit": "730fc35968c5433b9e2a829779057f4f9495dc51^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "le64addr_string",
+    "FilePath": "addrtoname.c",
+    "revert_files": [
+      "addrtoname.c"
+    ],
+    "pcap": "arp-oobr.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 124,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "FAIL",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 124,
+      "configure_failed": false
+    },
+    "groundtruth": "REFUTED",
+    "reason": "test still fails on the upstream-fixed tree (fix/test mismatch)"
+  },
+  {
+    "cve": "CVE-2017-12895",
+    "fix_commit": "2b62d1dda41590db29368ec7ba5f4faf3464765a",
+    "parent_commit": "2b62d1dda41590db29368ec7ba5f4faf3464765a^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "icmp_print",
+    "FilePath": "print-icmp.c",
+    "revert_files": [
+      "print-icmp.c"
+    ],
+    "pcap": "icmp-cksum-oobr-1.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x558c4e937f81 in in_cksum in_cksum.c:109",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12896",
+    "fix_commit": "4e430c6b0d8b7e77c7abca7e7afb0c3e727502f2",
+    "parent_commit": "4e430c6b0d8b7e77c7abca7e7afb0c3e727502f2^",
+    "era": "18.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "",
+    "FilePath": "tests/TESTLIST",
+    "groundtruth": "UNCONFIRMABLE",
+    "reason": "no source file to revert (fix touches only tests/meta)",
+    "revert_files": []
+  },
+  {
+    "cve": "CVE-2017-12897",
+    "fix_commit": "1dcd10aceabbc03bf571ea32b892c522cbe923de",
+    "parent_commit": "1dcd10aceabbc03bf571ea32b892c522cbe923de^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "atm_if_print",
+    "FilePath": "print-atm.c",
+    "revert_files": [
+      "netdissect.h",
+      "print-atm.c",
+      "print-chdlc.c",
+      "print-ether.c",
+      "print-fr.c",
+      "print-gre.c",
+      "print-isoclns.c",
+      "print-juniper.c",
+      "print-llc.c",
+      "print-mpls.c",
+      "print-null.c",
+      "print-ppp.c"
+    ],
+    "pcap": "isoclns-oobr.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5640bf1db9e3 in isoclns_print print-isoclns.c:684",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12898",
+    "fix_commit": "19d25dd8781620cd41bf178a5e2e27fc1cf242d0",
+    "parent_commit": "19d25dd8781620cd41bf178a5e2e27fc1cf242d0^",
+    "era": "18.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "interp_reply",
+    "FilePath": "print-nfs.c",
+    "revert_files": [
+      "print-nfs.c"
+    ],
+    "pcap": "nfs-attr-oobr.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "REFUTED",
+    "reason": "test passes even on the vulnerable tree (does not exercise the vuln)"
+  },
+  {
+    "cve": "CVE-2017-12899",
+    "fix_commit": "c6e0531b5def26ecf912e8de6ade86cbdaed3751",
+    "parent_commit": "c6e0531b5def26ecf912e8de6ade86cbdaed3751^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "decnet_print",
+    "FilePath": "print-decnet.c",
+    "revert_files": [
+      "print-decnet.c"
+    ],
+    "pcap": "decnet-oobr.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55d283f85062 in decnet_print print-decnet.c:545",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12900",
+    "fix_commit": "0318fa8b61bd6c837641129d585f1a73c652b1e0",
+    "parent_commit": "0318fa8b61bd6c837641129d585f1a73c652b1e0^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "",
+    "FilePath": "print-bgp.c",
+    "revert_files": [
+      "print-bgp.c",
+      "print-lldp.c",
+      "print-lspping.c",
+      "print-zephyr.c"
+    ],
+    "pcap": "tok2str-oobr-1.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "global-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x561e93ca75a0 in tok2strbuf util-print.c:486",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12901",
+    "fix_commit": "de981e6070d168b58ec1bb0713ded77ed4ad87f4",
+    "parent_commit": "de981e6070d168b58ec1bb0713ded77ed4ad87f4^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "eigrp_print",
+    "FilePath": "print-eigrp.c",
+    "revert_files": [
+      "print-eigrp.c"
+    ],
+    "pcap": "eigrp-tlv-oobr.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55cb8f5982ec in eigrp_print print-eigrp.c:312",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12902",
+    "fix_commit": "6ec0c6fa63412c7a07a5bcb790a529c3563b4173",
+    "parent_commit": "6ec0c6fa63412c7a07a5bcb790a529c3563b4173^",
+    "era": "18.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "",
+    "FilePath": "tests/TESTLIST",
+    "groundtruth": "UNCONFIRMABLE",
+    "reason": "no source file to revert (fix touches only tests/meta)",
+    "revert_files": []
+  },
+  {
+    "cve": "CVE-2017-12985",
+    "fix_commit": "66df248b49095c261138b5a5e34d341a6bf9ac7f",
+    "parent_commit": "66df248b49095c261138b5a5e34d341a6bf9ac7f^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ip6_print",
+    "FilePath": "print-ip6.c",
+    "revert_files": [
+      "print-ip6.c",
+      "print-mobility.c"
+    ],
+    "pcap": "ipv6-next-header-oobr-1.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55eaf9e5e38e in rt6_print print-rt6.c:48",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12986",
+    "fix_commit": "7ac73d6cd41e9d4ac0ca7e6830ca390e195bb21c",
+    "parent_commit": "7ac73d6cd41e9d4ac0ca7e6830ca390e195bb21c^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "",
+    "FilePath": "ip6.h",
+    "revert_files": [
+      "ip6.h"
+    ],
+    "pcap": "ipv6-rthdr-oobr.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5600e685e3df in EXTRACT_32BITS extract.h:183",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12987",
+    "fix_commit": "2ecb9d2c67d9119250c54811a6ce4d0f2ddf44f1",
+    "parent_commit": "2ecb9d2c67d9119250c54811a6ce4d0f2ddf44f1^",
+    "era": "18.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "",
+    "FilePath": "tests/TESTLIST",
+    "groundtruth": "UNCONFIRMABLE",
+    "reason": "no source file to revert (fix touches only tests/meta)",
+    "revert_files": []
+  },
+  {
+    "cve": "CVE-2017-12988",
+    "fix_commit": "8934a7d6307267d301182f19ed162563717e29e3",
+    "parent_commit": "8934a7d6307267d301182f19ed162563717e29e3^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "telnet_parse",
+    "FilePath": "print-telnet.c",
+    "revert_files": [
+      "print-telnet.c"
+    ],
+    "pcap": "telnet-iac-check-oobr.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5644d06952d7 in telnet_parse print-telnet.c:445",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12989",
+    "fix_commit": "db24063b01cba8e9d4d88b7d8ac70c9000c104e4",
+    "parent_commit": "db24063b01cba8e9d4d88b7d8ac70c9000c104e4^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "resp_get_length",
+    "FilePath": "print-resp.c",
+    "revert_files": [
+      "print-resp.c"
+    ],
+    "pcap": "resp_4_infiniteloop.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 1,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12990",
+    "fix_commit": "c2ef693866beae071a24b45c49f9674af1df4028",
+    "parent_commit": "c2ef693866beae071a24b45c49f9674af1df4028^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ikev1_n_print",
+    "FilePath": "print-isakmp.c",
+    "revert_files": [
+      "print-isakmp.c"
+    ],
+    "pcap": "isakmp-no-none-np.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 1,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12991",
+    "fix_commit": "50a44b6b8e4f7c127440dbd4239cf571945cc1e7",
+    "parent_commit": "50a44b6b8e4f7c127440dbd4239cf571945cc1e7^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "bgp_attr_print",
+    "FilePath": "print-bgp.c",
+    "revert_files": [
+      "print-bgp.c"
+    ],
+    "pcap": "bgp-as-path-oobr.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x565104169864 in bgp_attr_print print-bgp.c:1409",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12992",
+    "fix_commit": "e942fb84fbe3a73a98a00d2a279425872b5fb9d2",
+    "parent_commit": "e942fb84fbe3a73a98a00d2a279425872b5fb9d2^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ripng_print",
+    "FilePath": "print-ripng.c",
+    "revert_files": [
+      "print-ripng.c"
+    ],
+    "pcap": "hoobr_ripng_print.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5565e2e552d4 in ripng_print print-ripng.c:131",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12993",
+    "fix_commit": "b534e304568585707c4a92422aeca25cf908ff02",
+    "parent_commit": "b534e304568585707c4a92422aeca25cf908ff02^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "juniper_atm1_print",
+    "FilePath": "print-juniper.c",
+    "revert_files": [
+      "print-juniper.c"
+    ],
+    "pcap": "hoobr_juniper.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x560d5b9f13a9 in juniper_parse_header print-juniper.c:1288",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12994",
+    "fix_commit": "ffde45acf3348f8353fb4064a1b21683ee6b5ddf",
+    "parent_commit": "ffde45acf3348f8353fb4064a1b21683ee6b5ddf^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "bgp_attr_print",
+    "FilePath": "print-bgp.c",
+    "revert_files": [
+      "print-bgp.c"
+    ],
+    "pcap": "bgp-aigp-oobr.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5562a876eec4 in bgp_attr_print print-bgp.c:2191",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12995",
+    "fix_commit": "3a76fd7c95fced2c2f8c8148a9055c3a542eff29",
+    "parent_commit": "3a76fd7c95fced2c2f8c8148a9055c3a542eff29^",
+    "era": "18.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "ns_nprint",
+    "FilePath": "print-domain.c",
+    "revert_files": [
+      "print-domain.c"
+    ],
+    "pcap": "dns-zlip-1.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "REFUTED",
+    "reason": "test passes even on the vulnerable tree (does not exercise the vuln)"
+  },
+  {
+    "cve": "CVE-2017-12996",
+    "fix_commit": "6fca58f5f9c96749a575f52e20598ad43f5bdf30",
+    "parent_commit": "6fca58f5f9c96749a575f52e20598ad43f5bdf30^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "pimv2_print",
+    "FilePath": "print-pim.c",
+    "revert_files": [
+      "print-pim.c"
+    ],
+    "pcap": "pimv2-oobr-1.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55618243c449 in EXTRACT_32BITS extract.h:183",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12997",
+    "fix_commit": "34cec721d39c76be1e0a600829a7b17bdfb832b6",
+    "parent_commit": "34cec721d39c76be1e0a600829a7b17bdfb832b6^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "lldp_private_8021_print",
+    "FilePath": "print-lldp.c",
+    "revert_files": [
+      "print-lldp.c"
+    ],
+    "pcap": "lldp-infinite-loop-1.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 1,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12998",
+    "fix_commit": "979dcefd7b259e9e233f77fe1c5312793bfd948f",
+    "parent_commit": "979dcefd7b259e9e233f77fe1c5312793bfd948f^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "isis_print_extd_ip_reach",
+    "FilePath": "print-isoclns.c",
+    "revert_files": [
+      "print-isoclns.c"
+    ],
+    "pcap": "isis-extd-ipreach-oobr.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5588b51e463c in isis_print_extd_ip_reach print-isoclns.c:2044",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-12999",
+    "fix_commit": "3b32029db354cbc875127869d9b12a9addc75b50",
+    "parent_commit": "3b32029db354cbc875127869d9b12a9addc75b50^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "isis_print",
+    "FilePath": "print-isoclns.c",
+    "revert_files": [
+      "print-isoclns.c"
+    ],
+    "pcap": "isis-areaaddr-oobr-1.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x56324d1305ed in lookup_nsap addrtoname.c:451",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13000",
+    "fix_commit": "8512734883227c11568bb35da1d48b9f8466f43f",
+    "parent_commit": "8512734883227c11568bb35da1d48b9f8466f43f^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ieee802_15_4_if_print",
+    "FilePath": "print-802_15_4.c",
+    "revert_files": [
+      "print-802_15_4.c"
+    ],
+    "pcap": "802_15_4_beacon.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x56484454c661 in ieee802_15_4_if_print print-802_15_4.c:125",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13001",
+    "fix_commit": "7a923447fd49a069a0fd3b6c3547438ab5ee2123",
+    "parent_commit": "7a923447fd49a069a0fd3b6c3547438ab5ee2123^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "nfs_printfh",
+    "FilePath": "print-nfs.c",
+    "revert_files": [
+      "print-nfs.c"
+    ],
+    "pcap": "hoobr_nfs_printfh.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #1 0x55f7c7617e39 in nfs_printfh print-nfs.c:813",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13002",
+    "fix_commit": "cbddb98484ea8ec1deece351abd56e063d775b38",
+    "parent_commit": "cbddb98484ea8ec1deece351abd56e063d775b38^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "aodv_extension",
+    "FilePath": "print-aodv.c",
+    "revert_files": [
+      "print-aodv.c"
+    ],
+    "pcap": "hoobr_aodv_extension.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5591f8f4f7df in aodv_extension print-aodv.c:181",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13003",
+    "fix_commit": "a25211918f2e790c67d859d20ccf8dbb81da1598",
+    "parent_commit": "a25211918f2e790c67d859d20ccf8dbb81da1598^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "lmp_print",
+    "FilePath": "print-lmp.c",
+    "revert_files": [
+      "extract.h",
+      "print-lmp.c"
+    ],
+    "pcap": "lmpv1_busyloop.pcap",
+    "flags": "-vvv -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 1,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13004",
+    "fix_commit": "35d146b7a66496d72cdeb95ccb33ab80a265ce90",
+    "parent_commit": "35d146b7a66496d72cdeb95ccb33ab80a265ce90^",
+    "era": "18.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "",
+    "FilePath": "tests/TESTLIST",
+    "groundtruth": "UNCONFIRMABLE",
+    "reason": "no source file to revert (fix touches only tests/meta)",
+    "revert_files": []
+  },
+  {
+    "cve": "CVE-2017-13005",
+    "fix_commit": "b45a9a167ca6a3ef2752ae9d48d56ac14b001bfd",
+    "parent_commit": "b45a9a167ca6a3ef2752ae9d48d56ac14b001bfd^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "xid_map_enter",
+    "FilePath": "print-nfs.c",
+    "revert_files": [
+      "print-nfs.c"
+    ],
+    "pcap": "hoobr_nfs_xid_map_enter.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5572a9e15f91 in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13006",
+    "fix_commit": "cc4a7391c616be7a64ed65742ef9ed3f106eb165",
+    "parent_commit": "cc4a7391c616be7a64ed65742ef9ed3f106eb165^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "l2tp_accm_print",
+    "FilePath": "print-l2tp.c",
+    "revert_files": [
+      "print-l2tp.c"
+    ],
+    "pcap": "l2tp-avp-overflow.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55f92b7f4e5d in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "FAIL",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 1,
+      "configure_failed": false
+    },
+    "groundtruth": "REFUTED",
+    "reason": "test still fails on the upstream-fixed tree (fix/test mismatch)"
+  },
+  {
+    "cve": "CVE-2017-13007",
+    "fix_commit": "ca336198e8bebccc18502de27672fdbd6eb34856",
+    "parent_commit": "ca336198e8bebccc18502de27672fdbd6eb34856^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "pktap_if_print",
+    "FilePath": "print-pktap.c",
+    "revert_files": [
+      "print-pktap.c"
+    ],
+    "pcap": "pktap-heap-overflow.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5631d4e4d179 in ppp_hdlc_if_print print-ppp.c:1656",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "FAIL",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 1,
+      "configure_failed": false
+    },
+    "groundtruth": "REFUTED",
+    "reason": "test still fails on the upstream-fixed tree (fix/test mismatch)"
+  },
+  {
+    "cve": "CVE-2017-13008",
+    "fix_commit": "5edf405d7ed9fc92f4f43e8a3d44baa4c6387562",
+    "parent_commit": "5edf405d7ed9fc92f4f43e8a3d44baa4c6387562^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "parse_elements",
+    "FilePath": "print-802_11.c",
+    "revert_files": [
+      "print-802_11.c"
+    ],
+    "pcap": "ieee802.11_rates_oobr.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #1 0x564b33f3f4af in parse_elements print-802_11.c:1192",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13009",
+    "fix_commit": "db8c799f6dfc68765c9451fcbfca06e662f5bd5f",
+    "parent_commit": "db8c799f6dfc68765c9451fcbfca06e662f5bd5f^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "mobility_print",
+    "FilePath": "print-mobility.c",
+    "revert_files": [
+      "print-mobility.c"
+    ],
+    "pcap": "ipv6-mobility-header-oobr.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x559d1fe11d50 in mobility_print print-mobility.c:301",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13010",
+    "fix_commit": "877b66b398518d9501513e0860c9f3a8acc70892",
+    "parent_commit": "877b66b398518d9501513e0860c9f3a8acc70892^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "beep_print",
+    "FilePath": "print-beep.c",
+    "revert_files": [
+      "print-beep.c"
+    ],
+    "pcap": "beep-oobr.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #1 0x56430bb6346b in l_strnstart print-beep.c:37",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13011",
+    "fix_commit": "9f0730bee3eb65d07b49fd468bc2f269173352fe",
+    "parent_commit": "9f0730bee3eb65d07b49fd468bc2f269173352fe^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "bittok2str_internal",
+    "FilePath": "util-print.c",
+    "revert_files": [
+      "util-print.c"
+    ],
+    "pcap": "lldp_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "global-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #2 0x56050e6abc6e in bittok2str_internal util-print.c:542",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13012",
+    "fix_commit": "8509ef02eceb2bbb479cea10fe4a7ec6395f1a8b",
+    "parent_commit": "8509ef02eceb2bbb479cea10fe4a7ec6395f1a8b^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "icmp_print",
+    "FilePath": "print-icmp.c",
+    "revert_files": [
+      "print-icmp.c"
+    ],
+    "pcap": "extract_read2_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55a55a5af225 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13013",
+    "fix_commit": "13ab8d18617d616c7d343530f8a842e7143fb5cc",
+    "parent_commit": "13ab8d18617d616c7d343530f8a842e7143fb5cc^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "arp_print",
+    "FilePath": "print-arp.c",
+    "revert_files": [
+      "print-arp.c"
+    ],
+    "pcap": "getname_2_read4_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5566ebb2ef5c in getname addrtoname.c:245",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13014",
+    "fix_commit": "cc356512f512e7fa423b3674db4bb31dbe40ffec",
+    "parent_commit": "cc356512f512e7fa423b3674db4bb31dbe40ffec^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "wb_prep",
+    "FilePath": "print-wb.c",
+    "revert_files": [
+      "print-wb.c"
+    ],
+    "pcap": "wb-oobr.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5580f24a4a33 in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13015",
+    "fix_commit": "985122081165753c7442bd7824c473eb9ff56308",
+    "parent_commit": "985122081165753c7442bd7824c473eb9ff56308^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "eap_print",
+    "FilePath": "print-eap.c",
+    "revert_files": [
+      "print-eap.c"
+    ],
+    "pcap": "eap_extract_read2_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5602f99954b6 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13016",
+    "fix_commit": "c177cb3800a9a68d79b2812f0ffcb9479abd6eb8",
+    "parent_commit": "c177cb3800a9a68d79b2812f0ffcb9479abd6eb8^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "esis_print",
+    "FilePath": "print-isoclns.c",
+    "revert_files": [
+      "addrtoname.h",
+      "print-isoclns.c"
+    ],
+    "pcap": "esis_snpa_asan-2.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x562c3f92fe99 in lookup_emem addrtoname.c:368",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13017",
+    "fix_commit": "11b426ee05eb62ed103218526f1fa616851c43ce",
+    "parent_commit": "11b426ee05eb62ed103218526f1fa616851c43ce^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "dhcp6opt_print",
+    "FilePath": "print-dhcp6.c",
+    "revert_files": [
+      "print-dhcp6.c"
+    ],
+    "pcap": "dhcp6_reconf_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x556b4418d240 in dhcp6opt_print print-dhcp6.c:522",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13018",
+    "fix_commit": "26a6799b9ca80508c05cac7a9a3bef922991520b",
+    "parent_commit": "26a6799b9ca80508c05cac7a9a3bef922991520b^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "pgm_print",
+    "FilePath": "print-pgm.c",
+    "revert_files": [
+      "print-pgm.c"
+    ],
+    "pcap": "pgm_opts_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55813983db7b in pgm_print print-pgm.c:460",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13019",
+    "fix_commit": "4601c685e7fd19c3724d5e499c69b8d3ec49933e",
+    "parent_commit": "4601c685e7fd19c3724d5e499c69b8d3ec49933e^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "pgm_print",
+    "FilePath": "print-pgm.c",
+    "revert_files": [
+      "print-pgm.c"
+    ],
+    "pcap": "pgm_opts_asan_2.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x556b5dc3bcf7 in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13020",
+    "fix_commit": "c5dd7bef5e54da5996dc4713284aa6266ae75b75",
+    "parent_commit": "c5dd7bef5e54da5996dc4713284aa6266ae75b75^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "vtp_print",
+    "FilePath": "print-vtp.c",
+    "revert_files": [
+      "print-vtp.c"
+    ],
+    "pcap": "vtp_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x56347d6a396f in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13021",
+    "fix_commit": "67c7126062d59729cd421bb38f9594015c9907ba",
+    "parent_commit": "67c7126062d59729cd421bb38f9594015c9907ba^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "icmp6_print",
+    "FilePath": "print-icmp6.c",
+    "revert_files": [
+      "print-icmp6.c"
+    ],
+    "pcap": "icmp6_mobileprefix_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5557f4db564d in icmp6_print print-icmp6.c:1134",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13022",
+    "fix_commit": "eee0b04bcfdae319c242b0b8fc3d07029ee65b8c",
+    "parent_commit": "eee0b04bcfdae319c242b0b8fc3d07029ee65b8c^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ip_optprint",
+    "FilePath": "print-ip.c",
+    "revert_files": [
+      "print-ip.c"
+    ],
+    "pcap": "ip_printroute_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x56460972f1ec in getname addrtoname.c:245",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13023",
+    "fix_commit": "b8e559afaeb8fe0604a1f8e3ad4dc1445de07a00",
+    "parent_commit": "b8e559afaeb8fe0604a1f8e3ad4dc1445de07a00^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "mobility_opt_print",
+    "FilePath": "print-mobility.c",
+    "revert_files": [
+      "print-mobility.c"
+    ],
+    "pcap": "mobility_opt_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55ae0ae11150 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13024",
+    "fix_commit": "2e1f6d9320afa83abc1ff716c7981fa504edadf2",
+    "parent_commit": "2e1f6d9320afa83abc1ff716c7981fa504edadf2^",
+    "era": "18.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "",
+    "FilePath": "tests/TESTLIST",
+    "groundtruth": "UNCONFIRMABLE",
+    "reason": "no source file to revert (fix touches only tests/meta)",
+    "revert_files": []
+  },
+  {
+    "cve": "CVE-2017-13025",
+    "fix_commit": "5338aac7b8b880b0c5e0c15e27dadc44c5559284",
+    "parent_commit": "5338aac7b8b880b0c5e0c15e27dadc44c5559284^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "mobility_opt_print",
+    "FilePath": "print-mobility.c",
+    "revert_files": [
+      "extract.h",
+      "print-mobility.c"
+    ],
+    "pcap": "mobility_opt_asan_3.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x560aa932f93d in getname6 addrtoname.c:311",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13026",
+    "fix_commit": "b20e1639dbac84b3fcb393858521c13ad47a9d70",
+    "parent_commit": "b20e1639dbac84b3fcb393858521c13ad47a9d70^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "isis_print_mt_capability_subtlv",
+    "FilePath": "print-isoclns.c",
+    "revert_files": [
+      "print-isoclns.c"
+    ],
+    "pcap": "isis_stlv_asan-2.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55d8fd5e19b8 in isis_print_mt_capability_subtlv print-isoclns.c:1514",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13027",
+    "fix_commit": "a77ff09c46560bc895dea11dc9fe643486b056ac",
+    "parent_commit": "a77ff09c46560bc895dea11dc9fe643486b056ac^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "lldp_mgmt_addr_tlv_print",
+    "FilePath": "print-lldp.c",
+    "revert_files": [
+      "print-lldp.c"
+    ],
+    "pcap": "lldp_mgmt_addr_tlv_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5584e78aefe4 in safeputs util-print.c:920",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13028",
+    "fix_commit": "29e5470e6ab84badbc31f4532bb7554a796d9d52",
+    "parent_commit": "29e5470e6ab84badbc31f4532bb7554a796d9d52^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "bootp_print",
+    "FilePath": "print-bootp.c",
+    "revert_files": [
+      "print-bootp.c"
+    ],
+    "pcap": "bootp_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55fa529748b1 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13029",
+    "fix_commit": "7029d15f148ef24bb7c6668bc640f5470d085e5a",
+    "parent_commit": "7029d15f148ef24bb7c6668bc640f5470d085e5a^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "print_bacp_config_options",
+    "FilePath": "print-ppp.c",
+    "revert_files": [
+      "print-ppp.c"
+    ],
+    "pcap": "ppp_ccp_config_deflate_option_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55817bc4c72c in print_ccp_config_options print-ppp.c:1254",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13030",
+    "fix_commit": "5dc1860d8267b1e0cb78c9ffa2a40bea2fdb3ddc",
+    "parent_commit": "5dc1860d8267b1e0cb78c9ffa2a40bea2fdb3ddc^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "cisco_autorp_print",
+    "FilePath": "print-pim.c",
+    "revert_files": [
+      "print-pim.c"
+    ],
+    "pcap": "pim_header_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5648ec03fd84 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13031",
+    "fix_commit": "2d669862df7cd17f539129049f6fb70d17174125",
+    "parent_commit": "2d669862df7cd17f539129049f6fb70d17174125^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "frag6_print",
+    "FilePath": "print-frag6.c",
+    "revert_files": [
+      "print-frag6.c"
+    ],
+    "pcap": "ip6_frag_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x558e243a77ce in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13032",
+    "fix_commit": "1bc78d795cd5cad5525498658f414a11ea0a7e9c",
+    "parent_commit": "1bc78d795cd5cad5525498658f414a11ea0a7e9c^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "print_attr_string",
+    "FilePath": "print-radius.c",
+    "revert_files": [
+      "print-radius.c"
+    ],
+    "pcap": "radius_attr_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x562014a53f19 in print_attr_string print-radius.c:550",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13033",
+    "fix_commit": "ae83295915d08a854de27a88efac5dd7353e6d3f",
+    "parent_commit": "ae83295915d08a854de27a88efac5dd7353e6d3f^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "vtp_print",
+    "FilePath": "print-vtp.c",
+    "revert_files": [
+      "print-vtp.c"
+    ],
+    "pcap": "vtp_asan-3.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x56130b8ab76d in fn_printzp util-print.c:217",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13034",
+    "fix_commit": "da6f1a677bfa4476abaeaf9b1afe1c4390f51b41",
+    "parent_commit": "da6f1a677bfa4476abaeaf9b1afe1c4390f51b41^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "pgm_print",
+    "FilePath": "print-pgm.c",
+    "revert_files": [
+      "print-pgm.c"
+    ],
+    "pcap": "pgm_group_addr_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x56320523c032 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13035",
+    "fix_commit": "571a6f33f47e7a2394fa08f925e534135c29cf1e",
+    "parent_commit": "571a6f33f47e7a2394fa08f925e534135c29cf1e^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "isis_print_id",
+    "FilePath": "print-isoclns.c",
+    "revert_files": [
+      "print-isoclns.c"
+    ],
+    "pcap": "isis_sysid_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55e52afe24d4 in isis_print_id print-isoclns.c:1651",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13036",
+    "fix_commit": "88b2dac837e81cf56dce05e6e7b5989332c0092d",
+    "parent_commit": "88b2dac837e81cf56dce05e6e7b5989332c0092d^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ospf6_decode_v3",
+    "FilePath": "print-ospf6.c",
+    "revert_files": [
+      "print-ospf6.c"
+    ],
+    "pcap": "ospf6_decode_v3_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55e3e4c38796 in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13037",
+    "fix_commit": "2c2cfbd2b771ac888bc5c4a6d922f749d3822538",
+    "parent_commit": "2c2cfbd2b771ac888bc5c4a6d922f749d3822538^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ip_optprint",
+    "FilePath": "print-ip.c",
+    "revert_files": [
+      "print-ip.c"
+    ],
+    "pcap": "ip_ts_opts_asan.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x564da1dbee03 in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13038",
+    "fix_commit": "7335163a6ef82d46ff18f3e6099a157747241629",
+    "parent_commit": "7335163a6ef82d46ff18f3e6099a157747241629^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "handle_mlppp",
+    "FilePath": "print-ppp.c",
+    "revert_files": [
+      "print-ppp.c"
+    ],
+    "pcap": "mlppp-oobr.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x561a36847ba3 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13039",
+    "fix_commit": "e0a5a02b0fc1900a69d6c37ed0aab36fb8494e6d",
+    "parent_commit": "e0a5a02b0fc1900a69d6c37ed0aab36fb8494e6d^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ikev1_attr_print",
+    "FilePath": "print-isakmp.c",
+    "revert_files": [
+      "print-isakmp.c"
+    ],
+    "pcap": "isakmpv1-attr-oobr.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55ac923c8e93 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13040",
+    "fix_commit": "4c3aee4bb0294c232d56b6d34e9eeb74f630fe8c",
+    "parent_commit": "4c3aee4bb0294c232d56b6d34e9eeb74f630fe8c^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "mp_capable_print",
+    "FilePath": "print-mptcp.c",
+    "revert_files": [
+      "print-mptcp.c"
+    ],
+    "pcap": "mptcp-dss-oobr.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55d30ac15168 in mp_dss_len print-mptcp.c:244",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13041",
+    "fix_commit": "f4b9e24c7384d882a7f434cc7413925bf871d63e",
+    "parent_commit": "f4b9e24c7384d882a7f434cc7413925bf871d63e^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "icmp6_nodeinfo_print",
+    "FilePath": "print-icmp6.c",
+    "revert_files": [
+      "print-icmp6.c"
+    ],
+    "pcap": "icmp6_nodeinfo_oobr.pcap",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5558fb1b2096 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13042",
+    "fix_commit": "39582c04cc5e34054b2936b423072fb9df2ff6ef",
+    "parent_commit": "39582c04cc5e34054b2936b423072fb9df2ff6ef^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "dhcpv6_print",
+    "FilePath": "print-hncp.c",
+    "revert_files": [
+      "print-hncp.c"
+    ],
+    "pcap": "hncp_dhcpv6data-oobr.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55a788f2f90d in getname6 addrtoname.c:311",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13043",
+    "fix_commit": "d515b4b4a300479cdf1a6e0d1bb95bc1f9fee514",
+    "parent_commit": "d515b4b4a300479cdf1a6e0d1bb95bc1f9fee514^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "decode_multicast_vpn",
+    "FilePath": "print-bgp.c",
+    "revert_files": [
+      "print-bgp.c"
+    ],
+    "pcap": "bgp_mvpn_6_and_7.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55b7883655c9 in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13044",
+    "fix_commit": "c2f6833dddecf2d5fb89c9c898eee9981da342ed",
+    "parent_commit": "c2f6833dddecf2d5fb89c9c898eee9981da342ed^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "dhcpv4_print",
+    "FilePath": "print-hncp.c",
+    "revert_files": [
+      "print-hncp.c"
+    ],
+    "pcap": "hncp_dhcpv4data-oobr.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x557a7652f1bc in getname addrtoname.c:245",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13045",
+    "fix_commit": "3b36ec4e713dea9266db11975066c425aa669b6c",
+    "parent_commit": "3b36ec4e713dea9266db11975066c425aa669b6c^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "vqp_print",
+    "FilePath": "print-vqp.c",
+    "revert_files": [
+      "print-vqp.c"
+    ],
+    "pcap": "vqp-oobr.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5637b04a2c9f in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13046",
+    "fix_commit": "d10a0f980fe8f9407ab1ffbd612641433ebe175e",
+    "parent_commit": "d10a0f980fe8f9407ab1ffbd612641433ebe175e^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "bgp_attr_print",
+    "FilePath": "print-bgp.c",
+    "revert_files": [
+      "print-bgp.c"
+    ],
+    "pcap": "bgp_pmsi_tunnel-oobr.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x563cbd56ef79 in bgp_attr_print print-bgp.c:2126",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13047",
+    "fix_commit": "331530a4076c69bbd2e3214db6ccbe834fb75640",
+    "parent_commit": "331530a4076c69bbd2e3214db6ccbe834fb75640^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "esis_print",
+    "FilePath": "print-isoclns.c",
+    "revert_files": [
+      "print-isoclns.c"
+    ],
+    "pcap": "esis_opt_prot-oobr.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x56170d9e141e in esis_print print-isoclns.c:1338",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13048",
+    "fix_commit": "3c8a2b0e91d8d8947e89384dacf6b54673083e71",
+    "parent_commit": "3c8a2b0e91d8d8947e89384dacf6b54673083e71^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "rsvp_obj_print",
+    "FilePath": "print-rsvp.c",
+    "revert_files": [
+      "print-rsvp.c"
+    ],
+    "pcap": "rsvp_fast_reroute-oobr.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5641dae5c31d in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13049",
+    "fix_commit": "aa0858100096a3490edf93034a80e66a4d61aad5",
+    "parent_commit": "aa0858100096a3490edf93034a80e66a4d61aad5^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ubik_print",
+    "FilePath": "print-rx.c",
+    "revert_files": [
+      "print-rx.c"
+    ],
+    "pcap": "rx_ubik-oobr.pcap",
+    "flags": "-c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x56457ee63ecb in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13050",
+    "fix_commit": "83c64fce3a5226b080e535f5131a8a318f30e79b",
+    "parent_commit": "83c64fce3a5226b080e535f5131a8a318f30e79b^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "rpki_rtr_pdu_print",
+    "FilePath": "print-rpki-rtr.c",
+    "revert_files": [
+      "print-rpki-rtr.c"
+    ],
+    "pcap": "rpki-rtr-oob.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55864045a9dd in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13051",
+    "fix_commit": "289c672020280529fd382f3502efab7100d638ec",
+    "parent_commit": "289c672020280529fd382f3502efab7100d638ec^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "rsvp_obj_print",
+    "FilePath": "print-rsvp.c",
+    "revert_files": [
+      "print-rsvp.c"
+    ],
+    "pcap": "rsvp_uni-oobr-1.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55ee2ef2f1fc in getname addrtoname.c:245",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13052",
+    "fix_commit": "5d340a5ca6e420a70297cdbdf777333f18bfdab7",
+    "parent_commit": "5d340a5ca6e420a70297cdbdf777333f18bfdab7^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "cfm_network_addr_print",
+    "FilePath": "print-cfm.c",
+    "revert_files": [
+      "print-cfm.c"
+    ],
+    "pcap": "cfm_sender_id-oobr.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55d74e7301d1 in lookup_emem addrtoname.c:368",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13053",
+    "fix_commit": "bd4e697ebd6c8457efa8f28f6831fc929b88a014",
+    "parent_commit": "bd4e697ebd6c8457efa8f28f6831fc929b88a014^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "decode_rt_routing_info",
+    "FilePath": "print-bgp.c",
+    "revert_files": [
+      "print-bgp.c"
+    ],
+    "pcap": "bgp_vpn_rt-oobr.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x557c505656e9 in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13054",
+    "fix_commit": "e6511cc1a950fe1566b2236329d6b4bd0826cc7a",
+    "parent_commit": "e6511cc1a950fe1566b2236329d6b4bd0826cc7a^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "lldp_private_8023_print",
+    "FilePath": "print-lldp.c",
+    "revert_files": [
+      "print-lldp.c"
+    ],
+    "pcap": "lldp_8023_mtu-oobr.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x555c10ffe637 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13055",
+    "fix_commit": "5d0d76e88ee2d3236d7e032589d6f1d4ec5f7b1e",
+    "parent_commit": "5d0d76e88ee2d3236d7e032589d6f1d4ec5f7b1e^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "isis_print_is_reach_subtlv",
+    "FilePath": "print-isoclns.c",
+    "revert_files": [
+      "print-isoclns.c"
+    ],
+    "pcap": "isis-extd-isreach-oobr.pcap",
+    "flags": "-v -c4",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55a8febe46ce in isis_print_is_reach_subtlv print-isoclns.c:1864",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13687",
+    "fix_commit": "866c60236c41cea1e1654c8a071897292f64be49",
+    "parent_commit": "866c60236c41cea1e1654c8a071897292f64be49^",
+    "era": "18.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "",
+    "FilePath": "tests/TESTLIST",
+    "groundtruth": "UNCONFIRMABLE",
+    "reason": "no source file to revert (fix touches only tests/meta)",
+    "revert_files": []
+  },
+  {
+    "cve": "CVE-2017-13688",
+    "fix_commit": "0cb1b8a434b599b8d636db029aadb757c24e39d6",
+    "parent_commit": "0cb1b8a434b599b8d636db029aadb757c24e39d6^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "olsr_print",
+    "FilePath": "print-olsr.c",
+    "revert_files": [
+      "print-olsr.c"
+    ],
+    "pcap": "olsr-oobr-1.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55e879a2507e in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13689",
+    "fix_commit": "061e7371a944588f231cb1b66d6fb070b646e376",
+    "parent_commit": "061e7371a944588f231cb1b66d6fb070b646e376^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ikev1_id_print",
+    "FilePath": "print-isakmp.c",
+    "revert_files": [
+      "print-isakmp.c"
+    ],
+    "pcap": "ikev1_id_ipv6_addr_subnet-oobr.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5645837ce372 in ikev1_id_print print-isakmp.c:1443",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13690",
+    "fix_commit": "8dca25d26c7ca2caf6138267f6f17111212c156e",
+    "parent_commit": "8dca25d26c7ca2caf6138267f6f17111212c156e^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ikev2_ID_print",
+    "FilePath": "print-isakmp.c",
+    "revert_files": [
+      "print-isakmp.c"
+    ],
+    "pcap": "isakmp-various-oobr.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": null,
+      "crash": null,
+      "top_frame": "    #0 0x55eef4fd6002 in ikev2_ke_print print-isakmp.c:2174",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-13725",
+    "fix_commit": "3c4d7c0ee30a30e5abff3d6d9586a3753101faf5",
+    "parent_commit": "3c4d7c0ee30a30e5abff3d6d9586a3753101faf5^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "rt6_print",
+    "FilePath": "print-rt6.c",
+    "revert_files": [
+      "print-rt6.c"
+    ],
+    "pcap": "",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "NORESULT",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": null,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "NORESULT",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": null,
+      "configure_failed": false
+    },
+    "groundtruth": "UNCONFIRMABLE",
+    "reason": "V-=NORESULT, V+=NORESULT (build/runtime failure on an arm)"
+  },
+  {
+    "cve": "CVE-2017-5204",
+    "fix_commit": "d6913f7e3fc6d3084ab64d179853468e58cdca4b",
+    "parent_commit": "d6913f7e3fc6d3084ab64d179853468e58cdca4b^",
+    "era": "16.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ip6_print",
+    "FilePath": "print-ip6.c",
+    "revert_files": [
+      "print-ip6.c"
+    ],
+    "pcap": "ipv6hdr-heapoverflow.pcap",
+    "flags": "-t",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x49a4d8 in ip6_print print-ip6.c:296",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-5205",
+    "fix_commit": "51d66a246aacc081d05590fa11cc367d7e6778f4",
+    "parent_commit": "51d66a246aacc081d05590fa11cc367d7e6778f4^",
+    "era": "18.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "ikev2_p_print",
+    "FilePath": "print-isakmp.c",
+    "revert_files": [
+      "print-isakmp.c"
+    ],
+    "pcap": "",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "NORESULT",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": null,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "NORESULT",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": null,
+      "configure_failed": false
+    },
+    "groundtruth": "UNCONFIRMABLE",
+    "reason": "V-=NORESULT, V+=NORESULT (build/runtime failure on an arm)"
+  },
+  {
+    "cve": "CVE-2017-5341",
+    "fix_commit": "409ffe94529df3d8bb8258bf99586f821756cb29",
+    "parent_commit": "409ffe94529df3d8bb8258bf99586f821756cb29^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "otv_print",
+    "FilePath": "print-otv.c",
+    "revert_files": [
+      "print-otv.c"
+    ],
+    "pcap": "otv-heapoverflow-1.pcap",
+    "flags": "-t -c10",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55d19c230ffa in otv_print print-otv.c:59",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-5342",
+    "fix_commit": "0db4dcafe5ae38201d3869c96a96cb714d82ff35",
+    "parent_commit": "0db4dcafe5ae38201d3869c96a96cb714d82ff35^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "geneve_print",
+    "FilePath": "print-geneve.c",
+    "revert_files": [
+      "print-ether.c",
+      "print-geneve.c",
+      "print-gre.c",
+      "print-nsh.c",
+      "print-otv.c",
+      "print-vxlan-gpe.c",
+      "print-vxlan.c"
+    ],
+    "pcap": "otv-heapoverflow-2.pcap",
+    "flags": "-t -c10",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x56068b795a99 in EXTRACT_16BITS extract.h:144",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-5482",
+    "fix_commit": "c39c1d99ac3b6d5d9519b39da6717180651650d3",
+    "parent_commit": "c39c1d99ac3b6d5d9519b39da6717180651650d3^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "q933_print",
+    "FilePath": "print-fr.c",
+    "revert_files": [
+      "print-fr.c"
+    ],
+    "pcap": "q933-heapoverflow-2.pcap",
+    "flags": "-t",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x558ab6ba0b7e in q933_print print-fr.c:909",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-5483",
+    "fix_commit": "eec1624f7be88008f519d92150ee0eb85633518b",
+    "parent_commit": "eec1624f7be88008f519d92150ee0eb85633518b^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "asn1_parse",
+    "FilePath": "print-snmp.c",
+    "revert_files": [
+      "print-snmp.c"
+    ],
+    "pcap": "snmp-heapoverflow-1.pcap",
+    "flags": "-t",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x562665a84671 in v3msg_print print-snmp.c:1801",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-5484",
+    "fix_commit": "5d214e36eed3565fbdc0f9b527bbc33a6bb63972",
+    "parent_commit": "5d214e36eed3565fbdc0f9b527bbc33a6bb63972^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "atm_print",
+    "FilePath": "print-atm.c",
+    "revert_files": [
+      "print-atm.c"
+    ],
+    "pcap": "atm-heapoverflow.pcap",
+    "flags": "-t -c1 -e",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x558f5d958f0b in sig_print print-atm.c:356",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2017-5485",
+    "fix_commit": "2817174698bcd5371ff7fbc9d50b5241dd0130bd",
+    "parent_commit": "2817174698bcd5371ff7fbc9d50b5241dd0130bd^",
+    "era": "18.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "isonsap_string",
+    "FilePath": "addrtoname.c",
+    "revert_files": [
+      "addrtoname.c"
+    ],
+    "pcap": "",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "NORESULT",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": null,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "NORESULT",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": null,
+      "configure_failed": false
+    },
+    "groundtruth": "UNCONFIRMABLE",
+    "reason": "V-=NORESULT, V+=NORESULT (build/runtime failure on an arm)"
+  },
+  {
+    "cve": "CVE-2017-5486",
+    "fix_commit": "b553848e3e2c0c466f65ab14e253af91467e561a",
+    "parent_commit": "b553848e3e2c0c466f65ab14e253af91467e561a^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "clnp_print",
+    "FilePath": "print-isoclns.c",
+    "revert_files": [
+      "print-isoclns.c"
+    ],
+    "pcap": "",
+    "flags": "-nn -v",
+    "v_minus": {
+      "result": "NORESULT",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": null,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "NORESULT",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": null,
+      "configure_failed": false
+    },
+    "groundtruth": "UNCONFIRMABLE",
+    "reason": "V-=NORESULT, V+=NORESULT (build/runtime failure on an arm)"
+  },
+  {
+    "cve": "CVE-2018-14461",
+    "fix_commit": "aa5c6b710dfd8020d2c908d6b3bd41f1da719b3b",
+    "parent_commit": "aa5c6b710dfd8020d2c908d6b3bd41f1da719b3b^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ldp_pdu_print",
+    "FilePath": "print-ldp.c",
+    "revert_files": [
+      "print-ldp.c"
+    ],
+    "pcap": "ldp-ldp_tlv_print-oobr.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5611331f8725 in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-14462",
+    "fix_commit": "1a1bce0526a77b62e41531b00f8bb5e21fd4f3a3",
+    "parent_commit": "1a1bce0526a77b62e41531b00f8bb5e21fd4f3a3^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "icmp_print",
+    "FilePath": "print-icmp.c",
+    "revert_files": [
+      "print-icmp.c"
+    ],
+    "pcap": "icmp-icmp_print-oobr-1.pcap",
+    "flags": "-v -c3",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5601ed1af6b6 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-14463",
+    "fix_commit": "3de07c772166b7e8e8bb4b9d1d078f1d901b570b",
+    "parent_commit": "3de07c772166b7e8e8bb4b9d1d078f1d901b570b^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "vrrp_print",
+    "FilePath": "print-vrrp.c",
+    "revert_files": [
+      "print-vrrp.c"
+    ],
+    "pcap": "vrrp-vrrp_print-oobr.pcap",
+    "flags": "-v -c3",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5647e4ea3057 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-14464",
+    "fix_commit": "d97e94223720684c6aa740ff219e0d19426c2220",
+    "parent_commit": "d97e94223720684c6aa740ff219e0d19426c2220^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "lmp_print",
+    "FilePath": "print-lmp.c",
+    "revert_files": [
+      "print-lmp.c"
+    ],
+    "pcap": "lmp-lmp_print_data_link_subobjs-oobr.pcap",
+    "flags": "-v -c2",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5601402046f4 in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-14465",
+    "fix_commit": "bea2686c296b79609060a104cc139810785b0739",
+    "parent_commit": "bea2686c296b79609060a104cc139810785b0739^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "rsvp_obj_print",
+    "FilePath": "print-rsvp.c",
+    "revert_files": [
+      "print-rsvp.c"
+    ],
+    "pcap": "rsvp-rsvp_obj_print-oobr.pcap",
+    "flags": "-v -c3",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55b26c25b979 in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-14466",
+    "fix_commit": "c24922e692a52121e853a84ead6b9337f4c08a94",
+    "parent_commit": "c24922e692a52121e853a84ead6b9337f4c08a94^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "rx_cache_find",
+    "FilePath": "print-rx.c",
+    "revert_files": [
+      "print-rx.c"
+    ],
+    "pcap": "rx_serviceid_oobr.pcap",
+    "flags": "-c3",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55fca94632ea in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-14467",
+    "fix_commit": "e3f3b445e2d20ac5d5b7fcb7559ce6beb55da0c9",
+    "parent_commit": "e3f3b445e2d20ac5d5b7fcb7559ce6beb55da0c9^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "bgp_capabilities_print",
+    "FilePath": "print-bgp.c",
+    "revert_files": [
+      "print-bgp.c"
+    ],
+    "pcap": "bgp-bgp_capabilities_print-oobr-2.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x560a26570611 in bgp_capabilities_print print-bgp.c:2345",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-14468",
+    "fix_commit": "aa3e54f594385ce7e1e319b0c84999e51192578b",
+    "parent_commit": "aa3e54f594385ce7e1e319b0c84999e51192578b^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "mfr_print",
+    "FilePath": "print-fr.c",
+    "revert_files": [
+      "print-fr.c"
+    ],
+    "pcap": "frf16_magic_ie-oobr.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x562fa1da2ab9 in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-14469",
+    "fix_commit": "396e94ff55a80d554b1fe46bf107db1e91008d6c",
+    "parent_commit": "396e94ff55a80d554b1fe46bf107db1e91008d6c^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ikev1_n_print",
+    "FilePath": "print-isakmp.c",
+    "revert_files": [
+      "print-isakmp.c"
+    ],
+    "pcap": "isakmp-ikev1_n_print-oobr.pcap",
+    "flags": "-v -c3",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x558d6e1c8d3c in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-14470",
+    "fix_commit": "12f66f69f7bf1ec1266ddbee90a7616cbf33696b",
+    "parent_commit": "12f66f69f7bf1ec1266ddbee90a7616cbf33696b^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "babel_print_v2",
+    "FilePath": "print-babel.c",
+    "revert_files": [
+      "print-babel.c"
+    ],
+    "pcap": "babel_update_oobr.pcap",
+    "flags": "-c 52",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 124,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-14880",
+    "fix_commit": "e01c9bf76740802025c9328901b55ee4a0c49ed6",
+    "parent_commit": "e01c9bf76740802025c9328901b55ee4a0c49ed6^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ospf6_print_lshdr",
+    "FilePath": "print-ospf6.c",
+    "revert_files": [
+      "print-ospf6.c"
+    ],
+    "pcap": "ospf6_print_lshdr-oobr.pcapng",
+    "flags": "-vv -c15",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x55c15ea384b0 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-14881",
+    "fix_commit": "86326e880d31b328a151d45348c35220baa9a1ff",
+    "parent_commit": "86326e880d31b328a151d45348c35220baa9a1ff^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "bgp_capabilities_print",
+    "FilePath": "print-bgp.c",
+    "revert_files": [
+      "print-bgp.c"
+    ],
+    "pcap": "bgp-bgp_capabilities_print-oobr-1.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5642d8165297 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-14882",
+    "fix_commit": "d7505276842e85bfd067fa21cdb32b8a2dc3c5e4",
+    "parent_commit": "d7505276842e85bfd067fa21cdb32b8a2dc3c5e4^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "icmp6_nodeinfo_print",
+    "FilePath": "print-icmp6.c",
+    "revert_files": [
+      "print-icmp6.c"
+    ],
+    "pcap": "rpl-dao-oobr.pcapng",
+    "flags": "-vv -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x558b3f3b2716 in rpl_dio_printopt print-icmp6.c:665",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-16227",
+    "fix_commit": "4846b3c5d0a850e860baf4f07340495d29837d09",
+    "parent_commit": "4846b3c5d0a850e860baf4f07340495d29837d09^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "ieee802_11_print",
+    "FilePath": "print-802_11.c",
+    "revert_files": [
+      "print-802_11.c"
+    ],
+    "pcap": "ieee802.11_meshhdr-oobr.pcap",
+    "flags": "-H -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-use-after-free",
+      "crash": null,
+      "top_frame": "    #0 0x55a830d46aca in extract_mesh_header_length print-802_11.c:1956",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-16228",
+    "fix_commit": "83a412a5275cac973c5841eca3511c766bed778d",
+    "parent_commit": "83a412a5275cac973c5841eca3511c766bed778d^",
+    "era": "18.04",
+    "pipeline_reproduced": false,
+    "F_NAME": "print_prefix",
+    "FilePath": "print-hncp.c",
+    "revert_files": [
+      "print-hncp.c"
+    ],
+    "pcap": "hncp_prefix-oobr.pcapng",
+    "flags": "-vvv",
+    "v_minus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "REFUTED",
+    "reason": "test passes even on the vulnerable tree (does not exercise the vuln)"
+  },
+  {
+    "cve": "CVE-2018-16229",
+    "fix_commit": "211124b972e74f0da66bc8b16f181f78793e2f66",
+    "parent_commit": "211124b972e74f0da66bc8b16f181f78793e2f66^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "dccp_print_option",
+    "FilePath": "print-dccp.c",
+    "revert_files": [
+      "print-dccp.c"
+    ],
+    "pcap": "dccp_options-oobr.pcap",
+    "flags": "-vv -c8",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x5560ffb82484 in EXTRACT_32BITS extract.h:190",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2018-16230",
+    "fix_commit": "13d52e9c0e7caf7e6325b0051bc90a49968be67f",
+    "parent_commit": "13d52e9c0e7caf7e6325b0051bc90a49968be67f^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "bgp_attr_print",
+    "FilePath": "print-bgp.c",
+    "revert_files": [
+      "print-bgp.c"
+    ],
+    "pcap": "bgp_mp_reach_nlri-oobr.pcap",
+    "flags": "-v -c1",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": null,
+      "crash": null,
+      "top_frame": "    #0 0x56096092f74c in getname6 addrtoname.c:297",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  },
+  {
+    "cve": "CVE-2019-15167",
+    "fix_commit": "a152aebfd1114376ba266ed30416be596ef9d806",
+    "parent_commit": "a152aebfd1114376ba266ed30416be596ef9d806^",
+    "era": "18.04",
+    "pipeline_reproduced": true,
+    "F_NAME": "vrrp_print",
+    "FilePath": "print-vrrp.c",
+    "revert_files": [
+      "print-vrrp.c"
+    ],
+    "pcap": "vrrp-vrrp_print-oobr-2.pcap",
+    "flags": "-v",
+    "v_minus": {
+      "result": "FAIL",
+      "asan": "heap-buffer-overflow",
+      "crash": null,
+      "top_frame": "    #0 0x556576aa31d0 in EXTRACT_16BITS extract.h:184",
+      "exit": 134,
+      "configure_failed": false
+    },
+    "v_plus": {
+      "result": "PASS",
+      "asan": null,
+      "crash": null,
+      "top_frame": null,
+      "exit": 0,
+      "configure_failed": false
+    },
+    "groundtruth": "CONFIRMED",
+    "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+  }
+]

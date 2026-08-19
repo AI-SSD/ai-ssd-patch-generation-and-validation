@@ -222,7 +222,7 @@ poc_repair:
   openai_api_key: ""
 
   # -- Ollama (provider: ollama) --
-  api_endpoint: "http://10.3.2.171:80/api/chat"
+  api_endpoint: "http://10.3.1.226:80/api/chat"
   model: "devstral:32k"
 
   max_repair_attempts: 3
@@ -316,13 +316,14 @@ phase2:
   language: "c"                          # c | java | …
   system_prompt: >-
     You are an expert security engineer specializing in fixing software
-    vulnerabilities. Your task is to fix a security vulnerability by making the
-    SMALLEST POSSIBLE EDIT to the vulnerable function — never by rewriting it.
+    vulnerabilities. The vulnerability you must fix is {cwe}. Your task is to
+    fix it by making the SMALLEST POSSIBLE EDIT to the vulnerable function —
+    never by rewriting it.
   feedback_system_prompt: >-
     You are an expert security engineer specializing in fixing software
-    vulnerabilities. Your previous patch attempt FAILED validation. Analyze the
-    failure and produce an improved fix as MINIMAL edits — never rewrite the
-    whole function.
+    vulnerabilities. Your previous patch attempt for {cve_id} — {cwe} — FAILED
+    validation. Analyze the failure and produce an improved fix as MINIMAL
+    edits — never rewrite the whole function.
   # Project-internal headers absent host-side (C/gcc only; the generic
   # "fatal error: *.h" regex is the primary arbiter, so this is belt-and-braces).
   internal_headers: []

@@ -12,7 +12,7 @@ The pipeline operates in five sequential phases, orchestrated by a central modul
 | ----------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Phase 0** | `cve_aggregator/`    | **Data Aggregation**: Scrapes NVD/CVE.org, cross-references ExploitDB, extracts Proofs-of-Concept (PoCs) — or, for CVEs with no public PoC, harvests the fixing commit's own regression test — validates syntax, attempts LLM-based repair of invalid PoCs, and exports normalized datasets (CSV/JSON).                                               |
 | **Phase 1** | `orchestrator.py`    | **Vulnerability Reproduction**: Builds Docker environments tailored to the target project (matching the appropriate Ubuntu version and compiler era), compiles the vulnerable code, and reproduces the issue via the PoC exploit or the regression test, capturing a deterministic baseline signature for later comparison.                      |
-| **Phase 2** | `patch_generator.py` | **Patch Generation**: Uses local (Ollama) or external (OpenAI) LLMs to generate candidate patches for the vulnerable functions.                                                                                                                                  |
+| **Phase 2** | `patch_generator.py` | **Patch Generation**: Uses local (Ollama) or external (OpenAI) LLMs to generate candidate patches for the vulnerable functions. A per-model training-data contamination filter restricts generation to CVEs published after the model's knowledge cutoff, and CWE-aware spear prompts tailor the system prompt to each vulnerability's weakness class.                                                                                                                                  |
 | **Phase 3** | `patch_validator.py` | **Patch Validation**: Rebuilds the patched source incrementally from the Phase 1 image, re-executes the exploit/test and compares against the Phase 1 baseline to confirm mitigation, and runs host-side Static Application Security Testing (SAST) with a configurable, per-project tool set (for C: Cppcheck, Clang-Tidy, Semgrep, Flawfinder; for Java: Semgrep, PMD), failing a patch only when it introduces *new* findings. |
 | **Phase 4** | `reporter.py`        | **Automated Reporting**: Aggregates all execution results, generates comprehensive Markdown reports, and produces Matplotlib visualizations comparing model performances.                                                                                        |
 
@@ -152,11 +152,13 @@ python3 cleanup.py --force --all
 
 - `pipeline/cve_aggregator/`: Source code for Phase 0 and project configurations.
 - `pipeline/master_pipeline/`: Source code for the orchestrator and feedback loop.
+- `pipeline/groundtruth/`: Independent ground-truth reproduction oracle (V−/V+ differential validation).
 - `pipeline/exploits/`: Verified PoC exploit scripts ready for execution.
 - `pipeline/manual_supervision/`: PoCs needing human validation before proceeding.
 - `pipeline/patches/`: LLM-generated source code patches.
 - `pipeline/results/` & `pipeline/validation_results/`: JSON outputs and datasets from pipeline runs.
 - `pipeline/reports/`: Final Markdown reports and charts from Phase 4.
+- `pipeline/profiles/`: LLM model profiles (`.env` files) for benchmark campaigns.
 
 ## ⚠️ Warning
 

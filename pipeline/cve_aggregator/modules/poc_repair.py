@@ -25,6 +25,8 @@ import requests
 from ..models import CVEEntry, Dataset, SyntaxValidationResult
 from ..utils.file_utils import get_file_extension_for_language
 from ..utils.gpu_lock import gpu_lock
+from ..utils.gpu_monitor import ensure_exclusive, resolve_mode
+from ..utils.gpu_slots import current_slots
 from ..utils.llm_compat import (
     is_unsupported_temperature_error,
     openai_temperature_kwargs,
@@ -504,7 +506,7 @@ class PoCRepairLLM(PipelineModule):
 
         # Configuration knobs
         provider: str = cfg.get("provider", "ollama").lower()
-        api_endpoint: str = cfg.get("api_endpoint", "http://10.3.2.171:80/api/chat")
+        api_endpoint: str = cfg.get("api_endpoint", "http://10.3.1.226:80/api/chat")
         model: str = cfg.get("model", "qwen2.5-coder:7b")
         openai_model: str = cfg.get("openai_model", "gpt-4.1-mini")
         # Base model for the active provider; the per-attempt schedule below can
@@ -654,7 +656,7 @@ class PoCRepairLLM(PipelineModule):
             # wasting hours on CPU-only inference.
             gpu_wait_timeout: int = cfg.get("gpu_wait_timeout", 120)
             if gpu_wait_timeout > 0 and not self._wait_for_gpu(
-                api_endpoint, timeout=gpu_wait_timeout
+                api_endpoint, timeout=gpu_wait_timeout, model=model
             ):
                 self.logger.warning(
                     "GPU not available after %d s — skipping PoC repair. "
@@ -810,7 +812,8 @@ class PoCRepairLLM(PipelineModule):
         repair_results: List[Dict[str, Any]] = []
         gpu_lock_cfg = bool(cfg.get("gpu_lock", True))
         with gpu_lock(provider, enabled=gpu_lock_cfg, endpoint=api_endpoint,
-                      logger=self.logger, label="phase0-repair"), \
+                      slots=self._gpu_slots(), logger=self.logger,
+                      label="phase0-repair"), \
                 ThreadPoolExecutor(max_workers=max_repair_workers) as executor:
             futures = {
                 executor.submit(_run_repair, item): item
@@ -1920,40 +1923,30 @@ class PoCRepairLLM(PipelineModule):
             self.logger.debug("GPU status check skipped (%s).", exc)
 
     def _wait_for_gpu(self, api_endpoint: str, timeout: int = 120,
-                      poll_interval: int = 15) -> bool:
-        """Poll /api/ps until GPU VRAM is free or *timeout* expires.
+                      poll_interval: int = 15,
+                      model: Optional[str] = None) -> bool:
+        """Gate on GPU exclusivity: empty-or-ours passes; foreign models block.
 
-        Returns True if GPU is available, False if the wait timed out.
+        Delegates to :func:`ensure_exclusive` — in "evict" mode (default)
+        foreign resident models are actively unloaded so the repair model never
+        loads beside them and partially offloads to CPU. Returns True when the
+        GPU is empty / serving *model*, False when the wait timed out.
         """
-        from urllib.parse import urlparse, urlunparse
+        return ensure_exclusive(api_endpoint,
+                                auth=getattr(self, "_ollama_auth", None),
+                                model=model, mode=resolve_mode(),
+                                timeout=timeout, poll_interval=poll_interval,
+                                log=self.logger, slots=self._gpu_slots())
 
-        parsed = urlparse(api_endpoint)
-        ps_url = urlunparse((parsed.scheme, parsed.netloc, "/api/ps", "", "", ""))
-        start = time.time()
+    def _gpu_slots(self) -> int:
+        """GPU semaphore width / residency budget RIGHT NOW.
 
-        while True:
-            try:
-                resp = requests.get(ps_url, timeout=10,
-                                    auth=getattr(self, "_ollama_auth", None))
-                resp.raise_for_status()
-                running = resp.json().get("models", [])
-                total_vram = sum(e.get("size_vram", 0) for e in running)
-                if not running or total_vram == 0:
-                    return True
-            except Exception:
-                return True  # can't reach /api/ps — assume available
-
-            elapsed = time.time() - start
-            if elapsed >= timeout:
-                return False
-
-            names = [e.get("name", "?") for e in running]
-            vram_gib = total_vram / (1024 ** 3)
-            self.logger.info(
-                "GPU busy (%.1f GiB VRAM used by %s) — waiting (%d/%d s) …",
-                vram_gib, ", ".join(names), int(elapsed), timeout,
-            )
-            time.sleep(poll_interval)
+        Resolved via ``gpu_slots.current_slots``: the live poller file (fresh) >
+        SSD_GPU_SLOTS env > poc_repair.gpu_slots / probe > 1. Read per
+        acquisition so a GPU freed mid-run is picked up."""
+        cfg = self.config.get("poc_repair", {}) if isinstance(
+            getattr(self, "config", None), dict) else {}
+        return current_slots(cfg or {}, logger=self.logger)
 
     def _preload_model(self, api_endpoint: str, model: str,
                        timeout: int = 300, poll_interval: int = 10) -> bool:

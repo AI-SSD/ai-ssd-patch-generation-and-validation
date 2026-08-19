@@ -32,14 +32,13 @@ pipeline:
   abort_on_error: false
   skip_modules: []
 
-# Reproducer priority (see aggregator_config.yaml for all modes). ExploitDB PoC
-# preferred; the fix-commit test (Option A) is the fallback for CVEs with no PoC.
-# NOTE: "intree" only RUNS once this project has a phase1.intree_test recipe
-# (FFmpeg has the FATE suite, but it is not wired here) — until then harvested
-# tests route to manual and ExploitDB is the effective source.
+# Reproducer priority (see aggregator_config.yaml for all modes).
+# INTREE-FIRST (uniform pipeline-wide where a phase1.intree_test recipe exists —
+# this config now ships one); the fix-commit test is the discriminating oracle,
+# ExploitDB the fallback for CVEs whose fix shipped no test.
 reproduction_strategy:
-  - exploitdb
   - intree
+  - exploitdb
 
 logging:
   level: "INFO"
@@ -135,7 +134,7 @@ poc_repair:
   provider: "openai"
   openai_model: "gpt-4.1-mini"
   openai_api_key: ""
-  api_endpoint: "http://10.3.2.171:80/api/chat"
+  api_endpoint: "http://10.3.1.226:80/api/chat"
   model: "devstral:32k"
   max_repair_attempts: 3
   models_by_attempt:
@@ -203,14 +202,15 @@ phase2:
   language: "c"
   system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for FFmpeg (the multimedia decoding/encoding framework — libavcodec,
-    libavformat, libavutil, etc.). Your task is to fix a security vulnerability by
-    making the SMALLEST POSSIBLE EDIT to the vulnerable function — never by
-    rewriting it.
+    for FFmpeg (the multimedia decoding/encoding framework). The vulnerability
+    you must fix is {cwe}.
+    Your task is to fix it by making the SMALLEST POSSIBLE EDIT to the
+    vulnerable function — never by rewriting it.
   feedback_system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for FFmpeg. Your previous patch attempt FAILED validation. Analyze the failure
-    and produce an improved fix as MINIMAL edits — never rewrite the whole function.
+    for FFmpeg. Your previous patch attempt for {cve_id} — {cwe} —
+    FAILED validation. Analyze the failure and produce an improved fix as
+    MINIMAL edits — never rewrite the whole function.
   internal_headers: []
 
 # ---------------------------------------------------------------------------
@@ -419,7 +419,7 @@ phase1:
       INCS="-I$SOURCE_DIR"; LIBS="-L$SOURCE_DIR/libavformat -L$SOURCE_DIR/libavcodec -L$SOURCE_DIR/libavutil -lavformat -lavcodec -lavutil -lm -lpthread"
       if gcc -O2 -w "$SOURCE_DIR/$TEST_PATH" -o /tmp/itest $INCS $LIBS 2>/tmp/cc.log; then
         echo "--- running test: $TEST_PATH ---"
-        timeout "${INTREE_TEST_TIMEOUT:-300}" /tmp/itest > /tmp/it.log 2>&1; rc=$?
+        timeout -k 10 "${INTREE_TEST_TIMEOUT:-300}" /tmp/itest > /tmp/it.log 2>&1; rc=$?
         tail -25 /tmp/it.log
         if [ "$rc" -eq 0 ]; then echo "SSD_TEST_RESULT=PASS"; exit 0; else echo "SSD_TEST_RESULT=FAIL"; exit 1; fi
       fi

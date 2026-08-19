@@ -25,9 +25,10 @@ pipeline:
   abort_on_error: false
   skip_modules: []
 
+# INTREE-FIRST (uniform pipeline-wide where a phase1.intree_test recipe exists).
 reproduction_strategy:
-  - exploitdb
   - intree
+  - exploitdb
 
 logging:
   level: "INFO"
@@ -117,7 +118,7 @@ poc_repair:
   provider: "openai"
   openai_model: "gpt-4.1-mini"
   openai_api_key: ""
-  api_endpoint: "http://10.3.2.171:80/api/chat"
+  api_endpoint: "http://10.3.1.226:80/api/chat"
   model: "devstral:32k"
   max_repair_attempts: 3
   models_by_attempt:
@@ -185,13 +186,15 @@ phase2:
   language: "c"
   system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for GnuTLS (the GNU TLS/SSL, X.509 and cryptography library). Your task is to
-    fix a security vulnerability by making the SMALLEST POSSIBLE EDIT to the
+    for GnuTLS (the GNU TLS/SSL, X.509 and cryptography library). The
+    vulnerability you must fix is {cwe}.
+    Your task is to fix it by making the SMALLEST POSSIBLE EDIT to the
     vulnerable function — never by rewriting it.
   feedback_system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for GnuTLS. Your previous patch attempt FAILED validation. Analyze the failure
-    and produce an improved fix as MINIMAL edits — never rewrite the whole function.
+    for GnuTLS. Your previous patch attempt for {cve_id} — {cwe} —
+    FAILED validation. Analyze the failure and produce an improved fix as
+    MINIMAL edits — never rewrite the whole function.
   internal_headers: []
 
 # ---------------------------------------------------------------------------
@@ -411,7 +414,7 @@ phase1:
       export LD_LIBRARY_PATH="$PFX/lib:$BUILD_DIR/lib/.libs"
       SUB="tests"; [ -n "$TEST_SUBDIR" ] && [ -d "$BUILD_DIR/$TEST_SUBDIR" ] && SUB="$TEST_SUBDIR"
       echo "--- make -C $SUB check TESTS=$TEST_NAME ---"
-      timeout "${INTREE_TEST_TIMEOUT:-500}" make -C "$SUB" check TESTS="$TEST_NAME" > /tmp/mt.log 2>&1; rc=$?
+      timeout -k 10 "${INTREE_TEST_TIMEOUT:-500}" make -C "$SUB" check TESTS="$TEST_NAME" > /tmp/mt.log 2>&1; rc=$?
       tail -30 /tmp/mt.log
       TRS="$BUILD_DIR/$SUB/$TEST_NAME.trs"
       [ -f "$TRS" ] || { echo "no .trs (test not registered/built) — NORESULT"; echo "SSD_TEST_RESULT=NORESULT"; exit 2; }

@@ -32,12 +32,14 @@ pipeline:
 #   [intree, exploitdb]    both, Option A preferred      (test, else the PoC)
 # "intree" needs this project's phase1.intree_test.{build_script,run_script}
 # recipe (glibc has one). Supersedes commit_discovery.harvest_regression_tests.
-# Flip to [exploitdb, intree] to add fix-commit-test coverage for the many CVEs
-# with no public PoC.
+# INTREE-FIRST, uniform across the study projects (glibc/openssl/tcpdump): the
+# fix-commit regression test is the discriminating oracle (ground-truth-validated);
+# ExploitDB is the fallback for CVEs whose fix shipped no test. On the 2026-07
+# corpus the order is provably inconsequential (no CVE has both sources curated).
 # ---------------------------------------------------------------------------
 reproduction_strategy:
-  - exploitdb
   - intree
+  - exploitdb
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -216,7 +218,9 @@ poc_mapper:
   auto_update: true
 
   # Deep search: grep exploit file *contents* for CVE IDs (slower but thorough)
-  deep_search: false
+  # Aligned with openssl/tcpdump (2026-08-02): PoC-discovery knobs are uniform
+  # across the study projects.
+  deep_search: true
 
   # Extract full source code from matched exploit files?
   extract_content: true
@@ -224,12 +228,14 @@ poc_mapper:
   # Reverse search: scan ExploitDB titles/contents for your project's
   # keywords to discover CVEs not returned by NVD keyword search.
   reverse_search: true
-  enable_reverse_content_grep: false
+  enable_reverse_content_grep: true
 
   # Only include verified exploits from ExploitDB?
   # Set to false to also include unverified community-contributed PoCs
   # (increases recall at the cost of lower quality assurance).
-  require_verified: true
+  # Aligned with openssl/tcpdump (2026-08-02). Safe under intree-first: an
+  # unverified PoC can only become primary for CVEs whose fix shipped no test.
+  require_verified: false
 
   # Preferred ExploitDB platform tokens, most-preferred first. The primary PoC
   # (index 0, the one Phase 1 compiles) is chosen from the highest-ranked
@@ -293,7 +299,7 @@ poc_repair:
 
   # -- Ollama settings (used only when provider: "ollama") --
   # Ollama-compatible chat API endpoint
-  api_endpoint: "http://10.3.2.171:80/api/chat"
+  api_endpoint: "http://10.3.1.226:80/api/chat"
 
   # LLM model to use for repairs (must be available on the Ollama server).
   # devstral is faster than qwen3-coder:30b and code-repair specialised.
@@ -470,20 +476,25 @@ output:
 # gate is Phase 3's in-container rebuild). `system_prompt`/`feedback_system_prompt`
 # are the ROLE PREAMBLE only — the pipeline appends the fixed SEARCH/REPLACE edit
 # format (the parser contract) and, for feedback, the failure-analysis tail.
+# Both preambles are per-CVE TEMPLATES ("spear prompts"): {cwe} expands to the
+# CVE's actual weakness class from the Phase 0 CSV — e.g. "CWE-787 (Out-of-bounds
+# Write)" — and {cve_id}/{cwe_id}/{cwe_name} are also available; a CVE without a
+# usable CWE renders a neutral fallback. Never hardcode a vulnerability type
+# here: the CWE is injected per CVE so the framing always matches the bug at hand.
 # `internal_headers` are project-internal headers absent host-side; the generic
 # `fatal error: *.h` regex is the primary arbiter, so this list is belt-and-braces.
 phase2:
   language: "c"
   system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for the GNU C Library (glibc). Your task is to fix a security vulnerability by
-    making the SMALLEST POSSIBLE EDIT to the vulnerable function — never by
-    rewriting it.
+    for the GNU C Library (glibc). The vulnerability you must fix is {cwe}.
+    Your task is to fix it by making the SMALLEST POSSIBLE EDIT to the
+    vulnerable function — never by rewriting it.
   feedback_system_prompt: >-
     You are an expert C security engineer specializing in vulnerability patching
-    for the GNU C Library (glibc). Your previous patch attempt FAILED validation.
-    Analyze the failure and produce an improved fix as MINIMAL edits — never
-    rewrite the whole function.
+    for the GNU C Library (glibc). Your previous patch attempt for {cve_id} —
+    {cwe} — FAILED validation. Analyze the failure and produce an improved fix
+    as MINIMAL edits — never rewrite the whole function.
   internal_headers:
     - "kernel-features.h"
     - "xlocale.h"
@@ -951,11 +962,11 @@ phase1:
       run_built() {
           rc=200
           if [ -x "$BUILD_DIR/testrun.sh" ]; then
-              timeout "${INTREE_TEST_TIMEOUT:-320}" "$BUILD_DIR/testrun.sh" "$1" > /tmp/it.log 2>&1; rc=$?
+              timeout -k 10 "${INTREE_TEST_TIMEOUT:-320}" "$BUILD_DIR/testrun.sh" "$1" > /tmp/it.log 2>&1; rc=$?
               grep -qiE "cannot execute|not a dynamic|error while loading|No such file" /tmp/it.log 2>/dev/null && rc=200
           fi
           if [ "$rc" -eq 200 ]; then
-              GCONV_PATH="$BUILD_DIR/iconvdata" timeout "${INTREE_TEST_TIMEOUT:-320}" \
+              GCONV_PATH="$BUILD_DIR/iconvdata" timeout -k 10 "${INTREE_TEST_TIMEOUT:-320}" \
                   "$LOADER" --library-path "$LIBP" "$1" > /tmp/it.log 2>&1; rc=$?
           fi
       }
@@ -970,7 +981,7 @@ phase1:
       }
       # Strategy 1: native single-test target (glibc >= ~2.34).
       rm -f "$TR"
-      timeout "${INTREE_TEST_TIMEOUT:-320}" make test "t=$TEST_SUBDIR/$TEST_NAME" > /tmp/mt.log 2>&1
+      timeout -k 10 "${INTREE_TEST_TIMEOUT:-320}" make test "t=$TEST_SUBDIR/$TEST_NAME" > /tmp/mt.log 2>&1
       tail -20 /tmp/mt.log
       emit_from_result
       # Strategy 2: standalone compile, run through the build runtime only.
@@ -1004,7 +1015,7 @@ phase1:
       rm -f "$TR"
       # -k: keep going past UNRELATED sibling-test failures in the subdir so our
       # target test still gets built+run and writes its .test-result.
-      timeout "${INTREE_SUBDIR_TIMEOUT:-1500}" make -k check "subdirs=$TEST_SUBDIR" test-wrapper= > /tmp/chk.log 2>&1
+      timeout -k 10 "${INTREE_SUBDIR_TIMEOUT:-1500}" make -k check "subdirs=$TEST_SUBDIR" test-wrapper= > /tmp/chk.log 2>&1
       tail -20 /tmp/chk.log
       emit_from_result
       # Harness produced no verdict: accept a prior standalone PASS if we had one.

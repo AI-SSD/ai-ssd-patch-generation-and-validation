@@ -15,7 +15,12 @@ from pathlib import Path
 
 import pytest
 
-sys.modules.setdefault("pandas", types.ModuleType("pandas"))
+try:  # prefer the real pandas when installed (VM); stub it otherwise (dev hosts)
+    import pandas  # noqa: F401
+except ImportError:
+    _pd_stub = types.ModuleType("pandas")
+    _pd_stub.DataFrame = _pd_stub.Series = object  # annotation targets (eager on <3.14)
+    sys.modules["pandas"] = _pd_stub
 
 from master_pipeline import config as cfg          # noqa: E402
 from master_pipeline import ablation as ab          # noqa: E402

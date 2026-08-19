@@ -1,0 +1,928 @@
+[
+ {
+  "cve": "CVE-2006-4343",
+  "fix_commit": "",
+  "parent_commit": "",
+  "era": "24.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "SSL_get_shared_ciphers",
+  "FilePath": "ssl/ssl_lib.c",
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "no FIX_COMMIT recorded"
+ },
+ {
+  "cve": "CVE-2010-0740",
+  "fix_commit": "",
+  "parent_commit": "",
+  "era": "14.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "ssl3_get_record",
+  "FilePath": "ssl/s3_pkt.c",
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "no FIX_COMMIT recorded"
+ },
+ {
+  "cve": "CVE-2014-0160",
+  "fix_commit": "",
+  "parent_commit": "",
+  "era": "16.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "tls1_process_heartbeat",
+  "FilePath": "ssl/t1_lib.c",
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "no FIX_COMMIT recorded"
+ },
+ {
+  "cve": "CVE-2015-1793",
+  "fix_commit": "9a0db453ba017ebcaccbee933ee6511a9ae4d1c8",
+  "parent_commit": "9a0db453ba017ebcaccbee933ee6511a9ae4d1c8^",
+  "era": "24.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "X509_verify_cert",
+  "FilePath": "crypto/x509/x509_vfy.c",
+  "revert_files": [
+   "crypto/x509/x509_vfy.c"
+  ],
+  "v_minus": {
+   "result": "NORESULT",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "NORESULT",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "V-=NORESULT, V+=NORESULT (build/runtime failure on an arm)"
+ },
+ {
+  "cve": "CVE-2015-3193",
+  "fix_commit": "d73cc256c8e256c32ed959456101b73ba9842f72",
+  "parent_commit": "d73cc256c8e256c32ed959456101b73ba9842f72^",
+  "era": "24.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "test_mod_exp",
+  "FilePath": "crypto/bn/bntest.c",
+  "revert_files": [
+   "crypto/bn/bntest.c"
+  ],
+  "v_minus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": 0,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": 0,
+   "configure_failed": false
+  },
+  "groundtruth": "REFUTED",
+  "reason": "test passes even on the vulnerable tree (does not exercise the vuln)"
+ },
+ {
+  "cve": "CVE-2016-2183",
+  "fix_commit": "",
+  "parent_commit": "",
+  "era": "16.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "",
+  "FilePath": "ssl/s3_lib.c",
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "no FIX_COMMIT recorded"
+ },
+ {
+  "cve": "CVE-2016-7053",
+  "fix_commit": "f962541d0be200055e508641ddf3a8ec8819e4df",
+  "parent_commit": "f962541d0be200055e508641ddf3a8ec8819e4df^",
+  "era": "16.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "asn1_item_embed_d2i",
+  "FilePath": "crypto/asn1/tasn_dec.c",
+  "revert_files": [
+   "crypto/asn1/tasn_dec.c"
+  ],
+  "v_minus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "REFUTED",
+  "reason": "test passes even on the vulnerable tree (does not exercise the vuln)"
+ },
+ {
+  "cve": "CVE-2016-7054",
+  "fix_commit": "",
+  "parent_commit": "",
+  "era": "14.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "chacha20_poly1305_cipher",
+  "FilePath": "crypto/evp/e_chacha20_poly1305.c",
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "no FIX_COMMIT recorded"
+ },
+ {
+  "cve": "CVE-2016-7055",
+  "fix_commit": "57c4b9f6a2f800b41ce2836986fe33640f6c3f8a",
+  "parent_commit": "57c4b9f6a2f800b41ce2836986fe33640f6c3f8a^",
+  "era": "16.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "",
+  "FilePath": "crypto/bn/asm/x86_64-mont.pl",
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "no source file to revert (fix touches only tests/meta)",
+  "revert_files": []
+ },
+ {
+  "cve": "CVE-2017-3730",
+  "fix_commit": "",
+  "parent_commit": "",
+  "era": "16.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "tls_construct_cke_ecdhe",
+  "FilePath": "ssl/statem/statem_clnt.c",
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "no FIX_COMMIT recorded"
+ },
+ {
+  "cve": "CVE-2017-3733",
+  "fix_commit": "4ad93618d26a3ea23d36ad5498ff4f59eff3a4d2",
+  "parent_commit": "4ad93618d26a3ea23d36ad5498ff4f59eff3a4d2^",
+  "era": "18.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "do_ssl3_write",
+  "FilePath": "ssl/record/rec_layer_s3.c",
+  "revert_files": [
+   "include/openssl/ssl3.h",
+   "ssl/record/rec_layer_s3.c",
+   "ssl/record/ssl3_record.c",
+   "ssl/ssl_locl.h",
+   "ssl/t1_enc.c",
+   "ssl/t1_lib.c"
+  ],
+  "v_minus": {
+   "result": "NORESULT",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "NORESULT",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "V-=NORESULT, V+=NORESULT (build/runtime failure on an arm)"
+ },
+ {
+  "cve": "CVE-2017-3737",
+  "fix_commit": "898fb884b706aaeb283de4812340bb0bde8476dc",
+  "parent_commit": "898fb884b706aaeb283de4812340bb0bde8476dc^",
+  "era": "18.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "",
+  "FilePath": "ssl/ssl.h",
+  "revert_files": [
+   "ssl/ssl.h"
+  ],
+  "v_minus": {
+   "result": "NORESULT",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "NORESULT",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "V-=NORESULT, V+=NORESULT (build/runtime failure on an arm)"
+ },
+ {
+  "cve": "CVE-2019-1547",
+  "fix_commit": "21c856b75d81eff61aa63b4f036bb64a85bf6d46",
+  "parent_commit": "21c856b75d81eff61aa63b4f036bb64a85bf6d46^",
+  "era": "20.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "EC_GROUP_set_generator",
+  "FilePath": "crypto/ec/ec_lib.c",
+  "revert_files": [
+   "crypto/ec/ec.h",
+   "crypto/ec/ec_err.c",
+   "crypto/ec/ec_lib.c"
+  ],
+  "v_minus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": 0,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": 0,
+   "configure_failed": false
+  },
+  "groundtruth": "REFUTED",
+  "reason": "test passes even on the vulnerable tree (does not exercise the vuln)"
+ },
+ {
+  "cve": "CVE-2019-1549",
+  "fix_commit": "1b0fe00e2704b5e20334a16d3c9099d1ba2ef1be",
+  "parent_commit": "1b0fe00e2704b5e20334a16d3c9099d1ba2ef1be^",
+  "era": "20.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "OPENSSL_fork_child",
+  "FilePath": "crypto/init.c",
+  "revert_files": [
+   "crypto/include/internal/rand_int.h",
+   "crypto/init.c",
+   "crypto/rand/drbg_lib.c",
+   "crypto/rand/rand_lcl.h",
+   "crypto/rand/rand_lib.c",
+   "crypto/threads_none.c",
+   "crypto/threads_pthread.c",
+   "crypto/threads_win.c",
+   "include/internal/cryptlib.h"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "CONFIRMED",
+  "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+ },
+ {
+  "cve": "CVE-2021-3450",
+  "fix_commit": "2a40b7bc7b94dd7de897a74571e7024f0cf0d63b",
+  "parent_commit": "2a40b7bc7b94dd7de897a74571e7024f0cf0d63b^",
+  "era": "22.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "check_chain_extensions",
+  "FilePath": "crypto/x509/x509_vfy.c",
+  "revert_files": [
+   "crypto/x509/x509_vfy.c"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "CONFIRMED",
+  "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+ },
+ {
+  "cve": "CVE-2021-3711",
+  "fix_commit": "59f5e75f3bced8fc0e130d72a3f582cf7b480b46",
+  "parent_commit": "59f5e75f3bced8fc0e130d72a3f582cf7b480b46^",
+  "era": "22.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "sm2_plaintext_size",
+  "FilePath": "crypto/sm2/sm2_crypt.c",
+  "revert_files": [
+   "crypto/sm2/sm2_crypt.c",
+   "crypto/sm2/sm2_pmeth.c",
+   "include/crypto/sm2.h"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "CONFIRMED",
+  "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+ },
+ {
+  "cve": "CVE-2021-3712",
+  "fix_commit": "94d23fcff9b2a7a8368dfe52214d5c2569882c11",
+  "parent_commit": "94d23fcff9b2a7a8368dfe52214d5c2569882c11^",
+  "era": "22.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "EC_GROUP_new_from_ecparameters",
+  "FilePath": "crypto/ec/ec_asn1.c",
+  "revert_files": [
+   "crypto/ec/ec_asn1.c"
+  ],
+  "v_minus": {
+   "result": "NORESULT",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "NORESULT",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "V-=NORESULT, V+=NORESULT (build/runtime failure on an arm)"
+ },
+ {
+  "cve": "CVE-2021-4160",
+  "fix_commit": "3bf7b73ea7123045b8f972badc67ed6878e6c37f",
+  "parent_commit": "3bf7b73ea7123045b8f972badc67ed6878e6c37f^",
+  "era": "24.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "",
+  "FilePath": "test/bntest.c",
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "no source file to revert (fix touches only tests/meta)",
+  "revert_files": []
+ },
+ {
+  "cve": "CVE-2022-3602",
+  "fix_commit": "fe3b639dc19b325846f4f6801f2f4604f56e3de3",
+  "parent_commit": "fe3b639dc19b325846f4f6801f2f4604f56e3de3^",
+  "era": "22.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "ossl_punycode_decode",
+  "FilePath": "crypto/punycode.c",
+  "revert_files": [
+   "crypto/punycode.c"
+  ],
+  "v_minus": {
+   "result": "NORESULT",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "NORESULT",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "V-=NORESULT, V+=NORESULT (build/runtime failure on an arm)"
+ },
+ {
+  "cve": "CVE-2022-4450",
+  "fix_commit": "63bcf189be73a9cc1264059bed6f57974be74a83",
+  "parent_commit": "63bcf189be73a9cc1264059bed6f57974be74a83^",
+  "era": "24.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "PEM_read_bio_ex",
+  "FilePath": "crypto/pem/pem_lib.c",
+  "revert_files": [
+   "crypto/pem/pem_lib.c"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "REFUTED",
+  "reason": "test still fails on the upstream-fixed tree (fix/test mismatch)"
+ },
+ {
+  "cve": "CVE-2023-0217",
+  "fix_commit": "23985bac83fd50c8e29431009302b5442f985096",
+  "parent_commit": "23985bac83fd50c8e29431009302b5442f985096^",
+  "era": "24.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "ossl_ffc_validate_private_key",
+  "FilePath": "crypto/ffc/ffc_key_validate.c",
+  "revert_files": [
+   "crypto/ffc/ffc_key_validate.c",
+   "include/internal/ffc.h"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "CONFIRMED",
+  "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+ },
+ {
+  "cve": "CVE-2023-0286",
+  "fix_commit": "2c6c9d439b484e1ba9830d8454a34fa4f80fdfe9",
+  "parent_commit": "2c6c9d439b484e1ba9830d8454a34fa4f80fdfe9^",
+  "era": "22.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "GENERAL_NAME_cmp",
+  "FilePath": "crypto/x509v3/v3_genn.c",
+  "revert_files": [
+   "crypto/x509v3/v3_genn.c",
+   "include/openssl/x509v3.h"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "CONFIRMED",
+  "reason": "test fails on vulnerable tree, passes on upstream-fixed tree"
+ },
+ {
+  "cve": "CVE-2023-3446",
+  "fix_commit": "1fa20cf2f506113c761777127a38bce5068740eb",
+  "parent_commit": "1fa20cf2f506113c761777127a38bce5068740eb^",
+  "era": "24.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "DH_check",
+  "FilePath": "crypto/dh/dh_check.c",
+  "revert_files": [
+   "crypto/dh/dh_check.c",
+   "include/openssl/dh.h"
+  ],
+  "v_minus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "NORESULT",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": true
+  },
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "V-=PASS, V+=NORESULT (build/runtime failure on an arm)"
+ },
+ {
+  "cve": "CVE-2023-5363",
+  "fix_commit": "0df40630850fb2740e6be6890bb905d3fc623b2d",
+  "parent_commit": "0df40630850fb2740e6be6890bb905d3fc623b2d^",
+  "era": "24.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "evp_cipher_init_internal",
+  "FilePath": "crypto/evp/evp_enc.c",
+  "revert_files": [
+   "crypto/evp/evp_enc.c"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "NORESULT",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": true
+  },
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "V-=FAIL, V+=NORESULT (build/runtime failure on an arm)"
+ },
+ {
+  "cve": "CVE-2024-12797",
+  "fix_commit": "738d4f9fdeaad57660dcba50a619fafced3fd5e9",
+  "parent_commit": "738d4f9fdeaad57660dcba50a619fafced3fd5e9^",
+  "era": "24.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "tls_post_process_server_rpk",
+  "FilePath": "ssl/statem/statem_clnt.c",
+  "revert_files": [
+   "ssl/statem/statem_clnt.c"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "NORESULT",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": true
+  },
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "V-=FAIL, V+=NORESULT (build/runtime failure on an arm)"
+ },
+ {
+  "cve": "CVE-2024-2511",
+  "fix_commit": "7e4d731b1c07201ad9374c1cd9ac5263bdf35bce",
+  "parent_commit": "7e4d731b1c07201ad9374c1cd9ac5263bdf35bce^",
+  "era": "24.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "ssl_update_cache",
+  "FilePath": "ssl/ssl_lib.c",
+  "revert_files": [
+   "ssl/ssl_lib.c",
+   "ssl/ssl_sess.c",
+   "ssl/statem/statem_srvr.c"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "REFUTED",
+  "reason": "test still fails on the upstream-fixed tree (fix/test mismatch)"
+ },
+ {
+  "cve": "CVE-2024-4741",
+  "fix_commit": "704f725b96aa373ee45ecfb23f6abfe8be8d9177",
+  "parent_commit": "704f725b96aa373ee45ecfb23f6abfe8be8d9177^",
+  "era": "24.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "RECORD_LAYER_data_present",
+  "FilePath": "ssl/record/rec_layer_s3.c",
+  "revert_files": [
+   "ssl/record/rec_layer_s3.c",
+   "ssl/record/record.h",
+   "ssl/ssl_lib.c"
+  ],
+  "v_minus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "NORESULT",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": true
+  },
+  "groundtruth": "UNCONFIRMABLE",
+  "reason": "V-=PASS, V+=NORESULT (build/runtime failure on an arm)"
+ },
+ {
+  "cve": "CVE-2024-5535",
+  "fix_commit": "4ada436a1946cbb24db5ab4ca082b69c1bc10f37",
+  "parent_commit": "4ada436a1946cbb24db5ab4ca082b69c1bc10f37^",
+  "era": "24.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "SSL_select_next_proto",
+  "FilePath": "ssl/ssl_lib.c",
+  "revert_files": [
+   "ssl/ssl_lib.c"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "REFUTED",
+  "reason": "test still fails on the upstream-fixed tree (fix/test mismatch)"
+ },
+ {
+  "cve": "CVE-2025-69419",
+  "fix_commit": "41be0f216404f14457bbf3b9cc488dba60b49296",
+  "parent_commit": "41be0f216404f14457bbf3b9cc488dba60b49296^",
+  "era": "24.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "do_buf",
+  "FilePath": "crypto/asn1/a_strex.c",
+  "revert_files": [
+   "crypto/asn1/a_strex.c",
+   "crypto/pkcs12/p12_utl.c"
+  ],
+  "v_minus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "REFUTED",
+  "reason": "test passes even on the vulnerable tree (does not exercise the vuln)"
+ },
+ {
+  "cve": "CVE-2026-2673",
+  "fix_commit": "2157c9d81f7b0bd7dfa25b960e928ec28e8dd63f",
+  "parent_commit": "2157c9d81f7b0bd7dfa25b960e928ec28e8dd63f^",
+  "era": "24.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "gid_cb",
+  "FilePath": "ssl/t1_lib.c",
+  "revert_files": [
+   "ssl/t1_lib.c"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "REFUTED",
+  "reason": "test still fails on the upstream-fixed tree (fix/test mismatch)"
+ },
+ {
+  "cve": "CVE-2026-34182",
+  "fix_commit": "03c1f4d45fb963aee7d5833390c507cd290182bc",
+  "parent_commit": "03c1f4d45fb963aee7d5833390c507cd290182bc^",
+  "era": "24.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "ossl_cms_EncryptedContent_init_bio",
+  "FilePath": "crypto/cms/cms_enc.c",
+  "revert_files": [
+   "crypto/cms/cms_enc.c"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "REFUTED",
+  "reason": "test still fails on the upstream-fixed tree (fix/test mismatch)"
+ },
+ {
+  "cve": "CVE-2026-42770",
+  "fix_commit": "3da5a516cd2635a320ff748503db2cef7c4b0f02",
+  "parent_commit": "3da5a516cd2635a320ff748503db2cef7c4b0f02^",
+  "era": "24.04",
+  "pipeline_reproduced": false,
+  "F_NAME": "dh_match_params",
+  "FilePath": "providers/implementations/exchange/dh_exch.c",
+  "revert_files": [
+   "providers/implementations/exchange/dh_exch.c"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "REFUTED",
+  "reason": "test still fails on the upstream-fixed tree (fix/test mismatch)"
+ },
+ {
+  "cve": "CVE-2026-45445",
+  "fix_commit": "323f0b6e7d530a4cb4336d50c88cb70f3ac2a451",
+  "parent_commit": "323f0b6e7d530a4cb4336d50c88cb70f3ac2a451^",
+  "era": "24.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "aes_ocb_cipher",
+  "FilePath": "providers/implementations/ciphers/cipher_aes_ocb.c",
+  "revert_files": [
+   "providers/implementations/ciphers/cipher_aes_ocb.c"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "REFUTED",
+  "reason": "test still fails on the upstream-fixed tree (fix/test mismatch)"
+ },
+ {
+  "cve": "CVE-2026-45446",
+  "fix_commit": "25b32cd9d41d2bc01b6abc425bb4baf2c2236fdc",
+  "parent_commit": "25b32cd9d41d2bc01b6abc425bb4baf2c2236fdc^",
+  "era": "24.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "aes_gcm_siv_finish",
+  "FilePath": "providers/implementations/ciphers/cipher_aes_gcm_siv_hw.c",
+  "revert_files": [
+   "providers/implementations/ciphers/cipher_aes_gcm_siv_hw.c",
+   "providers/implementations/ciphers/cipher_aes_siv.c"
+  ],
+  "v_minus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "FAIL",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "REFUTED",
+  "reason": "test still fails on the upstream-fixed tree (fix/test mismatch)"
+ },
+ {
+  "cve": "CVE-2026-9076",
+  "fix_commit": "05b066366842f930fadd9a6e94df98030af431bb",
+  "parent_commit": "05b066366842f930fadd9a6e94df98030af431bb^",
+  "era": "24.04",
+  "pipeline_reproduced": true,
+  "F_NAME": "kek_unwrap_key",
+  "FilePath": "crypto/cms/cms_pwri.c",
+  "revert_files": [
+   "crypto/cms/cms_pwri.c"
+  ],
+  "v_minus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "v_plus": {
+   "result": "PASS",
+   "asan": null,
+   "crash": null,
+   "top_frame": null,
+   "exit": null,
+   "configure_failed": false
+  },
+  "groundtruth": "REFUTED",
+  "reason": "test passes even on the vulnerable tree (does not exercise the vuln)"
+ }
+]

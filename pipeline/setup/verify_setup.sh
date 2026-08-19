@@ -252,7 +252,7 @@ fi
 echo -n "Checking LLM API connectivity... "
 LLM_ENDPOINT=$(grep -A1 "llm:" "$PIPELINE_ROOT/config.yaml" 2>/dev/null | grep "endpoint:" | sed 's/.*endpoint: *"\([^"]*\)".*/\1/' | tr -d '"' | head -1)
 if [ -z "$LLM_ENDPOINT" ]; then
-    LLM_ENDPOINT="http://10.3.2.171:80/api/chat"
+    LLM_ENDPOINT="http://10.3.1.226:80/api/chat"
 fi
 # Extract base URL for tags endpoint
 LLM_BASE=$(echo "$LLM_ENDPOINT" | sed 's|/api/chat|/api/tags|')
